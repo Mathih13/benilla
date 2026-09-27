@@ -650,3 +650,76 @@ fn set_merchant_compare_item_answers_one_or_nil_per_candidate_slot() {
         "number"
     );
 }
+
+/// Both item bindings return the pushed repair cost, `SetInventoryItem`'s third (`0x5332fb`) and
+/// `SetBagItem`'s second (`0x534975`); an item with no cost and an empty equipment slot answer 0.
+#[test]
+fn item_bindings_return_the_pushed_repair_cost() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    let mut inv: InventorySlots = Default::default();
+    inv[16] = Some(InvSlotView {
+        item_id: 8200,
+        name: Some("Worn Blade".into()),
+        quality: 2,
+        ..Default::default()
+    });
+    s.set_inventory_slots(inv);
+    let mut slots = HashMap::new();
+    for (slot, id, name) in [(1, 8201, "Worn Helm"), (2, 8202, "Whole Helm")] {
+        slots.insert(
+            slot,
+            ContainerSlot {
+                item_id: id,
+                count: 1,
+                quality: Some(2),
+                link: Some(format!("|cff1eff00|Hitem:{id}:0:0:0|h[{name}]|h|r")),
+                ..Default::default()
+            },
+        );
+    }
+    s.set_container(
+        0,
+        Some(ContainerState {
+            name: Some("Backpack".into()),
+            num_slots: 4,
+            slots,
+        }),
+    );
+    for (id, name) in [
+        (8200, "Worn Blade"),
+        (8201, "Worn Helm"),
+        (8202, "Whole Helm"),
+    ] {
+        s.set_item_template(
+            id,
+            ItemTemplateView {
+                name: name.into(),
+                quality: 2,
+                ..Default::default()
+            },
+        );
+    }
+    let mut costs = RepairCosts::default();
+    costs.equipped.insert(16, 1234);
+    costs.bags.insert((0, 1), 567);
+    s.set_repair_costs(costs);
+    s.run(
+        r#"
+        local a = CreateFrame("Button", "Slot"); a:SetPoint("CENTER", 0, 0)
+        a:SetWidth(10); a:SetHeight(10)
+        local tt = CreateFrame("GameTooltip", "TT")
+        tt:SetOwner(a, "ANCHOR_RIGHT")
+        local has, _, cost = tt:SetInventoryItem("player", 16)
+        assert(has == 1 and cost == 1234, "equipped: " .. tostring(cost))
+        local _, _, empty = tt:SetInventoryItem("player", 15)
+        assert(empty == 0, "an empty slot still pushes 0")
+        local _, bag = tt:SetBagItem(0, 1)
+        assert(bag == 567, "bag: " .. tostring(bag))
+        local _, whole = tt:SetBagItem(0, 2)
+        assert(whole == 0, "no cost: " .. tostring(whole))
+    "#,
+    )
+    .unwrap();
+    assert!(s.take_errors().is_empty());
+}
