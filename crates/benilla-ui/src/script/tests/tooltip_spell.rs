@@ -1065,9 +1065,7 @@ fn firebolt() -> SpellTooltipView {
     }
 }
 
-/// The spells a hover reads from the VM's own state are what the app pushes ahead of the hover:
-/// the pet bar's spell slots (never a token), the pet's book, the quest's and each log entry's
-/// reward spell, a craft recipe's spell subject (never an item one), and every unit's auras.
+/// Pet-bar tokens and craft item subjects name no spell, so they are left out.
 #[test]
 fn the_spell_subjects_are_what_the_setters_read_from_the_vm() {
     let mut s = script();
@@ -1141,9 +1139,7 @@ fn the_spell_subjects_are_what_the_setters_read_from_the_vm() {
     assert_eq!(subjects, vec![116, 133, 172, 589, 3110, 6307, 8921, 17253]);
 }
 
-/// A hover whose view is not in the store yet draws the fallback name and asks; the app's answer
-/// re-renders that tooltip whole, with no second hover, as the reference builds the tooltip at the
-/// call (`SetPetAction 0x532730` into `0x52e610`).
+/// No second hover needed: the reference builds the whole tooltip at the call (`0x52e610`).
 #[test]
 fn a_missed_view_re_renders_the_tooltip_when_the_app_answers() {
     let mut s = script();
@@ -1188,9 +1184,7 @@ fn a_missed_view_re_renders_the_tooltip_when_the_app_answers() {
     assert!(s.take_errors().is_empty());
 }
 
-/// Beast Training's detail icon has no fallback name (`craft_tooltip` hops to the taught pet
-/// spell), so its miss is an empty, hidden plate that the answer shows; an enchant link, which no
-/// pushed set can name, fills the same way.
+/// Beast Training's icon has no fallback name, so its miss is a hidden plate.
 #[test]
 fn a_hidden_miss_shows_and_an_enchant_link_fills_when_answered() {
     let mut s = script();
@@ -1253,8 +1247,7 @@ fn a_hidden_miss_shows_and_an_enchant_link_fills_when_answered() {
     assert!(s.take_errors().is_empty());
 }
 
-/// The answer re-renders only content the miss still owns: a new hover, a hide, a line Lua added
-/// after the setter, or a running fade leaves the tooltip as it is.
+/// A new hover, a hide, an added line or a running fade leaves the tooltip as it is.
 #[test]
 fn new_content_or_an_added_line_ends_the_wait() {
     let mut s = script();
@@ -1305,9 +1298,7 @@ fn new_content_or_an_added_line_ends_the_wait() {
     assert!(s.take_errors().is_empty());
 }
 
-/// Each waiting tooltip is re-read when its turn comes: a re-render's `OnTooltipCleared` that
-/// moves another waiting tooltip to a different spell leaves that one on its new wait, whichever
-/// of the two the answer reaches first.
+/// A re-render's `OnTooltipCleared` can move another waiting tooltip onto a new spell.
 #[test]
 fn a_wait_replaced_by_an_earlier_re_render_is_not_replayed() {
     let mut s = script();

@@ -676,8 +676,7 @@ fn the_mouseover_token_clears_when_no_unit_is_hovered() {
     }
 }
 
-/// A quest panel that opens this frame is hoverable in its tick: the quest feed pushes the reward
-/// spell the spell feed reads back out of the VM.
+/// A quest panel that opens this frame is hoverable in its tick.
 #[test]
 fn the_spell_feed_runs_after_the_quest_feed() {
     let mut app = crate::game_plugins::schedule_tests::headless_client();
@@ -688,10 +687,7 @@ fn the_spell_feed_runs_after_the_quest_feed() {
     ));
 }
 
-/// The spells the VM holds for a hover outside the player's book have their views after the
-/// feed's first tick, so each first hover is the whole tooltip: the pet bar's spell, Beast
-/// Training's taught spell and the target-of-target's debuff (`SetPetAction 0x532730`,
-/// `SetCraftSpell 0x533e90` and the aura builder `0x52f880` read the client's own records).
+/// The pet bar, Beast Training and target-of-target hovers are whole on the first hover.
 #[test]
 fn the_feed_pushes_the_spells_the_vm_holds_before_a_hover() {
     use benilla_ui::script::{
