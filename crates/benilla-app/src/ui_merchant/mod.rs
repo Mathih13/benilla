@@ -900,6 +900,56 @@ pub(crate) mod purse_fixture {
         ]))
     }
 
+    /// The stores [`feed_repair_costs`] reads, [`seat`]ed, and the player with the sword at
+    /// `slot_field`; the player's entity comes back for later field writes.
+    pub(crate) fn repair_app(slot_field: u16) -> (App, Entity) {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.init_resource::<Items>()
+            .init_resource::<crate::net::GuidIndex>()
+            .init_resource::<MerchantOpen>()
+            .init_resource::<crate::net::Reputations>()
+            .insert_resource(NetCommands(tx));
+        seat(app.world_mut());
+        let me = app
+            .world_mut()
+            .spawn((SelfPlayer, Guid(0x5e1f), player(slot_field, 0)))
+            .id();
+        (app, me)
+    }
+
+    /// A VM showing the sword wherever a binding may look for it, live id 16, backpack slot 1 and
+    /// bank slot 1, and a tooltip `TT` to hover them with.
+    pub(crate) fn sword_vm() -> UiScript {
+        let mut script = UiScript::new().unwrap();
+        let mut inv: benilla_ui::script::InventorySlots = Default::default();
+        inv[16] = Some(benilla_ui::script::InvSlotView {
+            item_id: SWORD_ENTRY,
+            ..Default::default()
+        });
+        script.set_inventory_slots(inv);
+        let mut bag = benilla_ui::script::ContainerState {
+            num_slots: 16,
+            ..Default::default()
+        };
+        bag.slots.insert(
+            1,
+            benilla_ui::script::ContainerSlot {
+                item_id: SWORD_ENTRY,
+                count: 1,
+                ..Default::default()
+            },
+        );
+        script.set_container(0, Some(bag.clone()));
+        script.set_container(crate::ui_items::BANK_CONTAINER, Some(bag));
+        script
+            .run(
+                r#"CreateFrame("GameTooltip", "TT"):SetOwner(CreateFrame("Frame"), "ANCHOR_NONE")"#,
+            )
+            .unwrap();
+        script
+    }
+
     /// The message's string, and a recorder of the `UI_ERROR_MESSAGE` lines [`shown`] reads.
     pub(crate) fn record_errors(script: &UiScript) {
         script
@@ -1112,40 +1162,8 @@ mod tests {
 
         let (full, discounted) = sword_prices();
         let priced = |slot_field: u16, read: &str| {
-            let (tx, _rx) = crossbeam_channel::unbounded();
-            let mut app = App::new();
-            app.init_resource::<Items>()
-                .init_resource::<crate::net::GuidIndex>()
-                .init_resource::<MerchantOpen>()
-                .init_resource::<crate::net::Reputations>()
-                .insert_resource(NetCommands(tx));
-            seat(app.world_mut());
-            app.world_mut()
-                .spawn((SelfPlayer, Guid(0x5e1f), player(slot_field, 0)));
-            let mut script = UiScript::new().unwrap();
-            let mut inv: benilla_ui::script::InventorySlots = Default::default();
-            inv[16] = Some(benilla_ui::script::InvSlotView {
-                item_id: SWORD_ENTRY,
-                ..Default::default()
-            });
-            script.set_inventory_slots(inv);
-            let mut bag = benilla_ui::script::ContainerState {
-                num_slots: 16,
-                ..Default::default()
-            };
-            bag.slots.insert(
-                1,
-                benilla_ui::script::ContainerSlot {
-                    item_id: SWORD_ENTRY,
-                    count: 1,
-                    ..Default::default()
-                },
-            );
-            script.set_container(0, Some(bag));
-            script
-                .run(r#"CreateFrame("GameTooltip", "TT"):SetOwner(CreateFrame("Frame"), "ANCHOR_NONE")"#)
-                .unwrap();
-            app.insert_non_send_resource(script);
+            let (mut app, _) = repair_app(slot_field);
+            app.insert_non_send_resource(sword_vm());
             let read_cost = |app: &mut App| {
                 app.world_mut().run_system_once(feed_repair_costs).unwrap();
                 let script = app.world().non_send_resource::<UiScript>();
@@ -1192,50 +1210,14 @@ mod tests {
         // `PLAYER_FIELD_BANK_SLOT_1`, inventory slot 39.
         let bank_1 = FIELD_PLAYER_INV_SLOT_HEAD + 2 * 39;
 
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut app = App::new();
-        app.init_resource::<Items>()
-            .init_resource::<crate::net::GuidIndex>()
-            .init_resource::<MerchantOpen>()
-            .init_resource::<crate::net::Reputations>()
-            .insert_resource(NetCommands(tx))
-            .add_systems(Update, feed_repair_costs);
-        seat(app.world_mut());
+        let (mut app, me) = repair_app(main_hand);
+        app.add_systems(Update, feed_repair_costs);
         let tables = app.world_mut().remove_resource::<RepairTables>().unwrap();
-        let me = app
-            .world_mut()
-            .spawn((SelfPlayer, Guid(0x5e1f), player(main_hand, 0)))
-            .id();
-        let mut script = UiScript::new().unwrap();
+        let mut script = sword_vm();
         script.set_merchant(Some(MerchantState {
             can_repair: true,
             ..Default::default()
         }));
-        let mut inv: benilla_ui::script::InventorySlots = Default::default();
-        inv[16] = Some(benilla_ui::script::InvSlotView {
-            item_id: SWORD_ENTRY,
-            ..Default::default()
-        });
-        script.set_inventory_slots(inv);
-        let mut bag = benilla_ui::script::ContainerState {
-            num_slots: 16,
-            ..Default::default()
-        };
-        bag.slots.insert(
-            1,
-            benilla_ui::script::ContainerSlot {
-                item_id: SWORD_ENTRY,
-                count: 1,
-                ..Default::default()
-            },
-        );
-        script.set_container(0, Some(bag.clone()));
-        script.set_container(crate::ui_items::BANK_CONTAINER, Some(bag));
-        script
-            .run(
-                r#"CreateFrame("GameTooltip", "TT"):SetOwner(CreateFrame("Frame"), "ANCHOR_NONE")"#,
-            )
-            .unwrap();
         app.insert_non_send_resource(script);
 
         let entity =
