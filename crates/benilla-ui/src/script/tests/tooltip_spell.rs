@@ -1138,10 +1138,19 @@ fn the_spell_subjects_are_what_the_setters_read_from_the_vm() {
     s.set_auras("pet", Some(vec![aura(172)]));
     s.set_auras("targettarget", Some(vec![aura(589)]));
     s.set_auras("party1", Some(vec![aura(8921)]));
+    s.set_tracking(Some(TrackingState {
+        spell_id: 2580,
+        name: Some("Find Minerals".into()),
+        icon: None,
+        cancelable: true,
+    }));
 
     let mut subjects = s.spell_tooltip_subjects();
     subjects.sort_unstable();
-    assert_eq!(subjects, vec![116, 133, 172, 589, 3110, 6307, 8921, 17253]);
+    assert_eq!(
+        subjects,
+        vec![116, 133, 172, 589, 2580, 3110, 6307, 8921, 17253]
+    );
 }
 
 /// No second hover and no second `OnTooltipCleared`: the reference builds the tooltip at the call.

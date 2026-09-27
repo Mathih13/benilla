@@ -711,7 +711,6 @@ fn the_feed_pushes_the_spells_the_vm_holds_before_a_hover() {
     })
     .insert_resource(NetCommands(tx))
     .init_resource::<Items>()
-    .init_resource::<crate::target::Selection>()
     .init_resource::<crate::net::GuidIndex>()
     .init_resource::<crate::spell::SpellModifiers>()
     .add_systems(Update, feed_spell_tooltips);

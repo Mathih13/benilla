@@ -333,16 +333,13 @@ struct SpellTooltipSources<'w> {
 }
 
 /// Push a view for every spell the UI can hover (the book, the class's talent ranks, the open
-/// trainer's services, the auras, and what the VM holds: the pet's spells, the quest rewards, the
-/// craft's subjects) before it is hovered, as the reference reads them all locally; an ask for any
-/// other id too.
+/// trainer's services, and what the VM holds: the pet's spells, the quest rewards, the craft's
+/// subjects, every unit's auras and the tracking spell) before it is hovered, as the reference
+/// reads them all locally; an ask for any other id too.
 fn feed_spell_tooltips(
     script: Option<NonSendMut<UiScript>>,
     actions: Option<Res<PlayerActions>>,
     spell_sources: SpellTooltipSources,
-    auras: Option<Res<crate::ui_aura::PlayerAuraCache>>,
-    selection: Res<crate::target::Selection>,
-    stores: Query<&ObjectStore>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     // The auto-attack target, the melee range cell's second reach.
     engaged_q: Query<&crate::creature_anim::Engaged, With<SelfPlayer>>,
@@ -372,7 +369,7 @@ fn feed_spell_tooltips(
         return;
     };
     let mut wanted: Vec<u32> = script.take_spell_tooltip_asks();
-    // What the VM holds for a hover: the pet's spells, quest rewards, craft subjects, unit auras.
+    // What the VM holds for a hover: pet spells, quest rewards, craft subjects, auras, tracking.
     wanted.extend(
         script
             .spell_tooltip_subjects()
@@ -412,28 +409,6 @@ fn feed_spell_tooltips(
                 );
             }
         }
-    }
-    if let Some(auras) = auras.as_deref() {
-        wanted.extend(auras.spell_ids().filter(|s| !memory.pushed.contains(s)));
-    }
-    // `SetTrackingSpell`: the display cache leaves the tracking aura out, so read the raw auras.
-    if let Ok(store) = self_q.single() {
-        wanted.extend(
-            store
-                .0
-                .unit_auras()
-                .map(|a| a.spell_id)
-                .filter(|s| !memory.pushed.contains(s)),
-        );
-    }
-    if let Some(store) = selection.target.and_then(|e| stores.get(e).ok()) {
-        wanted.extend(
-            store
-                .0
-                .unit_auras()
-                .map(|a| a.spell_id)
-                .filter(|s| !memory.pushed.contains(s)),
-        );
     }
     let home_area: Option<String> = home_bind
         .as_deref()
@@ -507,7 +482,7 @@ fn feed_spell_tooltips(
         memory.reagents = reagent_state;
         wanted.extend(memory.pushed.drain());
     }
-    // The sources overlap (the player's and the target's auras come twice): build each id once.
+    // The sources overlap (a self-buff is in the book and on the player): build each id once.
     wanted.sort_unstable();
     wanted.dedup();
     // Build, then push: the build's borrow of the VM's strings ends before the store is written.
