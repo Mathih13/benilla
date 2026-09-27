@@ -675,3 +675,120 @@ fn the_mouseover_token_clears_when_no_unit_is_hovered() {
         assert_eq!(named(&mut app), (None, None), "after {what}");
     }
 }
+
+/// A quest panel that opens this frame is hoverable in its tick: the quest feed pushes the reward
+/// spell the spell feed reads back out of the VM.
+#[test]
+fn the_spell_feed_runs_after_the_quest_feed() {
+    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    assert!(crate::test_support::runs_before(
+        &mut app,
+        crate::ui_quest::feed_quest,
+        feed_spell_tooltips
+    ));
+}
+
+/// The spells the VM holds for a hover outside the player's book have their views after the
+/// feed's first tick, so each first hover is the whole tooltip: the pet bar's spell, Beast
+/// Training's taught spell and the target-of-target's debuff (`SetPetAction 0x532730`,
+/// `SetCraftSpell 0x533e90` and the aura builder `0x52f880` read the client's own records).
+#[test]
+fn the_feed_pushes_the_spells_the_vm_holds_before_a_hover() {
+    use benilla_ui::script::{
+        AuraState, CraftRecipe, CraftState, CraftTooltip, PetActionView, TradeSkillDifficulty,
+    };
+    let spell = |name: &str, description: &str| benilla_formats::SpellDisplay {
+        name: name.into(),
+        description: Some(description.into()),
+        ..Default::default()
+    };
+    let catalog = std::collections::HashMap::from([
+        (3110, spell("Firebolt", "Deals Fire damage.")),
+        (17253, spell("Bite", "Bite the enemy.")),
+        (589, spell("Shadow Word: Pain", "Shadow damage over time.")),
+    ]);
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut app = App::new();
+    app.insert_resource(Spells {
+        catalog: benilla_formats::SpellCatalog::from_displays(catalog),
+        ..Spells::empty_for_tests()
+    })
+    .insert_resource(NetCommands(tx))
+    .init_resource::<Items>()
+    .init_resource::<crate::target::Selection>()
+    .init_resource::<crate::net::GuidIndex>()
+    .init_resource::<crate::spell::SpellModifiers>()
+    .add_systems(Update, feed_spell_tooltips);
+
+    let mut script = UiScript::new().unwrap();
+    script.set_pet_actions(
+        true,
+        true,
+        true,
+        vec![PetActionView {
+            name: Some("Firebolt".into()),
+            spell_id: Some(3110),
+            ..Default::default()
+        }],
+    );
+    script.set_craft(Some(CraftState {
+        name: "Beast Training".into(),
+        rank: 0,
+        max_rank: 0,
+        craft_type: 1,
+        recipes: vec![CraftRecipe {
+            spell_id: 24599,
+            tooltip: CraftTooltip::Spell(17253),
+            name: "Bite".into(),
+            sub_name: String::new(),
+            difficulty: TradeSkillDifficulty::Optimal,
+            num_available: 1,
+            icon: None,
+            description: None,
+            needs_item_target: false,
+            reagents: vec![],
+            tools: vec![],
+            spell_level: 0,
+        }],
+    }));
+    script.set_auras(
+        "targettarget",
+        Some(vec![AuraState {
+            spell_id: 589,
+            name: Some("Shadow Word: Pain".into()),
+            ..Default::default()
+        }]),
+    );
+    app.insert_non_send_resource(script);
+    app.update();
+
+    let script = app.world().non_send_resource::<UiScript>();
+    script
+        .run(
+            r#"
+            local a = CreateFrame("Button", "B"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
+            CreateFrame("GameTooltip", "TT")
+            local function lines()
+                local t = {}
+                for i = 1, TT:NumLines() do t[i] = getglobal("TTTextLeft" .. i):GetText() end
+                return table.concat(t, " | ")
+            end
+            TT:SetOwner(B, "ANCHOR_RIGHT"); TT:SetPetAction(1); PET = lines()
+            TT:SetOwner(B, "ANCHOR_RIGHT"); TT:SetCraftSpell(1); CRAFT = lines()
+            TT:SetOwner(B, "ANCHOR_RIGHT"); TT:SetUnitDebuff("targettarget", 1); TOT = lines()
+            "#,
+        )
+        .unwrap();
+    assert_eq!(
+        script.eval::<String>("return PET").unwrap(),
+        "Firebolt | Deals Fire damage."
+    );
+    assert_eq!(
+        script.eval::<String>("return CRAFT").unwrap(),
+        "Bite | Bite the enemy."
+    );
+    assert_eq!(
+        script.eval::<String>("return TOT").unwrap(),
+        "Shadow Word: Pain | Shadow damage over time."
+    );
+}

@@ -5,14 +5,16 @@
 //! Only `SetPlayerBuff` adds the gold time-remaining line.
 //!
 //! The app resolves each spell into a [`SpellTooltipView`] (`$`-tokens, cast, range and duration
-//! text), kept in an ask-once store by spell id: a miss records the id, the app pushes the view and
-//! the next hover repaints.
+//! text), kept in an ask-once store by spell id and pushed ahead of a hover. A miss records the
+//! id; a `set_spell_by_id` miss also waits, and the app's answer re-renders that tooltip. The
+//! talent and tracking hovers show their view on the next hover.
 
 use mlua::{Lua, Table, Value};
 
-use super::object::frame_handle_of;
-use super::tooltip::{append_line, clear_content, fire_cleared};
+use super::object::{frame_handle_of, frame_wrapper};
+use super::tooltip::{append_line, clear_content, fire_cleared, tip_mut};
 use super::{CraftTooltip, Model, TrainerTooltip};
+use crate::widget::FrameHandle;
 
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 /// The rank column's gray, `0xff808080`.
@@ -62,17 +64,116 @@ pub struct SpellTooltipView {
 }
 
 impl super::UiScript {
-    /// Store or replace a spell's view, answering its ask.
+    /// Store or replace a spell's view, answering its ask: a tooltip that missed it re-renders now.
+    /// The reference builds the whole tooltip at the call (`0x52e610`) and has no such second
+    /// render, whose `OnTooltipCleared` Lua sees a frame after the hover's.
     pub fn set_spell_tooltip(&mut self, spell_id: u32, view: SpellTooltipView) {
-        let mut model = self.model_mut();
-        model.spell_tooltip_asks.remove(&spell_id);
-        model.spell_tooltips.insert(spell_id, view);
+        let waiting: Vec<FrameHandle> = {
+            let mut model = self.model_mut();
+            model.spell_tooltip_asks.remove(&spell_id);
+            model.spell_tooltips.insert(spell_id, view);
+            model
+                .spell_tooltip_waits
+                .iter()
+                .filter(|(_, w)| w.spell_id == spell_id)
+                .map(|(h, _)| *h)
+                .collect()
+        };
+        for h in waiting {
+            if let Err(e) = answer_wait(&self.lua, h, spell_id) {
+                self.push_error(e);
+            }
+        }
     }
 
     /// Drain the spell ids the renderers asked for and the store lacked.
     pub fn take_spell_tooltip_asks(&mut self) -> Vec<u32> {
         self.model_mut().spell_tooltip_asks.drain().collect()
     }
+
+    /// The spells a hover reads from the VM's own state rather than the player's book: the pet's
+    /// bar and book, the open quest's and each log entry's reward spell, the open craft's spell
+    /// subjects, and every unit's auras. The app pushes their views ahead of a hover.
+    pub fn spell_tooltip_subjects(&self) -> Vec<u32> {
+        let model = self.model_ref();
+        let pet_bar = model
+            .pet_bar
+            .slots
+            .iter()
+            .filter(|s| !s.view.is_token)
+            .filter_map(|s| s.view.spell_id);
+        let pet_book = model.pet_book.slots.iter().map(|s| s.spell_id);
+        let rewards = model
+            .quest
+            .iter()
+            .filter_map(|q| q.reward_spell.as_ref())
+            .chain(
+                model
+                    .quest_log
+                    .entries
+                    .iter()
+                    .filter_map(|e| e.detail.as_ref()?.reward_spell.as_ref()),
+            )
+            .map(|s| s.spell_id);
+        let craft = model
+            .craft
+            .iter()
+            .flat_map(|c| &c.recipes)
+            .filter_map(|r| match r.tooltip {
+                CraftTooltip::Spell(id) => Some(id),
+                CraftTooltip::Item(_) => None,
+            });
+        let auras = model.auras.values().flatten().map(|a| a.spell_id);
+        pet_bar
+            .chain(pet_book)
+            .chain(rewards)
+            .chain(craft)
+            .chain(auras)
+            .filter(|&id| id != 0)
+            .collect()
+    }
+}
+
+/// A spell render that found no view: its arguments, and the line count it left, so a tooltip Lua
+/// has since added lines to keeps them.
+#[derive(Clone)]
+pub(crate) struct SpellWait {
+    spell_id: u32,
+    fallback_name: Option<String>,
+    opts: SpellRenderOpts,
+    remaining: Option<String>,
+    num_lines: usize,
+}
+
+/// Re-run the render `h` still waits with on `spell_id`, read afresh: an earlier re-render's Lua
+/// may have replaced it. Lines added since, or a fade under way, keep the tooltip as it is.
+fn answer_wait(lua: &Lua, h: FrameHandle, spell_id: u32) -> mlua::Result<()> {
+    let (id, wait) = {
+        let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+        let Some(wait) = model
+            .spell_tooltip_waits
+            .get(&h)
+            .filter(|w| w.spell_id == spell_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let t = tip_mut(&mut model, h)?;
+        if t.num_lines != wait.num_lines || t.fade_start.is_some() {
+            model.spell_tooltip_waits.remove(&h);
+            return Ok(());
+        }
+        (model.frame_id(h), wait)
+    };
+    let this = frame_wrapper(lua, id)?;
+    set_spell_by_id(
+        lua,
+        &this,
+        wait.spell_id,
+        wait.fallback_name,
+        wait.opts,
+        wait.remaining,
+    )
 }
 
 /// Look up a spell's view; a miss records the ask.
@@ -297,8 +398,23 @@ pub(super) fn set_spell_by_id(
     match spell_view_of(lua, spell_id) {
         Some(v) => render_spell(lua, this, &v, opts, remaining, None)?,
         None => {
-            if let Some(name) = fallback_name {
+            if let Some(name) = fallback_name.clone() {
                 append_line(lua, this, (name, WHITE), None, false)?;
+            }
+            // The fallback stands until the app answers the ask; id 0 asks nothing.
+            if spell_id != 0 {
+                let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+                let num_lines = tip_mut(&mut model, h)?.num_lines;
+                model.spell_tooltip_waits.insert(
+                    h,
+                    SpellWait {
+                        spell_id,
+                        fallback_name,
+                        opts,
+                        remaining,
+                        num_lines,
+                    },
+                );
             }
         }
     }
