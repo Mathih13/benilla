@@ -410,8 +410,7 @@ impl Model {
             .clone()
     }
 
-    /// The player's item's repair cost at live-API id `slot`, the vault band keyed as its
-    /// container slot, as [`Self::inv_slot`] routes it; 0 for no cost.
+    /// The player's repair cost at live id `slot`, the vault band by its container slot.
     pub(super) fn inv_repair_cost(&self, slot: usize) -> u32 {
         let costs = &self.repair_costs;
         let cost = if BANK_INV_SLOTS.contains(&slot) {

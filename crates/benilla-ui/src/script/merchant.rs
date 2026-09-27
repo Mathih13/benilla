@@ -66,14 +66,12 @@ pub struct ItemStatsHead {
     pub sell_price: u32,
 }
 
-/// Each damaged item's repair cost in copper, `0x4faf30` after the open vendor's discount, by the
-/// slot the tooltip bindings take; an absent slot costs 0.
+/// Each damaged item's repair cost in copper after the vendor's discount (`0x4faf30`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RepairCosts {
-    /// The player's equipped items by live inventory id (1-based, `SetInventoryItem`'s slot).
+    /// Equipped items by live inventory id.
     pub equipped: std::collections::HashMap<u32, u32>,
-    /// Every container's items by `(bag, slot)`, as `SetBagItem` takes them: the backpack and
-    /// bags 0-4, the bank vault -1 and its bags 5-10.
+    /// Container items by `(bag, slot)`: bags 0-4, the bank vault -1 and bank bags 5-10.
     pub bags: std::collections::HashMap<(i64, u32), u32>,
 }
 
@@ -105,7 +103,7 @@ impl super::UiScript {
         self.model_mut().repair_all_cost = copper;
     }
 
-    /// Push each carried item's repair cost, which the item tooltip bindings return.
+    /// Push the repair costs the item tooltip bindings return.
     pub fn set_repair_costs(&mut self, costs: RepairCosts) {
         self.model_mut().repair_costs = costs;
     }

@@ -338,8 +338,8 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     // not byte-read as `SetBagItem`'s two is (`0x534985`). Unit-keyed through `Model::inv_slot`:
     // an inspected item (`InspectPaperDollFrame.xml:20`) has no durability or creator, so those
     // lines do not show, as in the reference. An armed shopping tooltip renders the compare
-    // shape; the arm is consumed either way. repairCost is the player's item's `0x4faf30` cost
-    // (`0x5332fb`); an inspected unit's item carries no durability, so 0.
+    // shape; the arm is consumed either way. repairCost is the item's cost (`0x5332fb`), 0 for an
+    // inspected unit's.
     m.set(
         "SetInventoryItem",
         lua.create_function(
@@ -449,8 +449,7 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     // GameTooltip:SetBagItem(bag, slot) -> hasCooldown, repairCost: the real-instance hover and
     // the one money source: with the merchant open and repair off (`0x52e376`), the engine fires
     // `OnTooltipAddMoney(SellPrice × stack)`, or prints ITEM_UNSELLABLE at price 0 (`0x854a74`,
-    // pushed at `0x52e4a3`). repairCost is the item's `0x4faf30` cost (`0x534975`), which stock
-    // shows in repair mode when above 0 (`ContainerFrame.lua:274-277`).
+    // pushed at `0x52e4a3`). repairCost is the item's cost (`0x534975`), shown in repair mode.
     m.set(
         "SetBagItem",
         lua.create_function(|lua, (this, bag, slot): (Table, i64, u32)| {

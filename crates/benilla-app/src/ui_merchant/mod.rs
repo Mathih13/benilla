@@ -1,7 +1,7 @@
 //! The merchant window's app side: [`MerchantOpen`] holds the `SMSG_LIST_INVENTORY` rows,
 //! [`feed_merchant`] pushes them with the buyback and repair rows, the purse and the refusals,
-//! [`feed_repair_costs`] each item's repair cost and the repair-all total, and [`drain_merchant`]
-//! sends the Lua intents. A bag click sells through [`crate::ui_items`].
+//! [`feed_repair_costs`] the repair costs, and [`drain_merchant`] sends the Lua intents. A
+//! bag click sells through [`crate::ui_items`].
 
 use benilla_protocol::messages::{buy_result, sell_result, VendorItem};
 use benilla_world::interact::WorldRightPress;
@@ -302,9 +302,7 @@ fn item_repair_cost(
         .repair_cost(points, level, quality, class, subclass, discount)
 }
 
-/// Each damaged item's cost, for the tooltip bindings that price any slot's item (`0x5332fb`,
-/// `0x534975`): equipped by live id (slot + 1), the backpack, the four bags, the bank vault and its
-/// six bags by `(bag, slot)`. The keyring is skipped: a key carries no durability.
+/// Each damaged carried or banked item's cost (`0x4faf30`), keyed as the bindings take it.
 fn repair_costs(
     store: &benilla_protocol::ObjectFields,
     objects: &Objects,
@@ -336,7 +334,7 @@ fn repair_costs(
                 .insert((crate::ui_items::BANK_CONTAINER, u32::from(i) + 1), c);
         }
     }
-    // Bags 1-4 sit in inventory slots 19-22, bank bags 5-10 in the six bank bag slots.
+    // Bags 1-4 are inventory slots 19-22, bank bags 5-10 the bank bag slots.
     let bags = (1..=4u8)
         .map(|b| (i64::from(b), store.player_inv_slot(18 + b)))
         .chain((0..crate::ui_items::BANK_BAGS).map(|i| {
@@ -363,9 +361,7 @@ fn repair_costs(
     costs
 }
 
-/// The repair-all total over the reference's three sweeps (`0x4fbd60`): equipped slots 0-18, the
-/// backpack and the four bags' contents, never the bank. It sums the discounted, rounded per-item
-/// costs (`0x4fbe0b`); the total itself is never discounted.
+/// `GetRepairAllCost`'s sum of the per-item costs (`0x4fbd60`): equipped and bags, never the bank.
 fn repair_all_cost(costs: &RepairCosts) -> u32 {
     let carried = costs
         .bags
@@ -460,9 +456,7 @@ struct RepairFeedMemo {
     pushed: Option<(u32, RepairCosts)>,
 }
 
-/// Push each carried item's repair cost, which the reference prices at the call (`0x4faf30`) with
-/// the open vendor's discount, the full price with none open; and `GetRepairAllCost`'s total
-/// (`0x4fbd60`), 0 unless a repairing vendor is open.
+/// Push each item's repair cost, and `GetRepairAllCost`'s total while a repairer is open.
 fn feed_repair_costs(
     script: Option<NonSendMut<UiScript>>,
     open: Res<MerchantOpen>,
@@ -478,13 +472,12 @@ fn feed_repair_costs(
         return;
     };
     let (memo, vm_reset) = memo.get_reset(&script);
-    // No self store is no data: the logout frames keep the last push, as `feed_char` does.
+    // No self store at logout: keep the last push, as `feed_char` does.
     let Some(player) = inv.self_store.iter().next() else {
         return;
     };
     let vendor = vendor_store(&open, &units);
-    // The open merchant's discount for the player (`0x4faf8a`); `0x4faf30` keeps the full price
-    // unless it resolves the vendor's unit.
+    // The open vendor's price discount (`0x4faf8a`), 0 with none open.
     let discount = vendor.map_or(0.0, |vendor| {
         crate::target::vendor_price_discount(
             reactions.factions.as_deref(),
@@ -494,7 +487,6 @@ fn feed_repair_costs(
         )
     });
     let repairer = vendor.is_some_and(|store| store.0.unit_npc_flags() & NPC_FLAG_REPAIR != 0);
-    // Every watch is bound before the OR, so none observes a frame late.
     let objects_moved = inv.changes.moved();
     let self_changed = !inv.self_changed.is_empty();
     let templates_moved = memo.templates.moved(items.template_epoch());
@@ -900,8 +892,7 @@ pub(crate) mod purse_fixture {
         ]))
     }
 
-    /// The stores [`feed_repair_costs`] reads, [`seat`]ed, and the player with the sword at
-    /// `slot_field`; the player's entity comes back for later field writes.
+    /// [`seat`] and the player with the sword at `slot_field`; returns the player's entity too.
     pub(crate) fn repair_app(slot_field: u16) -> (App, Entity) {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
@@ -918,8 +909,7 @@ pub(crate) mod purse_fixture {
         (app, me)
     }
 
-    /// A VM showing the sword wherever a binding may look for it, live id 16, backpack slot 1 and
-    /// bank slot 1, and a tooltip `TT` to hover them with.
+    /// A VM with the sword at live id 16, backpack slot 1 and bank slot 1, and a tooltip `TT`.
     pub(crate) fn sword_vm() -> UiScript {
         let mut script = UiScript::new().unwrap();
         let mut inv: benilla_ui::script::InventorySlots = Default::default();
@@ -1151,9 +1141,7 @@ mod tests {
         assert!(lines.is_empty() && rows.is_empty());
     }
 
-    /// A carried item's cost is the discounted price at the open vendor and the full one after it
-    /// closes (`0x4faf30`), keyed as the bindings take it: the sword worn in the main hand answers
-    /// `SetInventoryItem("player", 16)`, the same sword in backpack slot 1 `SetBagItem(0, 1)`.
+    /// An item's cost is discounted at the vendor and full once it closes (`0x4faf30`).
     #[test]
     fn each_items_cost_takes_the_open_vendors_discount() {
         use benilla_protocol::field::FIELD_PLAYER_INV_SLOT_HEAD;
@@ -1175,7 +1163,7 @@ mod tests {
         };
         let want = (i64::from(discounted), i64::from(full));
 
-        // The main hand (slot 15), live id 16.
+        // Main hand, inventory slot 15.
         let worn = priced(
             FIELD_PLAYER_INV_SLOT_HEAD + 2 * 15,
             r#"local _, _, c = TT:SetInventoryItem("player", 16) return c"#,
@@ -1192,11 +1180,8 @@ mod tests {
         );
     }
 
-    /// The feed recomputes only when an input moves, so each input alone must reopen its gate: the
-    /// tables arriving, a repair's durability write, the sword changing slot, the vendor's PvP flag
-    /// (the discount alone), the vendor closing (the repair flag alone) and a template answer.
-    /// Driven through `App::update`, whose memo and change ticks persist across frames. A bank item
-    /// is priced for its tooltip but left out of the repair-all total (`0x4fbd60`).
+    /// Each gate input alone reopens the feed, through `App::update` so the memo persists; a bank
+    /// item is priced but left out of the total (`0x4fbd60`).
     #[test]
     fn each_input_alone_reopens_the_repair_cost_gate() {
         use benilla_protocol::field::{FIELD_PLAYER_INV_SLOT_HEAD, FIELD_UNIT_FLAGS};
@@ -1226,7 +1211,7 @@ mod tests {
             let mut store = app.world_mut().get_mut::<ObjectStore>(e).unwrap();
             store.0.merge(ObjectFields::from_pairs(pairs));
         };
-        // (worn, backpack slot 1, bank slot 1, `GetRepairAllCost`) after one frame.
+        // (worn, backpack, bank, `GetRepairAllCost`) after one frame.
         let frame = |app: &mut App| {
             app.update();
             app.world()
@@ -1246,13 +1231,12 @@ mod tests {
             .find(|(_, g)| g.0 == VENDOR)
             .unwrap()
             .0;
-        // The sword's guid pair moved from one player field to another.
         let hi = (SWORD >> 32) as u32;
         let moved =
             |from: u16, to: u16| [(from, 0), (from + 1, 0), (to, SWORD as u32), (to + 1, hi)];
 
         assert_eq!(frame(&mut app), (0, 0, 0, 0), "no tables, no prices");
-        // The fixture's 1 copper a point, less 0.1 at this vendor: 40 points cost 36.
+        // 1 copper a point, less 0.1: 40 points cost 36.
         app.insert_resource(tables);
         assert_eq!(frame(&mut app), (36, 0, 0, 36), "the tables arrive");
         let sword = entity(&app, SWORD);

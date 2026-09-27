@@ -651,9 +651,8 @@ fn set_merchant_compare_item_answers_one_or_nil_per_candidate_slot() {
     );
 }
 
-/// Both item bindings return the pushed repair cost, `SetInventoryItem`'s third (`0x5332fb`) and
-/// `SetBagItem`'s second (`0x534975`), a bank vault item's through either; an item with no cost, an
-/// empty equipment slot and an inspected unit's item answer 0.
+/// Both bindings return the pushed cost, a vault item's through either; no cost, an empty slot
+/// and an inspected unit's item answer 0.
 #[test]
 fn item_bindings_return_the_pushed_repair_cost() {
     let mut s = script();

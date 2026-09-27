@@ -248,9 +248,8 @@ fn doll_hover_renders_the_live_instance() {
     assert!(s.errors().is_empty(), "errors: {:?}", s.errors());
 }
 
-/// In repair mode a damaged item's hover adds `REPAIR_COST` and its coins under the tooltip, off
-/// the cost the binding returns: the doll through `SetInventoryItem` (`PaperDollFrame.lua:757-760`),
-/// a bag slot through `SetBagItem` (`ContainerFrame.lua:274-277`). Out of repair mode, neither.
+/// In repair mode a damaged item's hover adds `REPAIR_COST` and its coins, worn
+/// (`PaperDollFrame.lua:757-760`) or bagged (`ContainerFrame.lua:274-277`); out of it, neither.
 #[test]
 fn repair_mode_hover_shows_the_items_repair_cost() {
     let _data = benilla_formats::wow_data_or_skip!();
