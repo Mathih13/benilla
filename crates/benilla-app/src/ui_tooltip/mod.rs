@@ -507,6 +507,9 @@ fn feed_spell_tooltips(
         memory.reagents = reagent_state;
         wanted.extend(memory.pushed.drain());
     }
+    // The sources overlap (the player's and the target's auras come twice): build each id once.
+    wanted.sort_unstable();
+    wanted.dedup();
     // Build, then push: the build's borrow of the VM's strings ends before the store is written.
     let mut built: Vec<(u32, benilla_ui::script::SpellTooltipView)> = Vec::new();
     {

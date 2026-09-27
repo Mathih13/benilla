@@ -1053,6 +1053,15 @@ fn craft_recipe(spell_id: u32, name: &str, tooltip: CraftTooltip) -> CraftRecipe
     }
 }
 
+/// Firebolt (3110) on a pet-bar slot.
+fn firebolt_slot() -> PetActionView {
+    PetActionView {
+        name: Some("Firebolt".into()),
+        spell_id: Some(3110),
+        ..Default::default()
+    }
+}
+
 fn firebolt() -> SpellTooltipView {
     SpellTooltipView {
         name: "Firebolt".into(),
@@ -1079,11 +1088,7 @@ fn the_spell_subjects_are_what_the_setters_read_from_the_vm() {
                 is_token: true,
                 ..Default::default()
             },
-            PetActionView {
-                name: Some("Firebolt".into()),
-                spell_id: Some(3110),
-                ..Default::default()
-            },
+            firebolt_slot(),
         ],
     );
     s.set_pet_book(PetBookState {
@@ -1144,16 +1149,7 @@ fn the_spell_subjects_are_what_the_setters_read_from_the_vm() {
 fn a_missed_view_re_renders_the_tooltip_when_the_app_answers() {
     let mut s = script();
     s.set_screen_size(800.0, 600.0);
-    s.set_pet_actions(
-        true,
-        true,
-        true,
-        vec![PetActionView {
-            name: Some("Firebolt".into()),
-            spell_id: Some(3110),
-            ..Default::default()
-        }],
-    );
+    s.set_pet_actions(true, true, true, vec![firebolt_slot()]);
     s.run(
         r#"
         local a = CreateFrame("Button", "PB1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
@@ -1252,16 +1248,7 @@ fn a_hidden_miss_shows_and_an_enchant_link_fills_when_answered() {
 fn new_content_or_an_added_line_ends_the_wait() {
     let mut s = script();
     s.set_screen_size(800.0, 600.0);
-    s.set_pet_actions(
-        true,
-        true,
-        true,
-        vec![PetActionView {
-            name: Some("Firebolt".into()),
-            spell_id: Some(3110),
-            ..Default::default()
-        }],
-    );
+    s.set_pet_actions(true, true, true, vec![firebolt_slot()]);
     s.run(
         r#"
         local a = CreateFrame("Button", "PB1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
@@ -1303,16 +1290,7 @@ fn new_content_or_an_added_line_ends_the_wait() {
 fn a_wait_replaced_by_an_earlier_re_render_is_not_replayed() {
     let mut s = script();
     s.set_screen_size(800.0, 600.0);
-    s.set_pet_actions(
-        true,
-        true,
-        true,
-        vec![PetActionView {
-            name: Some("Firebolt".into()),
-            spell_id: Some(3110),
-            ..Default::default()
-        }],
-    );
+    s.set_pet_actions(true, true, true, vec![firebolt_slot()]);
     s.run(
         r#"
         local a = CreateFrame("Button", "PB1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)

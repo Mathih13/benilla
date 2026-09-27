@@ -134,8 +134,8 @@ impl super::UiScript {
     }
 }
 
-/// A spell render that found no view: its arguments, and the line count it left, so a tooltip Lua
-/// has since added lines to keeps them.
+/// A spell render that missed its view, kept to re-run when the view lands. The re-run is skipped
+/// if the tooltip no longer has `num_lines` lines, so lines Lua added since are kept.
 #[derive(Clone)]
 pub(crate) struct SpellWait {
     spell_id: u32,
