@@ -594,7 +594,7 @@ pub(crate) struct Model {
 
     /// The open vendor's stock, the `BuyMerchantItem` calls and whether `CloseMerchant` ran.
     pub(crate) merchant: Option<merchant::MerchantState>,
-    /// `GetRepairAllCost`'s total, which the app pushes every frame a vendor is open.
+    /// `GetRepairAllCost`'s total, which the app pushes on change; 0 unless a repairer is open.
     pub(crate) repair_all_cost: u32,
     /// Each carried item's repair cost, which `SetInventoryItem` and `SetBagItem` return.
     pub(crate) repair_costs: merchant::RepairCosts,

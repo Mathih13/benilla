@@ -339,7 +339,7 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     // an inspected item (`InspectPaperDollFrame.xml:20`) has no durability or creator, so those
     // lines do not show, as in the reference. An armed shopping tooltip renders the compare
     // shape; the arm is consumed either way. repairCost is the player's item's `0x4faf30` cost
-    // (`0x5332fb`), 0 for another unit's.
+    // (`0x5332fb`); an inspected unit's item carries no durability, so 0.
     m.set(
         "SetInventoryItem",
         lua.create_function(
@@ -383,12 +383,12 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                             )
                         });
                     let cost = if unit.eq_ignore_ascii_case("player") {
-                        model.repair_costs.equipped.get(&(slot as u32)).copied()
+                        model.inv_repair_cost(slot)
                     } else {
-                        None
+                        0
                     };
                     match view {
-                        Some((id, name, q, inst)) => (id, name, q, inst, cost.unwrap_or(0), armed),
+                        Some((id, name, q, inst)) => (id, name, q, inst, cost, armed),
                         // An empty slot answers nil and still pushes the other two: callers
                         // destructure all three first, and an addon may add up repairCost.
                         None => {

@@ -410,6 +410,21 @@ impl Model {
             .clone()
     }
 
+    /// The player's item's repair cost at live-API id `slot`, the vault band keyed as its
+    /// container slot, as [`Self::inv_slot`] routes it; 0 for no cost.
+    pub(super) fn inv_repair_cost(&self, slot: usize) -> u32 {
+        let costs = &self.repair_costs;
+        let cost = if BANK_INV_SLOTS.contains(&slot) {
+            let n = (slot - BANK_INV_SLOTS.start() + 1) as u32;
+            costs.bags.get(&(BANK_CONTAINER, n))
+        } else {
+            u32::try_from(slot)
+                .ok()
+                .and_then(|s| costs.equipped.get(&s))
+        };
+        cost.copied().unwrap_or(0)
+    }
+
     fn bank_inv_slot(&self, slot: usize) -> Option<InvSlotView> {
         if BANK_INV_SLOTS.contains(&slot) {
             let vault = self.containers.get(&BANK_CONTAINER)?;

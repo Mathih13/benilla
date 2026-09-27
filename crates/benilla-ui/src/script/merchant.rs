@@ -72,7 +72,8 @@ pub struct ItemStatsHead {
 pub struct RepairCosts {
     /// The player's equipped items by live inventory id (1-based, `SetInventoryItem`'s slot).
     pub equipped: std::collections::HashMap<u32, u32>,
-    /// The backpack's and the four bags' items by `(bag, slot)`, as `SetBagItem` takes them.
+    /// Every container's items by `(bag, slot)`, as `SetBagItem` takes them: the backpack and
+    /// bags 0-4, the bank vault -1 and its bags 5-10.
     pub bags: std::collections::HashMap<(i64, u32), u32>,
 }
 

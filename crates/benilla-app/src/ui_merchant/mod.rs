@@ -302,9 +302,9 @@ fn item_repair_cost(
         .repair_cost(points, level, quality, class, subclass, discount)
 }
 
-/// Each damaged item's cost over the reference's three sweeps (`0x4fbd60`): equipped slots 0-18,
-/// the backpack and the four bags' contents; never the bank, keyring or buyback. Keyed as the
-/// tooltip bindings take them: equipped by live id (slot + 1), the rest by `(bag, slot)`.
+/// Each damaged item's cost, for the tooltip bindings that price any slot's item (`0x5332fb`,
+/// `0x534975`): equipped by live id (slot + 1), the backpack, the four bags, the bank vault and its
+/// six bags by `(bag, slot)`. The keyring is skipped: a key carries no durability.
 fn repair_costs(
     store: &benilla_protocol::ObjectFields,
     objects: &Objects,
@@ -329,29 +329,53 @@ fn repair_costs(
             costs.bags.insert((0, u32::from(i) + 1), c);
         }
     }
-    // Bags 1-4 sit in inventory slots 19-22.
-    for bag in 1..=4u8 {
-        let bag_guid = store.player_inv_slot(18 + bag).unwrap_or(0);
-        let Some(b) = objects.object(bag_guid).filter(|_| bag_guid != 0) else {
+    for i in 0..crate::ui_items::BANK_SLOTS {
+        if let Some(c) = cost(store.player_bank_slot(i).unwrap_or(0)) {
+            costs
+                .bags
+                .insert((crate::ui_items::BANK_CONTAINER, u32::from(i) + 1), c);
+        }
+    }
+    // Bags 1-4 sit in inventory slots 19-22, bank bags 5-10 in the six bank bag slots.
+    let bags = (1..=4u8)
+        .map(|b| (i64::from(b), store.player_inv_slot(18 + b)))
+        .chain((0..crate::ui_items::BANK_BAGS).map(|i| {
+            (
+                crate::ui_items::BANK_BAG_ID_FIRST + i64::from(i),
+                store.player_bank_bag_slot(i),
+            )
+        }));
+    for (bag, bag_guid) in bags {
+        let bag_guid = bag_guid.unwrap_or(0);
+        if bag_guid == 0 {
+            continue;
+        }
+        let Some(b) = objects.object(bag_guid) else {
             continue;
         };
         let n = b.container_num_slots().unwrap_or(0).min(36) as u8;
         for j in 0..n {
             if let Some(c) = b.container_slot(j).and_then(cost) {
-                costs.bags.insert((i64::from(bag), u32::from(j) + 1), c);
+                costs.bags.insert((bag, u32::from(j) + 1), c);
             }
         }
     }
     costs
 }
 
-/// The repair-all total: the discounted, rounded per-item costs summed (`0x4fbe0b`); the total
-/// itself is never discounted.
+/// The repair-all total over the reference's three sweeps (`0x4fbd60`): equipped slots 0-18, the
+/// backpack and the four bags' contents, never the bank. It sums the discounted, rounded per-item
+/// costs (`0x4fbe0b`); the total itself is never discounted.
 fn repair_all_cost(costs: &RepairCosts) -> u32 {
+    let carried = costs
+        .bags
+        .iter()
+        .filter(|((bag, _), _)| (0..=4).contains(bag))
+        .map(|(_, c)| c);
     let total: u64 = costs
         .equipped
         .values()
-        .chain(costs.bags.values())
+        .chain(carried)
         .map(|&c| u64::from(c))
         .sum();
     total.min(u64::from(u32::MAX)) as u32
@@ -454,19 +478,21 @@ fn feed_repair_costs(
         return;
     };
     let (memo, vm_reset) = memo.get_reset(&script);
+    // No self store is no data: the logout frames keep the last push, as `feed_char` does.
+    let Some(player) = inv.self_store.iter().next() else {
+        return;
+    };
     let vendor = vendor_store(&open, &units);
-    let player = inv.self_store.iter().next();
     // The open merchant's discount for the player (`0x4faf8a`); `0x4faf30` keeps the full price
     // unless it resolves the vendor's unit.
-    let discount = match (vendor, player) {
-        (Some(vendor), Some(store)) => crate::target::vendor_price_discount(
+    let discount = vendor.map_or(0.0, |vendor| {
+        crate::target::vendor_price_discount(
             reactions.factions.as_deref(),
             &reactions.reputations,
             vendor,
-            store,
-        ),
-        _ => 0.0,
-    };
+            player,
+        )
+    });
     let repairer = vendor.is_some_and(|store| store.0.unit_npc_flags() & NPC_FLAG_REPAIR != 0);
     // Every watch is bound before the OR, so none observes a frame late.
     let objects_moved = inv.changes.moved();
@@ -499,12 +525,9 @@ fn feed_repair_costs(
     if gate.skip() {
         return;
     }
-    let costs = match (player, tables.as_deref()) {
-        (Some(store), Some(t)) => {
-            repair_costs(&store.0, &inv.objects, &items, t, &commands, discount)
-        }
-        _ => RepairCosts::default(),
-    };
+    let costs = tables.as_deref().map_or_else(RepairCosts::default, |t| {
+        repair_costs(&player.0, &inv.objects, &items, t, &commands, discount)
+    });
     let total = if repairer { repair_all_cost(&costs) } else { 0 };
     if memo
         .pushed
@@ -1148,6 +1171,142 @@ mod tests {
         assert_eq!(
             carried, want,
             "in the backpack: at the vendor, then with none open"
+        );
+    }
+
+    /// The feed recomputes only when an input moves, so each input alone must reopen its gate: the
+    /// tables arriving, a repair's durability write, the sword changing slot, the vendor's PvP flag
+    /// (the discount alone), the vendor closing (the repair flag alone) and a template answer.
+    /// Driven through `App::update`, whose memo and change ticks persist across frames. A bank item
+    /// is priced for its tooltip but left out of the repair-all total (`0x4fbd60`).
+    #[test]
+    fn each_input_alone_reopens_the_repair_cost_gate() {
+        use benilla_protocol::field::{FIELD_PLAYER_INV_SLOT_HEAD, FIELD_UNIT_FLAGS};
+        use benilla_protocol::ObjectFields;
+        use purse_fixture::*;
+
+        /// `ITEM_FIELD_DURABILITY`, absolute.
+        const ITEM_DURABILITY: u16 = 46;
+        let main_hand = FIELD_PLAYER_INV_SLOT_HEAD + 2 * 15;
+        let backpack_1 = FIELD_PLAYER_INV_SLOT_HEAD + 2 * 23;
+        // `PLAYER_FIELD_BANK_SLOT_1`, inventory slot 39.
+        let bank_1 = FIELD_PLAYER_INV_SLOT_HEAD + 2 * 39;
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.init_resource::<Items>()
+            .init_resource::<crate::net::GuidIndex>()
+            .init_resource::<MerchantOpen>()
+            .init_resource::<crate::net::Reputations>()
+            .insert_resource(NetCommands(tx))
+            .add_systems(Update, feed_repair_costs);
+        seat(app.world_mut());
+        let tables = app.world_mut().remove_resource::<RepairTables>().unwrap();
+        let me = app
+            .world_mut()
+            .spawn((SelfPlayer, Guid(0x5e1f), player(main_hand, 0)))
+            .id();
+        let mut script = UiScript::new().unwrap();
+        script.set_merchant(Some(MerchantState {
+            can_repair: true,
+            ..Default::default()
+        }));
+        let mut inv: benilla_ui::script::InventorySlots = Default::default();
+        inv[16] = Some(benilla_ui::script::InvSlotView {
+            item_id: SWORD_ENTRY,
+            ..Default::default()
+        });
+        script.set_inventory_slots(inv);
+        let mut bag = benilla_ui::script::ContainerState {
+            num_slots: 16,
+            ..Default::default()
+        };
+        bag.slots.insert(
+            1,
+            benilla_ui::script::ContainerSlot {
+                item_id: SWORD_ENTRY,
+                count: 1,
+                ..Default::default()
+            },
+        );
+        script.set_container(0, Some(bag.clone()));
+        script.set_container(crate::ui_items::BANK_CONTAINER, Some(bag));
+        script
+            .run(
+                r#"CreateFrame("GameTooltip", "TT"):SetOwner(CreateFrame("Frame"), "ANCHOR_NONE")"#,
+            )
+            .unwrap();
+        app.insert_non_send_resource(script);
+
+        let entity =
+            |app: &App, guid: u64| app.world().resource::<crate::net::GuidIndex>().0[&guid];
+        let write = |app: &mut App, e: Entity, pairs: &[(u16, u32)]| {
+            let mut store = app.world_mut().get_mut::<ObjectStore>(e).unwrap();
+            store.0.merge(ObjectFields::from_pairs(pairs));
+        };
+        // (worn, backpack slot 1, bank slot 1, `GetRepairAllCost`) after one frame.
+        let frame = |app: &mut App| {
+            app.update();
+            app.world()
+                .non_send_resource::<UiScript>()
+                .eval::<(i64, i64, i64, i64)>(
+                    r#"local _, _, worn = TT:SetInventoryItem("player", 16)
+                       local _, carried = TT:SetBagItem(0, 1)
+                       local _, banked = TT:SetBagItem(-1, 1)
+                       return worn, carried, banked, (GetRepairAllCost())"#,
+                )
+                .unwrap()
+        };
+        let vendor = app
+            .world_mut()
+            .query::<(Entity, &Guid)>()
+            .iter(app.world())
+            .find(|(_, g)| g.0 == VENDOR)
+            .unwrap()
+            .0;
+        // The sword's guid pair moved from one player field to another.
+        let hi = (SWORD >> 32) as u32;
+        let moved =
+            |from: u16, to: u16| [(from, 0), (from + 1, 0), (to, SWORD as u32), (to + 1, hi)];
+
+        assert_eq!(frame(&mut app), (0, 0, 0, 0), "no tables, no prices");
+        // The fixture's 1 copper a point, less 0.1 at this vendor: 40 points cost 36.
+        app.insert_resource(tables);
+        assert_eq!(frame(&mut app), (36, 0, 0, 36), "the tables arrive");
+        let sword = entity(&app, SWORD);
+        write(&mut app, sword, &[(ITEM_DURABILITY, 55)]);
+        assert_eq!(
+            frame(&mut app),
+            (18, 0, 0, 18),
+            "a repair's write: 20 points"
+        );
+        write(&mut app, me, &moved(main_hand, bank_1));
+        assert_eq!(
+            frame(&mut app),
+            (0, 0, 18, 0),
+            "banked: priced, not in the total"
+        );
+        write(&mut app, me, &moved(bank_1, backpack_1));
+        assert_eq!(frame(&mut app), (0, 18, 0, 18), "the sword in the backpack");
+        write(&mut app, vendor, &[(FIELD_UNIT_FLAGS, 0)]);
+        assert_eq!(
+            frame(&mut app),
+            (0, 20, 0, 20),
+            "no PvP flag, no honor discount"
+        );
+        app.world_mut().resource_mut::<MerchantOpen>().clear();
+        assert_eq!(
+            frame(&mut app),
+            (0, 20, 0, 0),
+            "the repairer gone: no total"
+        );
+        app.world_mut()
+            .resource_mut::<Items>()
+            .insert_template(SWORD_ENTRY, None);
+        assert_eq!(
+            frame(&mut app),
+            (0, 0, 0, 0),
+            "an unknown template prices nothing"
         );
     }
 
