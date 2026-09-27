@@ -1144,7 +1144,7 @@ fn the_spell_subjects_are_what_the_setters_read_from_the_vm() {
     assert_eq!(subjects, vec![116, 133, 172, 589, 3110, 6307, 8921, 17253]);
 }
 
-/// No second hover needed: the reference builds the whole tooltip at the call (`0x52e610`).
+/// No second hover and no second `OnTooltipCleared`: the reference builds the tooltip at the call.
 #[test]
 fn a_missed_view_re_renders_the_tooltip_when_the_app_answers() {
     let mut s = script();
@@ -1155,6 +1155,8 @@ fn a_missed_view_re_renders_the_tooltip_when_the_app_answers() {
         local a = CreateFrame("Button", "PB1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
         CreateFrame("GameTooltip", "TT")
         TT:SetOwner(PB1, "ANCHOR_RIGHT")
+        CLEARED = 0
+        TT:SetScript("OnTooltipCleared", function() CLEARED = CLEARED + 1 end)
         TT:SetPetAction(1)
     "#,
     )
@@ -1176,6 +1178,11 @@ fn a_missed_view_re_renders_the_tooltip_when_the_app_answers() {
     assert!(
         s.take_spell_tooltip_asks().is_empty(),
         "the re-render found the view"
+    );
+    assert_eq!(
+        s.eval::<i64>("return CLEARED").unwrap(),
+        1,
+        "one setter call, one OnTooltipCleared"
     );
     assert!(s.take_errors().is_empty());
 }
@@ -1285,22 +1292,29 @@ fn new_content_or_an_added_line_ends_the_wait() {
     assert!(s.take_errors().is_empty());
 }
 
-/// A re-render's `OnTooltipCleared` can move another waiting tooltip onto a new spell.
+/// A re-render's `OnShow` can move another waiting tooltip onto a new spell.
 #[test]
 fn a_wait_replaced_by_an_earlier_re_render_is_not_replayed() {
     let mut s = script();
     s.set_screen_size(800.0, 600.0);
     s.set_pet_actions(true, true, true, vec![firebolt_slot()]);
+    s.set_craft(Some(CraftState {
+        name: "Beast Training".into(),
+        rank: 0,
+        max_rank: 0,
+        craft_type: 1,
+        recipes: vec![craft_recipe(24599, "Firebolt", CraftTooltip::Spell(3110))],
+    }));
     s.run(
         r#"
         local a = CreateFrame("Button", "PB1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
         CreateFrame("GameTooltip", "A")
         CreateFrame("GameTooltip", "B")
         A:SetOwner(PB1, "ANCHOR_RIGHT")
-        A:SetPetAction(1)
+        A:SetCraftSpell(1)
         B:SetOwner(PB1, "ANCHOR_RIGHT")
         B:SetPetAction(1)
-        A:SetScript("OnTooltipCleared", function()
+        A:SetScript("OnShow", function()
             B:SetOwner(PB1, "ANCHOR_RIGHT")
             B:SetHyperlink("|cffffd000|Henchant:20034|h[Enchant Weapon - Crusader]|h|r")
         end)

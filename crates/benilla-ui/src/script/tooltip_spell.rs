@@ -65,8 +65,8 @@ pub struct SpellTooltipView {
 
 impl super::UiScript {
     /// Store or replace a spell's view, answering its ask: a tooltip that missed it re-renders now.
-    /// The reference builds the whole tooltip at the call (`0x52e610`) and has no such second
-    /// render, whose `OnTooltipCleared` Lua sees a frame after the hover's.
+    /// The reference builds the whole tooltip at the call (`0x52e610`); here its lines complete a
+    /// frame after the hover.
     pub fn set_spell_tooltip(&mut self, spell_id: u32, view: SpellTooltipView) {
         let waiting: Vec<FrameHandle> = {
             let mut model = self.model_mut();
@@ -146,7 +146,8 @@ pub(crate) struct SpellWait {
 }
 
 /// Re-run the render `h` still waits with on `spell_id`, read afresh: an earlier re-render's Lua
-/// may have replaced it. Lines added since, or a fade under way, keep the tooltip as it is.
+/// may have replaced it. Lines added since, or a fade under way, keep the tooltip as it is. The
+/// clear is silent: Lua made one setter call and saw its one `OnTooltipCleared`.
 fn answer_wait(lua: &Lua, h: FrameHandle, spell_id: u32) -> mlua::Result<()> {
     let (id, wait) = {
         let mut model = lua.app_data_mut::<Model>().expect("model app_data");
@@ -163,12 +164,14 @@ fn answer_wait(lua: &Lua, h: FrameHandle, spell_id: u32) -> mlua::Result<()> {
             model.spell_tooltip_waits.remove(&h);
             return Ok(());
         }
+        clear_content(&mut model, h);
         (model.frame_id(h), wait)
     };
     let this = frame_wrapper(lua, id)?;
-    set_spell_by_id(
+    fill_spell(
         lua,
         &this,
+        h,
         wait.spell_id,
         wait.fallback_name,
         wait.opts,
@@ -395,6 +398,19 @@ pub(super) fn set_spell_by_id(
         clear_content(&mut model, h);
     }
     fire_cleared(lua, h);
+    fill_spell(lua, this, h, spell_id, fallback_name, opts, remaining)
+}
+
+/// Fill a cleared tooltip with the spell's view, or with the fallback name and a wait on the ask.
+fn fill_spell(
+    lua: &Lua,
+    this: &Table,
+    h: FrameHandle,
+    spell_id: u32,
+    fallback_name: Option<String>,
+    opts: SpellRenderOpts,
+    remaining: Option<String>,
+) -> mlua::Result<()> {
     match spell_view_of(lua, spell_id) {
         Some(v) => render_spell(lua, this, &v, opts, remaining, None)?,
         None => {
