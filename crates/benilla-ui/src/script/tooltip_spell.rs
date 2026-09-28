@@ -142,19 +142,44 @@ impl super::UiScript {
 }
 
 /// A spell render that missed its view, kept to re-run when the view lands. The re-run is skipped
-/// if the tooltip no longer has `num_lines` lines, so lines Lua added since are kept.
+/// unless the tooltip still shows `drawn`, so a line Lua added or rewrote since is kept.
 #[derive(Clone)]
 pub(crate) struct SpellWait {
     spell_id: u32,
     fallback_name: Option<String>,
     opts: SpellRenderOpts,
     remaining: Option<String>,
-    num_lines: usize,
+    drawn: Drawn,
+}
+
+/// Each shown line's left and right cell as `(text, colour)`.
+type Drawn = Vec<(Option<String>, Option<[f32; 4]>)>;
+
+fn drawn_lines(model: &mut Model, h: FrameHandle) -> mlua::Result<Drawn> {
+    let t = tip_mut(model, h)?;
+    let n = t.num_lines;
+    let cells: Vec<_> = t
+        .left_lines
+        .iter()
+        .take(n)
+        .chain(t.right_lines.iter().take(n))
+        .copied()
+        .collect();
+    Ok(cells
+        .into_iter()
+        .map(|rh| {
+            let d = model.region_data.get(&rh);
+            (
+                d.and_then(|d| d.text.clone()),
+                d.and_then(|d| d.vertex_color),
+            )
+        })
+        .collect())
 }
 
 /// Re-run the render `h` still waits with on `spell_id`, read afresh: an earlier re-render's Lua
-/// may have replaced it. Lines added since, or a fade under way, keep the tooltip as it is. The
-/// clear is silent: Lua made one setter call and saw its one `OnTooltipCleared`.
+/// may have replaced it. Lines Lua added or rewrote since, or a fade under way, keep the tooltip as
+/// it is. The clear is silent: Lua made one setter call and saw its one `OnTooltipCleared`.
 fn answer_wait(lua: &Lua, h: FrameHandle, spell_id: u32) -> mlua::Result<()> {
     let (id, wait) = {
         let mut model = lua.app_data_mut::<Model>().expect("model app_data");
@@ -166,8 +191,8 @@ fn answer_wait(lua: &Lua, h: FrameHandle, spell_id: u32) -> mlua::Result<()> {
         else {
             return Ok(());
         };
-        let t = tip_mut(&mut model, h)?;
-        if t.num_lines != wait.num_lines || t.fade_start.is_some() {
+        let fading = tip_mut(&mut model, h)?.fade_start.is_some();
+        if fading || drawn_lines(&mut model, h)? != wait.drawn {
             model.spell_tooltip_waits.remove(&h);
             return Ok(());
         }
@@ -427,7 +452,7 @@ fn fill_spell(
             // The fallback stands until the app answers the ask; id 0 asks nothing.
             if spell_id != 0 {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-                let num_lines = tip_mut(&mut model, h)?.num_lines;
+                let drawn = drawn_lines(&mut model, h)?;
                 model.spell_tooltip_waits.insert(
                     h,
                     SpellWait {
@@ -435,7 +460,7 @@ fn fill_spell(
                         fallback_name,
                         opts,
                         remaining,
-                        num_lines,
+                        drawn,
                     },
                 );
             }

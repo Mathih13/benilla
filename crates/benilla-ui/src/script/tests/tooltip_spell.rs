@@ -1303,6 +1303,49 @@ fn new_content_or_an_added_line_ends_the_wait() {
     assert!(s.take_errors().is_empty());
 }
 
+/// What Lua wrote after the miss is kept: a line rewritten in place, by `AppendText` or a cell's
+/// `SetTextColor`, or new content that reads the same as the miss's line.
+#[test]
+fn a_line_rewritten_in_place_ends_the_wait() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.set_pet_actions(true, true, true, vec![firebolt_slot()]);
+    s.run(
+        r#"
+        local a = CreateFrame("Button", "PB1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
+        CreateFrame("GameTooltip", "APP")
+        CreateFrame("GameTooltip", "COL")
+        APP:SetOwner(PB1, "ANCHOR_RIGHT")
+        APP:SetPetAction(1)
+        APP:AppendText(" (Pet)")
+        COL:SetOwner(PB1, "ANCHOR_RIGHT")
+        COL:SetPetAction(1)
+        COLTextLeft1:SetTextColor(1, 0, 0)
+        CreateFrame("GameTooltip", "SAM")
+        SAM:SetOwner(PB1, "ANCHOR_RIGHT")
+        SAM:SetPetAction(1)
+        SAM:SetOwner(PB1, "ANCHOR_RIGHT")
+        SAM:SetText("Firebolt", 1, 1, 1)
+    "#,
+    )
+    .unwrap();
+    s.set_spell_tooltip(3110, firebolt());
+    assert_eq!(
+        s.eval::<(i64, String)>("return APP:NumLines(), APPTextLeft1:GetText()")
+            .unwrap(),
+        (1, "Firebolt (Pet)".to_string())
+    );
+    assert_eq!(
+        s.eval::<(i64, f32, f32)>(
+            "local r, g = COLTextLeft1:GetTextColor(); return COL:NumLines(), r, g"
+        )
+        .unwrap(),
+        (1, 1.0, 0.0)
+    );
+    assert_eq!(s.eval::<i64>("return SAM:NumLines()").unwrap(), 1);
+    assert!(s.take_errors().is_empty());
+}
+
 /// A re-render's `OnShow` can move another waiting tooltip onto a new spell.
 #[test]
 fn a_wait_replaced_by_an_earlier_re_render_is_not_replayed() {
