@@ -138,7 +138,7 @@ fn passive_body(description: &str) -> SpellTooltipView {
 /// gold description, green `TOOLTIP_TALENT_LEARN`; no cost, range, cast, requirement, reagent or
 /// chance line.
 #[test]
-fn set_talent_renders_the_interleaved_tooltip() {
+fn set_talent_on_a_passive_talent_is_the_talent_builder() {
     let mut s = script();
     seed_talent_strings(&mut s);
     s.set_talents(one_tab_state());
@@ -179,6 +179,12 @@ fn set_talent_renders_the_interleaved_tooltip() {
             if t == "[LEARN]" && c[0] < 1e-6 && (c[1] - 1.0).abs() < 1e-6)
     });
     assert!(green, "the learn hint is green");
+    // The spacer is `0x530380`'s gold, not `0x5303b0`'s caller colour.
+    let gold_spacer = quads.iter().any(|q| {
+        matches!(&q.content, QuadContent::Text { text: Some(t), color: Some(c), .. }
+            if t == " " && (c[0] - 1.0).abs() < 1e-6 && (c[1] - 210.0 / 255.0).abs() < 1e-3 && c[2] < 1e-6)
+    });
+    assert!(gold_spacer, "the spacer is gold");
     assert!(s.take_errors().is_empty());
 }
 
@@ -189,7 +195,10 @@ fn set_talent_on_an_exceptional_talent_keeps_the_spell_body() {
     let mut s = script();
     seed_talent_strings(&mut s);
     let mut state = one_tab_state();
-    state.talents[0][1].exceptional = true;
+    let holy_shield = &mut state.talents[0][1];
+    holy_shield.name = "Holy Shield".into();
+    holy_shield.exceptional = true;
+    holy_shield.req_lines = vec!["Requires 30 points in Protection Talents".into()];
     s.set_talents(state);
     s.set_spell_tooltip(
         11119,
@@ -208,11 +217,15 @@ fn set_talent_on_an_exceptional_talent_keeps_the_spell_body() {
         local tt = CreateFrame("GameTooltip", "TT3")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetTalent(1, 2)
-        -- name, rank, req, cost, cast, requires item, desc = 7 lines.
-        assert(tt:NumLines() == 7, "got " .. tt:NumLines())
-        assert(TT3TextLeft4:GetText() == "150 Mana")
-        assert(TT3TextLeft5:GetText() == "Instant cast")
-        assert(TT3TextLeft6:GetText() == "Requires Shields")
+        local want = {
+            "Holy Shield", "[RANK 0/5]", "Requires 30 points in Protection Talents", "150 Mana",
+            "Instant cast", "Requires Shields", "Increases chance to block by 30% for 10 sec.",
+        }
+        assert(tt:NumLines() == table.getn(want), "got " .. tt:NumLines())
+        for i, text in ipairs(want) do
+            local got = getglobal("TT3TextLeft" .. i):GetText()
+            assert(got == text, "line " .. i .. ": " .. tostring(got))
+        end
     "#,
     )
     .unwrap();
