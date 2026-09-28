@@ -93,8 +93,8 @@ impl super::UiScript {
 
     /// The spells a hover reads from the VM's own state rather than the player's book: the pet's
     /// bar and book, the open quest's and each log entry's reward spell, the open craft's spell
-    /// subjects, every unit's auras and the tracking spell. The app pushes their views ahead of a
-    /// hover.
+    /// subjects, the player's and every other unit's auras, and the tracking spell. The app pushes
+    /// their views ahead of a hover.
     pub fn spell_tooltip_subjects(&self) -> Vec<u32> {
         let model = self.model_ref();
         let pet_bar = model
@@ -124,7 +124,11 @@ impl super::UiScript {
                 CraftTooltip::Spell(id) => Some(id),
                 CraftTooltip::Item(_) => None,
             });
-        let auras = model.auras.values().flatten().map(|a| a.spell_id);
+        let auras = model
+            .player_auras
+            .iter()
+            .chain(model.unit_auras.values().flatten())
+            .map(|a| a.spell_id);
         let tracking = model.tracking.iter().map(|t| t.spell_id);
         pet_bar
             .chain(pet_book)

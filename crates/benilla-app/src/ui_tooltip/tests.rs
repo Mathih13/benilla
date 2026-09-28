@@ -746,8 +746,19 @@ fn the_feed_pushes_the_spells_the_vm_holds_before_a_hover() {
             spell_level: 0,
         }],
     }));
-    script.set_auras(
-        "targettarget",
+    // We target a mob that targets party1, whose list the VM holds by guid.
+    const ME: u64 = 0x10;
+    const MOB: u64 = 0xF130_0000_0000_0001;
+    const TOT: u64 = 0x21;
+    script.set_unit_guids(&benilla_ui::script::UnitGuids {
+        player: ME,
+        target: MOB,
+        party: [TOT, 0, 0, 0],
+        held: std::collections::HashMap::from([(ME, MOB), (MOB, TOT), (TOT, 0)]),
+        ..Default::default()
+    });
+    script.set_unit_auras(
+        TOT,
         Some(vec![AuraState {
             spell_id: 589,
             name: Some("Shadow Word: Pain".into()),

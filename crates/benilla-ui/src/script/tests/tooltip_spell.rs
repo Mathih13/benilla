@@ -1135,9 +1135,11 @@ fn the_spell_subjects_are_what_the_setters_read_from_the_vm() {
         spell_id,
         ..Default::default()
     };
-    s.set_auras("pet", Some(vec![aura(172)]));
-    s.set_auras("targettarget", Some(vec![aura(589)]));
-    s.set_auras("party1", Some(vec![aura(8921)]));
+    s.set_player_auras(vec![aura(1459)]);
+    // The pet's, the target-of-target's and party1's lists, by guid.
+    s.set_unit_auras(0xF140_0000_0000_0077, Some(vec![aura(172)]));
+    s.set_unit_auras(0x21, Some(vec![aura(589)]));
+    s.set_unit_auras(0x22, Some(vec![aura(8921)]));
     s.set_tracking(Some(TrackingState {
         spell_id: 2580,
         name: Some("Find Minerals".into()),
@@ -1149,7 +1151,7 @@ fn the_spell_subjects_are_what_the_setters_read_from_the_vm() {
     subjects.sort_unstable();
     assert_eq!(
         subjects,
-        vec![116, 133, 172, 589, 2580, 3110, 6307, 8921, 17253]
+        vec![116, 133, 172, 589, 1459, 2580, 3110, 6307, 8921, 17253]
     );
 }
 
