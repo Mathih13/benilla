@@ -619,7 +619,8 @@ fn real_spell_catalog_reads_tooltip_columns() {
 
 /// The attack-start masks, rows from vmangos: [`SpellDisplay::on_next_swing`] (`0x404`),
 /// [`SpellDisplay::initiates_auto_attack`] (adding `AttributesEx & 0x200`) and
-/// [`SpellDisplay::initiates_auto_attack_at_go`] (`AttributesEx2 & 0x100000`).
+/// [`SpellDisplay::initiates_auto_attack_at_go`] (`AttributesEx2 & 0x100000`), whose union is
+/// [`SpellDisplay::initiates_combat`] (`0x6e5200`).
 #[test]
 fn real_spell_catalog_classifies_combat_initiation() {
     let data = crate::wow_data_or_skip!();
@@ -634,6 +635,7 @@ fn real_spell_catalog_classifies_combat_initiation() {
         (772, "Rend", false, true, false),           // Ex 0x8000200
         (7386, "Sunder Armor", false, true, false),  // Ex 0x8000200
         (1464, "Slam", false, true, false),          // Ex 0x8000200
+        (1752, "Sinister Strike", false, true, false), // Ex 0x8000200
         (100, "Charge", false, false, false),        // Ex 0x400: neither bit, bit 20 clear
         (6673, "Battle Shout", false, false, false), // Ex 0x0
         (6603, "Attack", false, false, false),       // the auto-attack pseudo-spell itself
@@ -675,6 +677,14 @@ fn real_spell_catalog_classifies_combat_initiation() {
             d.initiates_auto_attack_at_go(),
             at_go,
             "{name} ({id}) initiates_auto_attack_at_go (Ex2 {:#x})",
+            d.attributes_ex2
+        );
+        assert_eq!(
+            d.initiates_combat(),
+            next_swing || initiates || at_go,
+            "{name} ({id}) initiates_combat (Attributes {:#x}, Ex {:#x}, Ex2 {:#x})",
+            d.attributes,
+            d.attributes_ex,
             d.attributes_ex2
         );
         // Bit 20 suppresses the send-time start, so no spell starts the attack twice.

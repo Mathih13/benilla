@@ -633,21 +633,24 @@ impl AttackPick<'_, '_> {
         (self.scan.self_store(), self.scan.self_guid())
     }
 
-    /// The guid the swing or the pet's order goes at, or `None` once the refusal is raised. The
-    /// candidate is the selection (`0x61306b`): `AttackTarget` passes none (`0x489b50` →
-    /// `0x6131a0(0,0)`), nor does the pet bar (`0x4be42b`). An empty selection (`0x61307f`) or a
-    /// held unit the actor is friendly toward (`0x6130a3`, dropped at `0x6130a8`) runs
-    /// `TargetNearestEnemy` (`0x6130b5`), which commits its pick before this returns, so a call
-    /// after this one reads it. The target is then the selection as it stands (`0x6130c1`): a
-    /// fruitless scan leaves a friendly unit selected for the final gate to refuse, and only an
-    /// empty selection is `ERR_NO_ATTACK_TARGET` (`0x6130d9`).
+    /// The guid the swing, the pet's order or the cast goes at, or `None` once the refusal is
+    /// raised. The candidate is the guid the caller passed, else the selection (`0x61306b`):
+    /// `AttackTarget` passes none (`0x489b50` → `0x6131a0(0,0)`), nor does the pet bar
+    /// (`0x4be42b`); TryCast passes the caster on a self-cast press (`0x4e610e`). An empty
+    /// candidate (`0x61307f`) or a unit the actor is friendly toward (`0x6130a3`, dropped at
+    /// `0x6130a8`), the caster included, runs `TargetNearestEnemy` (`0x6130b5`), which commits its
+    /// pick before this returns, so a call after this one reads it. The target is then the
+    /// selection as it stands (`0x6130c1`): a fruitless scan leaves a friendly unit selected for
+    /// the final gate to refuse, and only an empty selection is `ERR_NO_ATTACK_TARGET`
+    /// (`0x6130d9`).
     pub(crate) fn target(
         &mut self,
+        passed: Option<u64>,
         selection: &mut Selection,
         seam: &mut crate::creature_anim::AttackSeam,
         errors: &mut crate::ui_action::UiErrorKeys,
     ) -> Option<u64> {
-        if !selection.guid.is_some_and(|g| self.keeps(g)) {
+        if !passed.or(selection.guid).is_some_and(|g| self.keeps(g)) {
             let engaged = self.engaged();
             cycle(
                 ScanSide::Enemy,

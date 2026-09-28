@@ -64,6 +64,19 @@ impl CastCommit {
     }
 }
 
+/// A player's spell press held at TryCast's attack pick (`6e4edf` → `0x612df0`), which can move
+/// the selection the ladder only reads. [`crate::script_calls`] runs the pick and resumes it.
+#[derive(Resource, Default)]
+pub(crate) struct HeldForPick(Option<HeldCast>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeldCast {
+    pub(crate) spell_id: u32,
+    /// Pressed with the self-cast modifier: TryCast's guid argument is then the caster
+    /// (`0x4e610e`), which the pick tries before the selection.
+    pub(crate) on_self: bool,
+}
+
 /// Everything the cast-send path reads, as one [`SystemParam`]: [`CastLadder::send`] is the only
 /// way into [`send_spell_cast`], for every caster surface.
 #[derive(SystemParam)]
@@ -86,6 +99,7 @@ pub(crate) struct CastLadder<'w, 's> {
     pub(crate) auto_repeat: ResMut<'w, AutoRepeatActive>,
     pub(crate) trade_skill_opens: ResMut<'w, crate::ui_tradeskill::TradeSkillOpens>,
     pub(crate) ground: ResMut<'w, super::targeting::SpellTargeting>,
+    pub(crate) held_for_pick: ResMut<'w, HeldForPick>,
 }
 
 /// What a targeting-cursor click bound: what `BindLocation 0x6e60f0` or `BindTarget 0x6e5b40`
@@ -189,14 +203,38 @@ impl CastLadder<'_, '_> {
         caster_dead_refusal(spell_id, def, self_store, &mut self.cast_errors)
     }
 
-    /// Run the ladder for `spell_id` and commit as `commit` says.
+    /// Run the ladder for `spell_id` and commit as `commit` says. Deviation: no attack pick, so
+    /// an item, form, craft or chained cast of predicate `0x6e5200` binds the selection as it is.
     pub(crate) fn send(
         &mut self,
         spell_id: u32,
         ctx: &cast_target::CastContext,
         commit: CastCommit,
     ) {
-        self.send_bound(spell_id, ctx, commit, None);
+        self.send_bound(spell_id, ctx, commit, None, None);
+    }
+
+    /// A player's spell press (`UseAction`, `CastSpell`, `CastSpellByName`): the ladder with
+    /// TryCast's attack pick, where the cast may stop in [`HeldForPick`].
+    pub(crate) fn send_spell(
+        &mut self,
+        spell_id: u32,
+        ctx: &cast_target::CastContext,
+        on_self: bool,
+    ) {
+        let held = HeldCast { spell_id, on_self };
+        self.send_bound(spell_id, ctx, CastCommit::Spell, None, Some(held));
+    }
+
+    /// The press held at the attack pick, if one is.
+    pub(crate) fn take_held(&mut self) -> Option<HeldCast> {
+        self.held_for_pick.0.take()
+    }
+
+    /// A held press after its pick, at the unit the pick left selected. The rungs above the pick
+    /// run again; none reads the selection, so each passes as it did.
+    pub(crate) fn resume_after_pick(&mut self, held: HeldCast, ctx: &cast_target::CastContext) {
+        self.send_bound(held.spell_id, ctx, CastCommit::Spell, None, None);
     }
 
     /// The ladder for a cast the caller already bound to a GameObject (a lock opener): TryCast
@@ -208,7 +246,7 @@ impl CastLadder<'_, '_> {
         ctx: &cast_target::CastContext,
         go_guid: u64,
     ) {
-        self.send_bound(spell_id, ctx, CastCommit::Spell, Some(go_guid));
+        self.send_bound(spell_id, ctx, CastCommit::Spell, Some(go_guid), None);
     }
 
     fn send_bound(
@@ -217,12 +255,14 @@ impl CastLadder<'_, '_> {
         ctx: &cast_target::CastContext,
         commit: CastCommit,
         on_object: Option<u64>,
+        hold: Option<HeldCast>,
     ) {
         send_spell_cast(
             spell_id,
             ctx,
             commit,
             on_object,
+            hold,
             &self.commands,
             &self.self_player,
             self.spells.as_deref(),
@@ -238,6 +278,7 @@ impl CastLadder<'_, '_> {
             &mut self.auto_repeat,
             &mut self.trade_skill_opens,
             &mut self.ground,
+            &mut self.held_for_pick,
         );
     }
 }
@@ -275,6 +316,8 @@ fn send_spell_cast(
     commit: CastCommit,
     // A caller-bound GameObject for a spell commit; an item commit carries its own.
     bound_object: Option<u64>,
+    // Set for a player's spell press, which parks in `held_for_pick` at the attack pick.
+    hold: Option<HeldCast>,
     commands: &NetCommands,
     self_player: &Query<(Entity, Has<crate::creature_anim::Engaged>), With<SelfPlayer>>,
     spells: Option<&Spells>,
@@ -290,6 +333,7 @@ fn send_spell_cast(
     auto_repeat: &mut AutoRepeatActive,
     trade_skill_opens: &mut crate::ui_tradeskill::TradeSkillOpens,
     ground: &mut super::targeting::SpellTargeting,
+    held_for_pick: &mut HeldForPick,
 ) {
     let now = Instant::now();
     let def = spells.and_then(|s| s.catalog.get(spell_id));
@@ -356,6 +400,18 @@ fn send_spell_cast(
                 cast_errors.push_local(spell_id, reason);
                 return;
             }
+        }
+    }
+    // TryCast's attack pick (`6e4edf`–`6e4f02`): a spell of predicate `0x6e5200`, pressed while
+    // not attacking (`0x60ecb0`), goes through the attack validator `0x612df0`, which keeps a
+    // hostile selection or selects the nearest enemy. It sits above the bind and the range gate,
+    // so an acquired target out of reach reads "Out of range.".
+    if let Some(held) = hold {
+        let engaged = self_player.single().is_ok_and(|(_, engaged)| engaged);
+        if def.is_some_and(|d| d.initiates_combat()) && !engaged {
+            debug!("ui_action: cast {spell_id} holds for the attack pick");
+            held_for_pick.0 = Some(held);
+            return;
         }
     }
     // ArmCast (`0x6e5250`) resolves the wire target from the spell's targeting constraints, never
@@ -754,6 +810,7 @@ mod tests {
         world.init_resource::<AutoRepeatActive>();
         world.init_resource::<crate::ui_tradeskill::TradeSkillOpens>();
         world.init_resource::<crate::spell::SpellTargeting>();
+        world.init_resource::<crate::spell::HeldForPick>();
         // A bare World has no message storage until it is asked for.
         world.init_resource::<Messages<crate::creature_anim::SheathRequest>>();
         world.init_resource::<Messages<crate::player::StandStateRequest>>();
@@ -1074,6 +1131,39 @@ mod tests {
                 ladder.send(spell_id, &ctx, CastCommit::Spell);
             })
             .expect("the ladder runs as a one-shot system");
+    }
+
+    /// TryCast's attack pick (`6e4edf`): a press of a `0x6e5200` spell stops there, above the
+    /// bind, for its owner to pick a unit. Attacking skips the pick (`0x60ecb0`), and neither a
+    /// spell without the bits nor a send that is not a press stops.
+    #[test]
+    fn a_combat_press_holds_at_the_attack_pick_unless_attacking() {
+        let press = |world: &mut World, spell_id: u32| {
+            world
+                .run_system_once(move |mut ladder: CastLadder| {
+                    ladder.send_spell(spell_id, &ctx(), false);
+                    ladder.take_held()
+                })
+                .expect("the ladder runs as a one-shot system")
+        };
+        let (mut world, rx) = combat_world(false);
+        assert_eq!(
+            press(&mut world, RAPTOR_STRIKE),
+            Some(HeldCast {
+                spell_id: RAPTOR_STRIKE,
+                on_self: false
+            })
+        );
+        assert!(rx.try_recv().is_err(), "a held press sends nothing");
+        assert!(world.resource::<CastErrors>().0.is_empty());
+        assert_eq!(press(&mut world, SERPENT_STING), None, "no 0x6e5200 bit");
+
+        let (mut world, _rx) = combat_world(true);
+        assert_eq!(press(&mut world, RAPTOR_STRIKE), None, "attacking");
+
+        let (mut world, _rx) = combat_world(false);
+        send(&mut world, RAPTOR_STRIKE, CastCommit::Spell);
+        assert_eq!(world.resource::<HeldForPick>().0, None, "not a press");
     }
 
     /// The commit's StopAttack (`0x6e5976`): `CMSG_ATTACKSTOP` (`0x624370`), then `CancelQueuedCast
