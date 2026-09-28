@@ -6,8 +6,10 @@
 //!
 //! The app resolves each spell into a [`SpellTooltipView`] (`$`-tokens, cast, range and duration
 //! text), kept in an ask-once store by spell id and pushed ahead of a hover. A miss records the
-//! id; a `set_spell_by_id` miss also waits, and the app's answer re-renders that tooltip. The
-//! talent and tracking hovers show their view on the next hover.
+//! id; a `set_spell_by_id` miss also waits, and the app's answer re-renders that tooltip a frame
+//! after the hover. That frame is a known difference from the reference, which builds every spell
+//! tooltip at the call (`0x52e610`); a spell no pushed set names, such as an `enchant:` link's,
+//! always meets it. A talent or tracking miss shows its view on the next hover.
 
 use mlua::{Lua, Table, Value};
 
@@ -64,9 +66,8 @@ pub struct SpellTooltipView {
 }
 
 impl super::UiScript {
-    /// Store or replace a spell's view, answering its ask: a tooltip that missed it re-renders now.
-    /// The reference builds the whole tooltip at the call (`0x52e610`); here its lines complete a
-    /// frame after the hover.
+    /// Store or replace a spell's view, answering its ask: a tooltip waiting on it re-renders now,
+    /// a frame after its hover, where the reference builds it whole at the call (`0x52e610`).
     pub fn set_spell_tooltip(&mut self, spell_id: u32, view: SpellTooltipView) {
         let waiting: Vec<FrameHandle> = {
             let mut model = self.model_mut();
