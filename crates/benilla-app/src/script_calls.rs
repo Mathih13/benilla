@@ -649,6 +649,21 @@ mod tests {
         );
     }
 
+    /// A self-cast press passes the caster to the pick (`0x4e610e`), and the reaction to oneself is
+    /// 4 (`0x606200`), so the pick Tabs to the enemy. With no faction table the caster would read
+    /// neutral and be kept.
+    #[test]
+    fn a_self_cast_strike_selects_the_nearest_enemy() {
+        let mut f = frame(false);
+        spawn_mob(&mut f, &[]);
+        with_strike(&mut f);
+        run(&mut f, "UseAction(1, 0, 1)");
+        assert_eq!(
+            strike_wire(&f),
+            vec![("select", MOB), ("cast", MOB), ("swing", MOB)]
+        );
+    }
+
     /// The pick's keep test (`0x6130a3`) drops a friend, so a strike at one retargets the nearest
     /// enemy, where the bind alone would refuse it as an invalid target.
     #[test]

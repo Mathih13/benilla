@@ -3,8 +3,8 @@
 //!
 //! The rungs: the auto-repeat toggle-off (the reference's action-button handler, ahead of TryCast;
 //! its order against the profession intercept is unobservable), the profession intercept, dead or a
-//! ghost, the targeting abort, in-flight, reagents and totems, the equipped item, target binding
-//! and range, then the validator `0x6094f0` (not-ready and GCD, power, crowd control, mounted,
+//! ghost, the targeting abort, in-flight, reagents and totems, the equipped item, combo points, the
+//! attack pick, target binding and range, then the validator `0x6094f0` (not-ready and GCD, power, crowd control, mounted,
 //! water, moving, form), the deferred cast-arm refusal and the targeting cursor. The commit tail
 //! follows: ranged stance, auto-repeat arm, the send, the auto-attack start, the GCD. A refusal is
 //! local and pre-commit: no packet, no GCD, no pending arm, only the red line.
@@ -63,6 +63,9 @@ impl CastCommit {
         }
     }
 }
+
+/// The class byte TryCast's finisher rung tests (`6e4e98`).
+const CLASS_ROGUE: u8 = 4;
 
 /// A player's spell press held at TryCast's attack pick (`6e4edf` → `0x612df0`), which can move
 /// the selection the ladder only reads. [`crate::script_calls`] runs the pick and resumes it.
@@ -400,6 +403,22 @@ fn send_spell_cast(
                 cast_errors.push_local(spell_id, reason);
                 return;
             }
+        }
+    }
+    // The finisher rung (`6e4e50`–`6e4ecd`), above the attack pick: a finishing move
+    // (`AttributesEx & 0x500000`) with the combo-point byte at 0 refuses 0x46 "That ability
+    // requires combo points" for a rogue (class byte 4, `6e4e98`), else 0x12. Like the button
+    // greying, it reads no target.
+    if let (Some(d), Some(store)) = (def, ctx.rel.self_store) {
+        if d.needs_combo_points() && store.0.player_combo_points().unwrap_or(0) == 0 {
+            let reason = if store.0.unit_class() == Some(CLASS_ROGUE) {
+                0x46
+            } else {
+                0x12
+            };
+            debug!("ui_action: cast {spell_id} refused locally — no combo points ({reason:#x})");
+            cast_errors.push_local(spell_id, reason);
+            return;
         }
     }
     // TryCast's attack pick (`6e4edf`–`6e4f02`): a spell of predicate `0x6e5200`, pressed while
@@ -983,11 +1002,13 @@ mod tests {
     const AUTO_SHOT: u32 = 75;
     const RAPTOR_STRIKE: u32 = 2973;
     const SERPENT_STING: u32 = 1978;
+    const EVISCERATE: u32 = 2098;
     const MOB: u64 = 0x0000_0000_0000_00f1;
 
     /// Auto Shot (auto-repeat `AttributesEx2 & 0x20`, ranged `Attributes & 0x2`), Raptor Strike
-    /// (on-next-swing `0x404`) and Serpent Sting, as the 1.12 rows classify them. `Targets & 0x2`
-    /// binds the selection without faction data.
+    /// (on-next-swing `0x404`), Serpent Sting and Eviscerate (a finisher, `AttributesEx 0x100000`,
+    /// that starts combat, `0x200`), as the 1.12 rows classify them. `Targets & 0x2` binds the
+    /// selection without faction data.
     fn combat_catalog() -> Spells {
         use std::collections::HashMap;
         let auto_shot = benilla_formats::SpellDisplay {
@@ -1010,11 +1031,17 @@ mod tests {
             modal_next_spell: AUTO_SHOT,
             ..Default::default()
         };
+        let eviscerate = benilla_formats::SpellDisplay {
+            targets: 0x2,
+            attributes_ex: 0x0010_0200,
+            ..Default::default()
+        };
         Spells {
             catalog: benilla_formats::SpellCatalog::from_displays(HashMap::from([
                 (AUTO_SHOT, auto_shot),
                 (RAPTOR_STRIKE, raptor_strike),
                 (SERPENT_STING, serpent_sting),
+                (EVISCERATE, eviscerate),
             ])),
             ..Spells::empty_for_tests()
         }
@@ -1164,6 +1191,57 @@ mod tests {
         let (mut world, _rx) = combat_world(false);
         send(&mut world, RAPTOR_STRIKE, CastCommit::Spell);
         assert_eq!(world.resource::<HeldForPick>().0, None, "not a press");
+    }
+
+    /// The rungs above the pick refuse before it: a press mid-cast (`6e4d97`) and a finisher with no
+    /// combo points (`6e4e50`) hold nothing, so they never select a unit. A rogue reads 0x46, any
+    /// other class 0x12 (`6e4e98`).
+    #[test]
+    fn the_rungs_above_the_attack_pick_refuse_before_it() {
+        use benilla_protocol::ObjectFields;
+        let (mut world, rx) = combat_world(false);
+        world
+            .resource_mut::<crate::spell::PendingCast>()
+            .arm(SERPENT_STING, Instant::now(), true);
+        let held = world
+            .run_system_once(|mut ladder: CastLadder| {
+                ladder.send_spell(RAPTOR_STRIKE, &ctx(), false);
+                ladder.take_held()
+            })
+            .expect("the ladder runs as a one-shot system");
+        assert_eq!(held, None, "in flight");
+        assert_eq!(
+            world.resource::<CastErrors>().0,
+            vec![CastFail::local(RAPTOR_STRIKE, 0x61)]
+        );
+        assert!(rx.try_recv().is_err());
+
+        // `UNIT_FIELD_BYTES_0` (field 36) byte 1 is the class; `PLAYER_FIELD_BYTES` holds no
+        // combo points.
+        for (class, reason) in [(4u32, 0x46), (11, 0x12)] {
+            let (mut world, rx) = combat_world(false);
+            let held = world
+                .run_system_once(move |mut ladder: CastLadder| {
+                    let me = crate::net::ObjectStore(ObjectFields::from_pairs(&[(36, class << 8)]));
+                    let ctx = cast_target::CastContext {
+                        rel: cast_target::TargetRelations {
+                            self_store: Some(&me),
+                            ..ctx().rel
+                        },
+                        ..ctx()
+                    };
+                    ladder.send_spell(EVISCERATE, &ctx, false);
+                    ladder.take_held()
+                })
+                .expect("the ladder runs as a one-shot system");
+            assert_eq!(held, None, "class {class}: no combo points");
+            assert_eq!(
+                world.resource::<CastErrors>().0,
+                vec![CastFail::local(EVISCERATE, reason)],
+                "class {class}"
+            );
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     /// The commit's StopAttack (`0x6e5976`): `CMSG_ATTACKSTOP` (`0x624370`), then `CancelQueuedCast

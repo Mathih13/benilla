@@ -697,8 +697,12 @@ impl AttackPick<'_, '_> {
     /// (`0x613099`) is kept as well, for the second resolve to refuse. Actor → target is
     /// [`reaction_from_player`] (the at-war bit), never `ring_reaction`. The reference's actor is
     /// the caller, a pet on the pet arm (`0x4bd40d`), which vmangos gives its owner's faction
-    /// (`Pet.cpp:248`).
+    /// (`Pet.cpp:248`). The reaction to oneself is 4 before any faction rung (`0x606200`), so a
+    /// passed caster is never kept, FFA flag or not.
     fn keeps(&self, guid: u64) -> bool {
+        if self.scan.self_guid() == Some(guid) {
+            return false;
+        }
         self.scan.store_of(guid).is_none_or(|store| {
             reaction_from_player(
                 self.scan.factions.as_deref(),
