@@ -4,10 +4,10 @@
 //! The rungs: the auto-repeat toggle-off (the reference's action-button handler, ahead of TryCast;
 //! its order against the profession intercept is unobservable), the profession intercept, dead or a
 //! ghost, the targeting abort, in-flight, reagents and totems, the equipped item, combo points, the
-//! attack pick, target binding and range, then the validator `0x6094f0` (not-ready and GCD, power, crowd control, mounted,
-//! water, moving, form), the deferred cast-arm refusal and the targeting cursor. The commit tail
-//! follows: ranged stance, auto-repeat arm, the send, the auto-attack start, the GCD. A refusal is
-//! local and pre-commit: no packet, no GCD, no pending arm, only the red line.
+//! attack pick, target binding and range, then the validator `0x6094f0` (not-ready and GCD, power,
+//! crowd control, mounted, water, moving, form), the deferred cast-arm refusal and the targeting
+//! cursor. The commit tail follows: ranged stance, auto-repeat arm, the send, the auto-attack start,
+//! the GCD. A refusal is local and pre-commit: no packet, no GCD, no pending arm, only the red line.
 //!
 //! An item use takes the same ladder: `CGItem::Use 0x5d8d00` calls `0x6e5a90`, whose body is
 //! `call 0x6e4b60` with the item as TryCast's third argument (read at `6e4d76` and `6e4f33`). Three
@@ -206,8 +206,8 @@ impl CastLadder<'_, '_> {
         caster_dead_refusal(spell_id, def, self_store, &mut self.cast_errors)
     }
 
-    /// Run the ladder for `spell_id` and commit as `commit` says. Deviation: no attack pick, so
-    /// an item, form, craft or chained cast of predicate `0x6e5200` binds the selection as it is.
+    /// Run the ladder for `spell_id` and commit as `commit` says, with no attack pick: no 1.12
+    /// item use, form, craft or `modalNextSpell` chain casts a spell of predicate `0x6e5200`.
     pub(crate) fn send(
         &mut self,
         spell_id: u32,

@@ -727,6 +727,42 @@ fn real_spell_catalog_classifies_combat_initiation() {
     );
 }
 
+/// TryCast's attack pick (`0x6e4edf`) is built for a spell press alone, so no form, recipe
+/// (`SPELL_EFFECT_CREATE_ITEM` 24, `SPELL_EFFECT_ENCHANT_ITEM` 53) or `modalNextSpell` chain may
+/// carry predicate `0x6e5200`. No item's use spell does either (vmangos `item_template`).
+#[test]
+fn real_spell_catalog_keeps_the_attack_pick_to_spell_presses() {
+    let data = crate::wow_data_or_skip!();
+    let mut chain = crate::open_chain(&data).expect("open chain");
+    let cat = load_spell_catalog(&mut chain).expect("load Spell/SpellIcon");
+    let (mut checked, mut chained) = (0, 0);
+    for (id, d) in cat.iter() {
+        let recipe = d.effects.iter().any(|&e| e == 24 || e == 53);
+        if d.shapeshift_form.is_some() || recipe {
+            checked += 1;
+            assert!(
+                !d.initiates_combat(),
+                "{} ({id}) is a form or a recipe of predicate 0x6e5200",
+                d.name
+            );
+        }
+        if d.modal_next_spell != 0 {
+            chained += 1;
+            let next = cat.get(d.modal_next_spell);
+            assert!(
+                !next.is_some_and(|n| n.initiates_combat()),
+                "{} ({id}) chains {} of predicate 0x6e5200",
+                d.name,
+                d.modal_next_spell
+            );
+        }
+    }
+    assert!(
+        checked > 0 && chained > 0,
+        "the forms, recipes and Auto Shot's chain are read"
+    );
+}
+
 /// `modalNextSpell`, column 38, which `0x6e7447` reads to start Auto Shot after a hunter shot:
 /// nonzero on 57 of 22357 rows, 52 of them naming spell 75.
 #[test]
