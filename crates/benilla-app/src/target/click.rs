@@ -177,9 +177,9 @@ pub(crate) struct Feedback<'w> {
 }
 
 /// The dispatchers, which take the object (`0x5f0130`, `0x5df2a0`, `0x5df130`, `0x5f86b0`,
-/// `0x5f05e0`): a right-click reaches them through [`act_on_right_click`] and a crate's [`Interact`]
-/// through [`act_on_interact`], both with Click to Move's walk, an approach's arrival through
-/// [`act_on_arrival`] without it.
+/// `0x5f05e0`): a right-click reaches them through [`act_on_right_click`] and a crate's
+/// [`Interact`] through [`act_on_interact`], both with Click to Move's walk, an approach's arrival
+/// through [`act_on_arrival`] without it.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct Dispatch<'w, 's> {
     seam: crate::creature_anim::AttackSeam<'w, 's>,
@@ -646,9 +646,10 @@ enum Select<'a, 'w> {
 
 /// Act on a pick by the cursor's classification of it: a GameObject, a corpse, an attack, loot,
 /// skin, or the `UNIT_NPC_FLAGS` ladder ([`service_arm`]); only the click selects first
-/// (`0x493540`), and the attack leg of an [`Interact`] selects through StartAttack. The range gray (`unable`) suppresses every send but attack, which the server holds
-/// until in reach; with Click to Move on, each dispatcher walks there instead (`CanAutoInteract` is
-/// their approach flag, `0x60c170`, `0x5d6c6f`).
+/// (`0x493540`), and the attack leg of an [`Interact`] selects through StartAttack. The range gray
+/// (`unable`) suppresses every send but attack, which the server holds until in reach; with Click
+/// to Move on, each dispatcher walks there instead (`CanAutoInteract` is their approach flag,
+/// `0x60c170`, `0x5d6c6f`).
 fn interact(dispatch: &mut Dispatch, press: &PressPick, mut select: Select) {
     let (hovered, hovered_object, cursor) = (&press.hovered, &press.object, &press.cursor);
     let walk = dispatch.auto.can_auto_interact();
@@ -2410,7 +2411,8 @@ mod tests {
 
     const WOLF: u64 = 0xF130_0000_0000_0299;
 
-    /// Our body hostile to nobody in particular and a wolf three yards off, the attack cursor on it.
+    /// Our body hostile to nobody in particular and a wolf three yards off, the attack cursor on
+    /// it.
     fn wolf_world() -> (World, Entity, crossbeam_channel::Receiver<ClientCommand>) {
         const F_UNIT_FLAGS: u16 = benilla_protocol::field::FIELD_UNIT_FLAGS;
         let (mut world, _vendor, rx) = walking_world(Vec3::ZERO, false);
