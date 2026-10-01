@@ -204,7 +204,6 @@ fn resolve_item(
         item_id: item.entry,
         stats,
         link,
-        // Unfloored: `GetMerchantItemMaxStack` pushes the template's own `[rec+0x60]` (`0x4fb71c`).
         max_stack: template.map(|t| t.stackable),
     }
 }

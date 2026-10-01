@@ -1193,9 +1193,6 @@ fn ctrl_and_shift_on_a_vendor_row_preview_and_post_without_buying() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
-/// Both shift arms (`MerchantFrame.lua:313-326`, `:340-353`) split only above a max stack of 1. A
-/// row sold in bundles answers 1, so a shift-left-click with the chat box closed picks up one
-/// bundle and a shift-right-click buys one; a row sold singly opens the split and buys nothing.
 #[test]
 fn shift_click_takes_one_bundle_and_splits_a_single() {
     benilla_formats::wow_data_or_skip!();
@@ -1204,7 +1201,6 @@ fn shift_click_takes_one_bundle_and_splits_a_single() {
     for f in crate::ui_script::test_ui::production_order(&[
         super::test_ui::MERCHANT_UI,
         &[
-            // `ChatFrameEditBox`, which the left arm tests first.
             "Interface\\FrameXML\\UIMenu.xml",
             "Interface\\FrameXML\\UIDropDownMenu.xml",
             "Interface\\FrameXML\\ChatFrame.xml",
@@ -1221,7 +1217,7 @@ fn shift_click_takes_one_bundle_and_splits_a_single() {
             MerchantItem {
                 name: Some("Refreshing Spring Water".into()),
                 price: 25,
-                quantity: 5, // sold five to a purchase
+                quantity: 5,
                 num_available: -1,
                 item_id: 159,
                 max_stack: Some(20),

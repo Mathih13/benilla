@@ -251,7 +251,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, index: Value| {
             let index = number_arg(lua, index, "Usage: GetMerchantItemMaxStack(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            // Both fields are read signed: the buy count by `jg`, the stack size by `fild`.
+            // Signed, as 1.12.1 reads both.
             let max_stack = usize::try_from(index)
                 .ok()
                 .and_then(|i| i.checked_sub(1))
@@ -539,7 +539,7 @@ mod tests {
                     name: Some("Refreshing Spring Water".into()),
                     texture: Some("Interface\\Icons\\INV_Drink_18".into()),
                     price: 25,
-                    quantity: 5,       // sold five to a purchase
+                    quantity: 5,
                     num_available: -1, // unlimited
                     item_id: 159,
                     stats: Some(ItemStatsHead {
@@ -610,7 +610,6 @@ mod tests {
             .unwrap());
     }
 
-    /// Every arm of `GetMerchantItemMaxStack`, the bundle row first.
     #[test]
     fn merchant_max_stack_is_one_for_bundles_and_misses() {
         let mut s = UiScript::new().unwrap();
@@ -643,7 +642,6 @@ mod tests {
         for out_of_range in ["0", "-1", "6", "9"] {
             assert_eq!(max(&mut s, out_of_range), 1, "index {out_of_range}");
         }
-        // `is-number` passes a numeric string, and a fraction is dropped.
         assert_eq!(max(&mut s, "\"3\""), 20);
         assert_eq!(max(&mut s, "3.9"), 20);
         for bad in ["", "nil", "\"x\"", "{}"] {
