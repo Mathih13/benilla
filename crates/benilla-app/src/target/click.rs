@@ -633,15 +633,23 @@ pub(super) fn act_on_right_click(
     if clicks.read().last().is_none() {
         return;
     }
-    interact(&mut dispatch, &press, Some(&mut selection));
+    interact(&mut dispatch, &press, Select::First(&mut selection));
+}
+
+/// Where [`interact`] selects its unit, if it does: the world click's entry (`0x492820`) selects
+/// first, whatever leg follows; a crate's [`Interact`] runs the dispatcher alone, and only its
+/// attack leg selects, through StartAttack (`0x5ecb70`, `SetSelection` at `0x5eccaa`).
+enum Select<'a, 'w> {
+    First(&'a mut ResMut<'w, Selection>),
+    OnAttack(&'a mut ResMut<'w, Selection>),
 }
 
 /// Act on a pick by the cursor's classification of it: a GameObject, a corpse, an attack, loot,
 /// skin, or the `UNIT_NPC_FLAGS` ladder ([`service_arm`]); only the click selects first
-/// (`0x493540`). The range gray (`unable`) suppresses every send but attack, which the server holds
+/// (`0x493540`), and the attack leg of an [`Interact`] selects through StartAttack. The range gray (`unable`) suppresses every send but attack, which the server holds
 /// until in reach; with Click to Move on, each dispatcher walks there instead (`CanAutoInteract` is
 /// their approach flag, `0x60c170`, `0x5d6c6f`).
-fn interact(dispatch: &mut Dispatch, press: &PressPick, selection: Option<&mut ResMut<Selection>>) {
+fn interact(dispatch: &mut Dispatch, press: &PressPick, mut select: Select) {
     let (hovered, hovered_object, cursor) = (&press.hovered, &press.object, &press.cursor);
     let walk = dispatch.auto.can_auto_interact();
     let self_mounted = dispatch.mounted();
@@ -791,18 +799,23 @@ fn interact(dispatch: &mut Dispatch, press: &PressPick, selection: Option<&mut R
     let me = dispatch.me();
     // A mid-combat click on a vendor or corpse switches and stops, never swings (`0x5ecb70`); the
     // sword, not the fork, as the re-swing also needs the player's own legs.
-    let outcome = match selection {
-        Some(selection) => scan::commit(
+    // Deref'd only where it commits: a leg that does not select leaves the change tick alone.
+    let commit = |seam: &mut crate::creature_anim::AttackSeam,
+                  selection: &mut ResMut<Selection>| {
+        scan::commit(
             selection,
-            &mut dispatch.seam,
+            seam,
             entity,
             guid,
             target,
             me.is_some_and(|(_, _, e)| e),
             me.map(|(_, g, _)| g),
             press.attack(),
-        ),
-        None => scan::CommitOutcome::default(),
+        )
+    };
+    let mut outcome = match &mut select {
+        Select::First(selection) => commit(&mut dispatch.seam, selection),
+        Select::OnAttack(_) => scan::CommitOutcome::default(),
     };
     match unit_branch(attack, dead_fork, leg) {
         UnitBranch::Attack => {
@@ -814,6 +827,11 @@ fn interact(dispatch: &mut Dispatch, press: &PressPick, selection: Option<&mut R
             {
                 // refused: the selection stands, no swing, nothing said
             } else {
+                // StartAttack's own select (`0x5eccaa`), past its gates and before the swing
+                // (`0x5eccfd`): the click's commit, with its stop and re-swing mid-combat.
+                if let Select::OnAttack(selection) = &mut select {
+                    outcome = commit(&mut dispatch.seam, selection);
+                }
                 debug!("right-click attack: {guid:#x}");
                 // `0x5ecb70`'s body through the seam; `swung` means the commit's re-swing already
                 // went out, which `0x5eccda` keeps from sending twice.
@@ -860,15 +878,17 @@ fn interact(dispatch: &mut Dispatch, press: &PressPick, selection: Option<&mut R
     }
 }
 
-/// Interact with an object as its own interact slot does: a unit's `0x60bea0`, a GameObject's
-/// `0x5f8660`, a corpse's `0x5d6bf0`, the entry points 1.12 client mods call on an object they pick.
-/// A right-click also selects the object first (`0x492820`); this does not.
+/// Interact with an object by running its own virtual dispatcher (slot `+0x60`): `0x60bea0` for a
+/// unit or player, `0x5d6bf0` for a corpse, `0x5f8660` for a GameObject. It skips the world click's
+/// select-first entry (`0x492820`); the attack leg selects through StartAttack (`0x5ecb70`), and
+/// the service, loot, skin, corpse and GameObject legs select nothing.
 #[derive(Message, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Interact(pub Entity);
 
 /// Each [`Interact`], its object classified as a press over it would be.
 pub(super) fn act_on_interact(
     mut requests: MessageReader<Interact>,
+    mut selection: ResMut<Selection>,
     kinds: Query<(&Guid, &crate::net::NetEntity)>,
     mut set: ParamSet<(cursor_mode::CursorInputs, Dispatch)>,
 ) {
@@ -892,7 +912,7 @@ pub(super) fn act_on_interact(
         }
         (pick.cursor, pick.attack_fork) =
             cursor_mode::classify(&set.p0(), &pick.hovered, &pick.object);
-        interact(&mut set.p1(), &pick, None);
+        interact(&mut set.p1(), &pick, Select::OnAttack(&mut selection));
     }
 }
 
@@ -2312,6 +2332,157 @@ mod tests {
             .iter()
             .map(|e| e.key)
             .collect()
+    }
+
+    /// A crate's [`Interact`] on `entity`, the selection's change tick cleared first.
+    fn interact_with(world: &mut World, entity: Entity) {
+        world.clear_trackers();
+        world
+            .resource_mut::<Messages<Interact>>()
+            .write(Interact(entity));
+        world.run_system_once(act_on_interact).unwrap();
+    }
+
+    /// The vendor leg (`0x5f0130`) runs the dispatcher alone: no select.
+    #[test]
+    fn an_interaction_opens_a_vendor_in_reach_and_leaves_the_selection() {
+        let (mut world, vendor, rx) = walking_world(Vec3::new(2.5, 0.0, 0.0), false);
+        interact_with(&mut world, vendor);
+        let sent: Vec<ClientCommand> = rx.try_iter().collect();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [ClientCommand::ListInventory { guid: VENDOR }]
+            ),
+            "{sent:?}"
+        );
+        assert_eq!(world.resource::<Selection>().guid, None);
+        assert!(!world.is_resource_changed::<Selection>());
+    }
+
+    #[test]
+    fn a_far_vendor_interaction_walks_only_with_click_to_move_on() {
+        for walk in [true, false] {
+            let (mut world, vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), walk);
+            interact_with(&mut world, vendor);
+            assert_eq!(
+                world.resource::<crate::player::Approach>().active(),
+                walk,
+                "AutoInteract {walk}"
+            );
+            let sent: Vec<ClientCommand> = rx.try_iter().collect();
+            assert!(sent.is_empty(), "{sent:?}");
+        }
+    }
+
+    /// `0x5f8660` → `0x5f86b0`: in reach the object is used; out of reach, with no walk, the range
+    /// arm raises `ERR_USE_TOO_FAR` (`0x5f874b`) and sends nothing. Neither selects.
+    #[test]
+    fn an_interaction_uses_a_gameobject_in_reach_and_refuses_one_out_of_it() {
+        for (x, used) in [(2.0, true), (30.0, false)] {
+            let (mut world, _vendor, rx) = walking_world(Vec3::ZERO, false);
+            let chest = spawn_chest(&mut world, Vec3::new(x, 0.0, 0.0));
+            interact_with(&mut world, chest);
+            let sent: Vec<ClientCommand> = rx.try_iter().collect();
+            assert_eq!(
+                matches!(sent.as_slice(), [ClientCommand::GameObjUse { guid: CHEST }]),
+                used,
+                "{x} yd: {sent:?}"
+            );
+            let keys: Vec<&str> = world
+                .resource::<crate::ui_action::UiErrorKeys>()
+                .0
+                .iter()
+                .map(|e| e.key)
+                .collect();
+            assert_eq!(
+                keys,
+                if used {
+                    vec![]
+                } else {
+                    vec!["ERR_USE_TOO_FAR"]
+                },
+                "{x} yd"
+            );
+            assert!(!world.is_resource_changed::<Selection>(), "{x} yd");
+        }
+    }
+
+    const WOLF: u64 = 0xF130_0000_0000_0299;
+
+    /// Our body hostile to nobody in particular and a wolf three yards off, the attack cursor on it.
+    fn wolf_world() -> (World, Entity, crossbeam_channel::Receiver<ClientCommand>) {
+        const F_UNIT_FLAGS: u16 = benilla_protocol::field::FIELD_UNIT_FLAGS;
+        let (mut world, _vendor, rx) = walking_world(Vec3::ZERO, false);
+        let me = world
+            .query_filtered::<Entity, With<SelfPlayer>>()
+            .single(&world)
+            .unwrap();
+        world.entity_mut(me).insert(store(&[
+            (F_HEALTH, 100),
+            (F_MAXHEALTH, 100),
+            (F_UNIT_FLAGS, 0x8),
+        ]));
+        let wolf = world
+            .spawn((
+                Guid(WOLF),
+                store(&[(F_HEALTH, 100), (F_MAXHEALTH, 100)]),
+                Transform::from_xyz(3.0, 0.0, 0.0),
+                crate::net::NetEntity {
+                    kind: benilla_protocol::EntityKind::Unit,
+                    display_id: None,
+                    scale: 1.0,
+                },
+            ))
+            .id();
+        (world, wolf, rx)
+    }
+
+    /// The attack leg `0x60c247` calls StartAttack (`0x5ecb70`), which selects the target
+    /// (`SetSelection`, `0x5eccaa`) before the swing (`0x5eccfd`), as the right-click does.
+    #[test]
+    fn an_interaction_attacks_an_attackable_unit_and_selects_it() {
+        let (mut world, wolf, rx) = wolf_world();
+        interact_with(&mut world, wolf);
+        let sent: Vec<ClientCommand> = rx.try_iter().collect();
+        let at = |want: fn(&ClientCommand) -> bool| sent.iter().position(want);
+        let select = at(|c| matches!(c, ClientCommand::SetSelection { guid: WOLF }));
+        let swing = at(|c| matches!(c, ClientCommand::AttackSwing { guid: WOLF }));
+        assert!(
+            select.is_some() && swing.is_some() && select < swing,
+            "{sent:?}"
+        );
+        assert_eq!(world.resource::<Selection>().guid, Some(WOLF));
+    }
+
+    /// Mid-combat on another target the select is the click's: stop, select, swing.
+    #[test]
+    fn an_interaction_switching_targets_mid_combat_stops_selects_and_swings() {
+        const OLD: u64 = 0xF130_0000_0000_0111;
+        let (mut world, wolf, rx) = wolf_world();
+        let old = world.spawn((Guid(OLD), store(&[(F_HEALTH, 100)]))).id();
+        {
+            let mut selection = world.resource_mut::<Selection>();
+            selection.guid = Some(OLD);
+            selection.target = Some(old);
+        }
+        let me = world
+            .query_filtered::<Entity, With<SelfPlayer>>()
+            .single(&world)
+            .unwrap();
+        world.entity_mut(me).insert(Engaged(OLD));
+        interact_with(&mut world, wolf);
+        let sent: Vec<&str> = rx
+            .try_iter()
+            .map(|c| match c {
+                ClientCommand::AttackStop => "stop",
+                ClientCommand::SetSelection { guid: WOLF } => "select",
+                ClientCommand::AttackSwing { guid: WOLF } => "swing",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(sent, ["stop", "select", "swing"]);
+        assert_eq!(world.resource::<Selection>().guid, Some(WOLF));
     }
 
     /// `0x5df2a0`: beyond melee reach the walk comes first and nothing is looted yet.

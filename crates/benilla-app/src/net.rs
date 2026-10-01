@@ -418,8 +418,8 @@ pub(crate) struct LoginAbandon(pub(crate) std::sync::Arc<std::sync::atomic::Atom
 #[derive(Resource, Default)]
 pub(crate) struct GuidIndex(pub(crate) HashMap<u64, Entity>);
 
-/// The object manager (`ClntObjMgrObjectPtr 0x468460`): every streamed object by guid, whatever
-/// the kind, with its descriptor store, our own player, and an item's countdown cells. Read-only.
+/// The streamed objects, whatever the kind, with their descriptor stores, our own player, and an
+/// item's countdown cells. Read-only. The by-guid lookups are `ClntObjMgrObjectPtr` (`0x468460`).
 #[derive(SystemParam)]
 pub struct Objects<'w, 's> {
     index: Res<'w, GuidIndex>,
@@ -429,12 +429,12 @@ pub struct Objects<'w, 's> {
 }
 
 impl Objects<'_, '_> {
-    /// The entity behind a guid, if streamed.
+    /// The entity behind a guid, if streamed (`ClntObjMgrObjectPtr`, `0x468460`).
     pub fn entity(&self, guid: u64) -> Option<Entity> {
         self.index.0.get(&guid).copied()
     }
 
-    /// A streamed object's merged descriptor fields.
+    /// A streamed object's merged descriptor fields, found as `0x468460` does, by guid.
     pub fn object(&self, guid: u64) -> Option<&ObjectFields> {
         self.index
             .0
