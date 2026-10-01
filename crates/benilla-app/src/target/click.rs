@@ -268,26 +268,33 @@ impl Dispatch<'_, '_> {
         }
     }
 
-    /// The approach to a GameObject (`0x610300`), which a fishing bobber never takes (`0x5f8705`).
-    /// It stops short of this object's range. Deviation: the reference's arm reads the last
-    /// object's (`0x611336` before `0x610383` stores this one's), so its first walk has no stop.
-    fn walk_to_object(&mut self, entity: Entity, guid: u64, go_type: i32, walk: bool) {
-        if walk && go_type != cursor_mode::GO_TYPE_FISHINGNODE {
-            let stop = crate::player::RANGE_STOP_FRACTION
-                * cursor_mode::go_interact_range_sq(go_type).sqrt();
-            self.approach(
+    /// A GameObject out of its use range (`0x5f3346`, error `0xe1`): the approach (`0x610300`) when
+    /// `walk` and the object is no fishing bobber (`0x5f8705`), which stops short of this object's
+    /// range. A walk that does not start, the leash's `ERR_AUTOFOLLOW_TOO_FAR` first, leaves
+    /// `ERR_USE_TOO_FAR` (`0x5f874b`). Deviation: the reference's arm reads the last object's
+    /// stop (`0x611336` before `0x610383` stores this one's), so its first walk has no stop.
+    fn walk_to_object(&mut self, entity: Entity, guid: u64, go_type: i32, walk: bool) -> bool {
+        let walked = walk
+            && go_type != cursor_mode::GO_TYPE_FISHINGNODE
+            && self.approach(
                 crate::player::ApproachVerb::Use,
                 entity,
                 guid,
                 crate::player::Subject::GameObject,
-                stop,
+                crate::player::RANGE_STOP_FRACTION
+                    * cursor_mode::go_interact_range_sq(go_type).sqrt(),
             );
+        if !walked {
+            self.feedback
+                .errors
+                .0
+                .push(crate::ui_action::UiError::key("ERR_USE_TOO_FAR"));
         }
+        walked
     }
 
     /// `0x5f86b0`, `OnUse` past its highlightable gate: the GameObject's own mounted gate, its type's
-    /// use handler, then its lock. A usable object out of `in_reach` is walked to when `walk`, else
-    /// nothing is shown; the reference shows `ERR_USE_TOO_FAR` (`0x5f874b`).
+    /// use handler, then its lock. A usable object out of `in_reach` goes to [`Self::walk_to_object`].
     fn use_gameobject(&mut self, entity: Entity, guid: u64, in_reach: bool, walk: bool) {
         let self_mounted = self.mounted();
         let self_store = self
@@ -633,7 +640,7 @@ pub(super) fn act_on_right_click(
     // highlightable (our `Point` cursor, silent), then usable (`0x5f3130`), whose lock arm toasts
     // first, even out of range.
     if go_is_nearest(hovered, hovered_object) {
-        // Traced (tag `use`): a `Point` cursor and the range gray both refuse silently here.
+        // Traced (tag `use`): a `Point` cursor refuses silently; the range gray raises `ERR_USE_TOO_FAR`.
         if benilla_assets::trace::enabled_for("use") {
             let ty = hovered_object
                 .target
@@ -2176,11 +2183,11 @@ mod tests {
 
     const CHEST: u64 = 0xC4E5;
 
-    fn spawn_chest(world: &mut World, at: Vec3) -> Entity {
-        let chest = world
+    fn spawn_object(world: &mut World, go_type: u32, at: Vec3) -> Entity {
+        let object = world
             .spawn((
                 Guid(CHEST),
-                store(&[(GO_TYPE_FIELD, 3)]),
+                store(&[(GO_TYPE_FIELD, go_type)]),
                 Transform::from_translation(at),
                 crate::net::NetEntity {
                     kind: benilla_protocol::EntityKind::GameObject,
@@ -2192,8 +2199,39 @@ mod tests {
         world
             .resource_mut::<crate::net::GuidIndex>()
             .0
-            .insert(CHEST, chest);
-        chest
+            .insert(CHEST, object);
+        object
+    }
+
+    fn spawn_chest(world: &mut World, at: Vec3) -> Entity {
+        spawn_object(world, 3, at)
+    }
+
+    /// Right-click the object out of reach (the cursor grayed, as for a far object), and the red
+    /// error keys the click raised.
+    fn click_far_object(world: &mut World, object: Entity, distance: f32) -> Vec<&'static str> {
+        *world.resource_mut::<PressPick>() = PressPick {
+            object: HoveredObject {
+                target: Some(object),
+                guid: Some(CHEST),
+                distance,
+            },
+            cursor: WorldCursor {
+                kind: cursor_mode::CursorKind::Interact,
+                unable: true,
+            },
+            ..PressPick::default()
+        };
+        world
+            .resource_mut::<Messages<WorldRightClick>>()
+            .write(WorldRightClick);
+        world.run_system_once(act_on_right_click).unwrap();
+        world
+            .resource::<crate::ui_action::UiErrorKeys>()
+            .0
+            .iter()
+            .map(|e| e.key)
+            .collect()
     }
 
     /// `0x5df2a0`: beyond melee reach the walk comes first and nothing is looted yet.
@@ -2367,8 +2405,8 @@ mod tests {
         assert_eq!(keys, vec!["ERR_AUTOFOLLOW_TOO_FAR"]);
     }
 
-    /// Out of interact range the click sends nothing, like the shared arms; the reference shows
-    /// `ERR_USE_TOO_FAR` unless its auto-walk (`0x610300`) starts.
+    /// Out of interact range the click sends nothing and raises `ERR_USE_TOO_FAR` (`0x5f874b`),
+    /// the stone's own use slot (`0x5f69d0`) never running.
     #[test]
     fn an_out_of_range_meeting_stone_click_sends_nothing() {
         const STONE: u64 = 0x5702;
@@ -2400,5 +2438,63 @@ mod tests {
             .next()
             .is_none());
         assert!(rx.try_iter().next().is_none());
+        let keys: Vec<&str> = world
+            .resource::<crate::ui_action::UiErrorKeys>()
+            .0
+            .iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(keys, vec!["ERR_USE_TOO_FAR"]);
+    }
+
+    /// `0x5f86b0`: the usable test (`0x5f3130`) refuses out of range with `0xe1`, and with the
+    /// option off the auto-walk (`0x610300`) is false, so `0x5f874b` raises `ERR_USE_TOO_FAR`: for
+    /// the shared arms and the mailbox, text and stone, whose slot `+0x18` is the same test.
+    #[test]
+    fn a_far_object_click_is_too_far_with_click_to_move_off() {
+        for go_type in [3, 9, 19, 23] {
+            let (mut world, _vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), false);
+            let object = spawn_object(&mut world, go_type, Vec3::new(0.0, 0.0, -20.0));
+            let keys = click_far_object(&mut world, object, 20.0);
+            assert_eq!(keys, vec!["ERR_USE_TOO_FAR"], "type {go_type}");
+            assert!(!world.resource::<crate::player::Approach>().active());
+            assert!(rx.try_iter().next().is_none(), "type {go_type}");
+        }
+    }
+
+    /// The arm's leash (`0x6110a0`) refuses the walk with `0x126`, and `0x610300` returns false, so
+    /// `0xe1` follows.
+    #[test]
+    fn a_leashed_far_object_click_raises_both_errors_in_order() {
+        let (mut world, _vendor, _rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
+        let chest = spawn_chest(&mut world, Vec3::new(0.0, 0.0, -90.0));
+        let keys = click_far_object(&mut world, chest, 90.0);
+        assert_eq!(keys, vec!["ERR_AUTOFOLLOW_TOO_FAR", "ERR_USE_TOO_FAR"]);
+        assert!(!world.resource::<crate::player::Approach>().active());
+    }
+
+    /// A walk that starts raises nothing.
+    #[test]
+    fn a_walkable_far_object_click_raises_no_error() {
+        let (mut world, _vendor, _rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
+        let chest = spawn_chest(&mut world, Vec3::new(0.0, 0.0, -20.0));
+        let keys = click_far_object(&mut world, chest, 20.0);
+        assert!(keys.is_empty(), "{keys:?}");
+        assert!(world.resource::<crate::player::Approach>().active());
+    }
+
+    /// A fishing node, out of its 100 yd, never takes the walk (`0x5f8705`) and goes straight to
+    /// `0x5f874b`.
+    #[test]
+    fn a_far_fishing_node_is_too_far_even_with_click_to_move_on() {
+        let (mut world, _vendor, _rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
+        let node = spawn_object(
+            &mut world,
+            cursor_mode::GO_TYPE_FISHINGNODE as u32,
+            Vec3::new(0.0, 0.0, -120.0),
+        );
+        let keys = click_far_object(&mut world, node, 120.0);
+        assert_eq!(keys, vec!["ERR_USE_TOO_FAR"]);
+        assert!(!world.resource::<crate::player::Approach>().active());
     }
 }
