@@ -162,63 +162,471 @@ fn interaction_already_open_on(target: u64, interact: &crate::ui_session::Intera
     interact.1 == Some(target)
 }
 
+/// The refusals and openers the dispatchers raise.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct Feedback<'w> {
+    errors: ResMut<'w, crate::ui_action::UiErrorKeys>,
+    cast_errors: ResMut<'w, crate::ui_action::CastErrors>,
+    mail: ResMut<'w, crate::ui_mail::MailOpen>,
+    item_text: ResMut<'w, crate::ui_item_text::ItemTextOpen>,
+    // The opener queue: this system cannot also hold `CastLadder` (a second `Items` and
+    // `CastErrors` borrow), so the lock verdict goes to `ui_action::drain::drain_go_openers`.
+    openers: ResMut<'w, crate::ui_action::GoOpenerCasts>,
+    // The stone's refusals need the roster, so they run in `drain_meeting_stone_joins`.
+    stone_uses: MessageWriter<'w, crate::ui_dialog_verbs::MeetingStoneUse>,
+}
+
+/// The dispatchers, which take the object (`0x5f0130`, `0x5df2a0`, `0x5df130`, `0x5f86b0`,
+/// `0x5f05e0`): a right-click reaches them through [`act_on_right_click`] with Click to Move's
+/// walk, an approach's arrival through [`act_on_arrival`] without it.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct Dispatch<'w, 's> {
+    seam: crate::creature_anim::AttackSeam<'w, 's>,
+    self_player: Query<'w, 's, (Entity, &'static Guid, Has<Engaged>), With<SelfPlayer>>,
+    // Through `creature_anim::gesture`, the chat path's entry, as the reference's dispatcher does.
+    gestures: ResMut<'w, crate::creature_anim::GestureQueue>,
+    go_inputs: GoLockInputs<'w, 's>,
+    player_actions: Res<'w, crate::ui_action::PlayerActions>,
+    // The skin leg's spells (`[0xb700e4]`, `[0xb700e8]`), already gated by the classifier.
+    learned: Res<'w, crate::ui_action::LearnedAbilities>,
+    // The GameObject leg also reads the object's anim state (the Action gate).
+    stores: Query<
+        'w,
+        's,
+        (
+            &'static ObjectStore,
+            Option<&'static crate::go_anim::GoAnim>,
+        ),
+    >,
+    places: Query<'w, 's, &'static Transform>,
+    service: ServiceArms<'w>,
+    feedback: Feedback<'w>,
+    auto: crate::player::AutoMove<'w, 's>,
+}
+
+impl Dispatch<'_, '_> {
+    fn me(&self) -> Option<(Entity, u64, bool)> {
+        self.self_player
+            .single()
+            .ok()
+            .map(|(e, g, engaged)| (e, g.0, engaged))
+    }
+
+    fn self_store(&self) -> Option<&ObjectStore> {
+        let (me, ..) = self.me()?;
+        self.stores.get(me).ok().map(|(s, _)| s)
+    }
+
+    /// The reference's one mounted predicate, the player's `UNIT_FIELD_MOUNTDISPLAYID`.
+    fn mounted(&self) -> bool {
+        self.self_store()
+            .is_some_and(|s| s.0.unit_mount_display_id() != 0)
+    }
+
+    /// Centre to centre, as the cursor measures.
+    fn dist_sq(&self, target: Entity) -> Option<f32> {
+        let (me, ..) = self.me()?;
+        let a = self.places.get(me).ok()?.translation;
+        Some(a.distance_squared(self.places.get(target).ok()?.translation))
+    }
+
+    fn melee_reach(&self, target: Entity) -> f32 {
+        match (self.stores.get(target).ok(), self.self_store()) {
+            (Some((it, _)), Some(me)) => cursor_mode::melee_reach(it, me),
+            _ => cursor_mode::MELEE_FLOOR,
+        }
+    }
+
+    fn approach(
+        &mut self,
+        verb: crate::player::ApproachVerb,
+        target: Entity,
+        guid: u64,
+        subject: crate::player::Subject,
+        stop: f32,
+    ) -> bool {
+        let Ok(at) = self.places.get(target).map(|t| t.translation) else {
+            return false;
+        };
+        match self.auto.start(verb, guid, subject, at, stop) {
+            Ok(()) => true,
+            Err(crate::player::Refused::TooFar) => {
+                self.feedback
+                    .errors
+                    .0
+                    .push(crate::ui_action::UiError::key("ERR_AUTOFOLLOW_TOO_FAR"));
+                false
+            }
+            Err(crate::player::Refused::Silent) => false,
+        }
+    }
+
+    /// The approach to a GameObject (`0x610300`), which a fishing bobber never takes (`0x5f8705`).
+    /// It stops short of this object's range. Deviation: the reference's arm reads the last
+    /// object's (`0x611336` before `0x610383` stores this one's), so its first walk has no stop.
+    fn walk_to_object(&mut self, entity: Entity, guid: u64, go_type: i32, walk: bool) {
+        if walk && go_type != cursor_mode::GO_TYPE_FISHINGNODE {
+            let stop = crate::player::RANGE_STOP_FRACTION
+                * cursor_mode::go_interact_range_sq(go_type).sqrt();
+            self.approach(
+                crate::player::ApproachVerb::Use,
+                entity,
+                guid,
+                crate::player::Subject::GameObject,
+                stop,
+            );
+        }
+    }
+
+    /// `0x5f86b0`, `OnUse` past its highlightable gate: the GameObject's own mounted gate, its type's
+    /// use handler, then its lock. A usable object out of `in_reach` is walked to when `walk`, else
+    /// nothing is shown; the reference shows `ERR_USE_TOO_FAR` (`0x5f874b`).
+    fn use_gameobject(&mut self, entity: Entity, guid: u64, in_reach: bool, walk: bool) {
+        let self_mounted = self.mounted();
+        let self_store = self
+            .me()
+            .and_then(|(e, ..)| self.stores.get(e).ok())
+            .map(|(s, _)| s);
+        let go = self
+            .stores
+            .get(entity)
+            .ok()
+            .map(|(s, anim)| (s, crate::go_anim::go_state(anim, s)));
+        // The GameObject's own mounted gate (`0x5f31a8`) returns before the opener: no packet, no
+        // cast. It applies only without a Lock.dbc row (`0x5f8180`, a pointer test, so an
+        // all-empty row counts, unlike `LockCatalog::is_locked`); a locked object is refused by
+        // its opener cast. Only MAILBOX is exempt (`0x5f31bb`). Silent: the key has no text or
+        // sound, and `0x4945b0` drops the empty string.
+        let lock_id = self.go_inputs.templates.get(guid).map_or(0, |t| t.lock_id);
+        let has_lock_row = lock_id != 0
+            && self
+                .go_inputs
+                .locks
+                .as_deref()
+                .is_some_and(|l| l.0.slots(lock_id).is_some());
+        let go_type = go.map_or(-1, |(s, _)| s.0.gameobject_type_id());
+        if self_mounted && !has_lock_row && go_type != cursor_mode::GO_TYPE_MAILBOX {
+            debug!(
+                "right-click gameobject {guid:#x}: refused, mounted (lock-less type {go_type}, silent)"
+            );
+            return;
+        }
+        // MAILBOX (type 19) opens locally: its use handler `0x5f6820` sends no
+        // `CMSG_GAMEOBJ_USE`, and `MAIL_SHOW` → `CheckInbox` asks for the list.
+        if go_type == cursor_mode::GO_TYPE_MAILBOX {
+            if in_reach {
+                debug!("right-click mailbox: open mail window {guid:#x}");
+                self.feedback.mail.click(guid);
+            } else {
+                self.walk_to_object(entity, guid, go_type, walk);
+            }
+            return;
+        }
+        // TEXT (type 9) opens locally (`0x5f58c0` → `0x4e32e0(goGuid, 0)`; vmangos' `Use` has no
+        // type-9 case); a re-click closes it, and the page is read at paint time.
+        if go_type == cursor_mode::GO_TYPE_TEXT {
+            if !in_reach {
+                self.walk_to_object(entity, guid, go_type, walk);
+            } else if self.feedback.item_text.toggle_closed(guid) {
+                debug!("right-click text gameobject: re-click closes {guid:#x}");
+            } else {
+                debug!("right-click text gameobject: read {guid:#x}");
+                self.feedback.item_text.open_pages(guid);
+            }
+            return;
+        }
+        // MEETINGSTONE (type 23) has its own use slot `0x5f69d0`: four client-side refusals, then
+        // `CMSG 0x292 {u64 goGuid}` (`0x4c9ff0`), never `CMSG_GAMEOBJ_USE`, whose type-23 arm in
+        // vmangos does nothing (`GameObject.cpp:1836`). Types 9, 19, 23 and 28 override the shared
+        // sender `0x5f33e0`.
+        if go_type == cursor_mode::GO_TYPE_MEETINGSTONE {
+            if in_reach {
+                debug!("right-click meeting stone: {guid:#x}");
+                self.feedback
+                    .stone_uses
+                    .write(crate::ui_dialog_verbs::MeetingStoneUse { go_guid: guid });
+            } else {
+                self.walk_to_object(entity, guid, go_type, walk);
+            }
+            return;
+        }
+        // By lock: used, opened by its opener cast, or refused locally (`0x5f3427..`).
+        match resolve_go_action(
+            guid,
+            &mut self.go_inputs,
+            &self.player_actions.spells,
+            go,
+            self_store,
+            &self.seam.net,
+        ) {
+            GoAction::Use | GoAction::OpenLock(_) | GoAction::OpenByKey(_) if !in_reach => {
+                self.walk_to_object(entity, guid, go_type, walk);
+            }
+            GoAction::Use => {
+                debug!("right-click gameobject use: {guid:#x}");
+                if benilla_assets::trace::enabled_for("use") {
+                    benilla_assets::trace::line(
+                        "use",
+                        &format!("SEND CMSG_GAMEOBJ_USE guid={guid:#x}"),
+                    );
+                }
+                let _ = self.seam.net.0.send(ClientCommand::GameObjUse { guid });
+            }
+            // Both opener arms queue for the one cast path, as the reference reaches `TryCast
+            // 0x6e4b60` from the use sender (`0x5f35c0`) like a button press.
+            GoAction::OpenLock(spell_id) => {
+                debug!("right-click gameobject open-lock: cast {spell_id} at {guid:#x}");
+                self.feedback
+                    .openers
+                    .0
+                    .push(crate::ui_action::GoOpener::Spell {
+                        spell_id,
+                        go_guid: guid,
+                    });
+            }
+            GoAction::OpenByKey(it) => {
+                debug!(
+                    "right-click gameobject open-by-key: use item ({},{}) blk {} at {guid:#x}",
+                    it.bag_index, it.slot, it.spell_index
+                );
+                self.feedback
+                    .openers
+                    .0
+                    .push(crate::ui_action::GoOpener::Key(it));
+            }
+            GoAction::Refuse(err) => {
+                debug!("right-click gameobject {guid:#x}: locked, refused ({err:?})");
+                if let Some(err) = err {
+                    self.feedback.errors.0.push(err);
+                }
+            }
+        }
+    }
+
+    /// `0x5df130`: `CMSG_LOOT` at a lootable corpse, walked to first when `walk` and beyond its
+    /// 5 yd (`0x5df1c3`). A walk that does not start falls through to the send.
+    fn loot_corpse(&mut self, entity: Entity, guid: u64, walk: bool) {
+        if walk
+            && self
+                .dist_sq(entity)
+                .is_some_and(|d2| d2 > cursor_mode::CORPSE_INTERACT_RANGE_SQ)
+            && self.approach(
+                crate::player::ApproachVerb::Loot,
+                entity,
+                guid,
+                crate::player::Subject::Corpse,
+                cursor_mode::CORPSE_INTERACT_RANGE_SQ.sqrt(),
+            )
+        {
+            return;
+        }
+        debug!("right-click corpse loot: {guid:#x}");
+        let _ = self.seam.net.0.send(ClientCommand::Loot { guid });
+        // Predicted, as for a unit corpse (`[player+0x1d28]` armed at the send).
+        self.seam.loot_latch.0 = Some(guid);
+    }
+
+    /// `0x5df2a0`: `CMSG_LOOT` at a dead unit, which `can_loot` (`CanLootNow 0x5ec110`) must
+    /// allow, walked to first when `walk` and beyond melee reach. A walk that does not start falls
+    /// through to the send.
+    fn loot_unit(&mut self, entity: Entity, guid: u64, can_loot: bool, walk: bool) {
+        if !can_loot {
+            return;
+        }
+        let reach = self.melee_reach(entity);
+        if walk
+            && self.dist_sq(entity).is_some_and(|d2| d2 > reach * reach)
+            && self.approach(
+                crate::player::ApproachVerb::Loot,
+                entity,
+                guid,
+                crate::player::Subject::Unit { dead: true },
+                reach,
+            )
+        {
+            return;
+        }
+        debug!("right-click loot: {guid:#x}");
+        let _ = self.seam.net.0.send(ClientCommand::Loot { guid });
+        // Predicted at the send, as the reference's sender (`0x5df253`) arms `[player+0x1d28]` and
+        // kneels before any reply; the anim driver reads the latch.
+        self.seam.loot_latch.0 = Some(guid);
+    }
+
+    /// `0x5f05e0`: the skin cast at a body. Out of reach it walks there when `walk`, and either way
+    /// casts nothing (`0x5f06c4`).
+    fn skin(
+        &mut self,
+        entity: Entity,
+        guid: u64,
+        spell_id: u32,
+        subject: crate::player::Subject,
+        in_reach: bool,
+        walk: bool,
+    ) {
+        if !in_reach {
+            if walk {
+                let stop = crate::player::RANGE_STOP_FRACTION * self.melee_reach(entity);
+                self.approach(
+                    crate::player::ApproachVerb::Skin,
+                    entity,
+                    guid,
+                    subject,
+                    stop,
+                );
+            }
+            return;
+        }
+        // The cast's mounted check (`0x6094f0`, reason `0x39`), the one place a rider is told
+        // anything; the record comes off [`GoLockInputs`]' catalog, this system's only `Spells`.
+        let mounted = self.mounted();
+        let def = self
+            .go_inputs
+            .spells
+            .as_ref()
+            .and_then(|s| s.catalog.get(spell_id));
+        if crate::spell::validator::cast_mounted_refusal(mounted, def) {
+            debug!("right-click skin: refused locally — mounted (0x39)");
+            self.feedback.cast_errors.push_local(spell_id, 0x39);
+        } else {
+            debug!("right-click skin: {guid:#x} (spell {spell_id})");
+            let _ = self.seam.net.0.send(ClientCommand::CastSpell {
+                spell_id,
+                target: Some(guid),
+            });
+        }
+    }
+
+    /// `0x5f0130`: the NPC-service ladder. Out of the 5.5556 yd reach it walks there when `walk`,
+    /// returning before the ladder and the gesture (`0x5f022f`), and otherwise sends nothing.
+    fn talk(&mut self, entity: Entity, guid: u64, in_reach: bool, walk: bool) {
+        if !in_reach {
+            if walk {
+                self.approach(
+                    crate::player::ApproachVerb::Talk,
+                    entity,
+                    guid,
+                    crate::player::Subject::Unit { dead: false },
+                    crate::player::TALK_STOP,
+                );
+            }
+            return;
+        }
+        // The reference's own `UNIT_NPC_FLAGS` ladder (`0x5f0289`), not the cursor kind, which its
+        // cursor ladder (`0x482336`) projects lossily; the re-click gate comes first.
+        if interaction_already_open_on(guid, &self.service.interact) {
+            debug!("right-click interact: {guid:#x} — its window is already open, nothing sent");
+            return;
+        }
+        let npc_flags = self
+            .stores
+            .get(entity)
+            .map(|(s, _)| s.0.unit_npc_flags())
+            .unwrap_or(0);
+        let me = self.me();
+        let self_store = self.self_store();
+        // Peeked, not taken: the cursor clears only once a sale goes out. The reference sends the
+        // cursor's stored guid; we resolve the held `(bag, slot)`, which a pickup locks, and a slot
+        // with no guid opens the list instead.
+        let cursor_sale = self
+            .service
+            .script
+            .as_deref()
+            .and_then(|s| s.cursor_item())
+            .and_then(|item| {
+                let slot0 = u8::try_from(item.slot.saturating_sub(1)).unwrap_or(0);
+                self_store.and_then(|s| {
+                    crate::ui_items::slot_guid(&s.0, item.bag, slot0, &self.go_inputs.objects)
+                })
+            });
+        let ghost = self_store.is_some_and(|s| s.0.player_is_ghost());
+        let Some(arm) = service_arm(npc_flags, self.service.quest.status(guid)) else {
+            // `0x5f05ca`: no consulted bit does nothing, gesture included.
+            debug!("right-click interact: {guid:#x} matches no service bit — nothing sent");
+            return;
+        };
+        match service_action(arm, guid, ghost, cursor_sale) {
+            ServiceAction::Send(cmd) => {
+                debug!("right-click interact: {guid:#x} ({arm:?})");
+                let _ = self.seam.net.0.send(cmd);
+            }
+            ServiceAction::SellFromCursor(cmd) => {
+                debug!("right-click interact: {guid:#x} (vendor — selling the held item)");
+                let _ = self.seam.net.0.send(cmd);
+                // The sell clear: the slot stays greyed until the server's update.
+                if let Some(script) = self.service.script.as_deref_mut() {
+                    script.take_cursor_item_for_sale();
+                }
+            }
+            ServiceAction::AskBinder => {
+                debug!("right-click interact: {guid:#x} (innkeeper — CONFIRM_BINDER, no packet)");
+                self.service.binder.ask(guid);
+            }
+            ServiceAction::AskSpiritHealer => {
+                debug!(
+                    "right-click interact: {guid:#x} (spirit healer — CONFIRM_XP_LOSS, no packet)"
+                );
+                self.service.death.ask_spirit_healer(guid);
+            }
+            ServiceAction::AcquireSpiritGuide => {
+                debug!("right-click interact: {guid:#x} (spirit guide — adopting, 0x2E2)");
+                let outcome = self.service.spirit.click_guide(guid);
+                if outcome.cancel_aura {
+                    if let Some(script) = self.service.script.as_deref_mut() {
+                        script.fire_event("AREA_SPIRIT_HEALER_OUT_OF_RANGE", vec![]);
+                    }
+                    let _ = self.seam.net.0.send(ClientCommand::CancelAura {
+                        spell_id: crate::ui_dialog_verbs::AREA_SPIRIT_HEALER_AURA,
+                    });
+                }
+                if let Some(healer) = outcome.query {
+                    let _ = self
+                        .seam
+                        .net
+                        .0
+                        .send(ClientCommand::AreaSpiritHealerQuery { healer });
+                }
+            }
+            ServiceAction::Silent(why) => {
+                debug!("right-click interact: {guid:#x} ({arm:?}) — silent: {why}");
+            }
+        }
+        // Talk on every taken arm, silent ones too (each arm of `0x5f0130` ends `call
+        // 0x60bb30(0)`); the anim's WeaponFlags `0x10` stows a drawn weapon for good.
+        if let Some((_, my_guid, _)) = me {
+            self.gestures
+                .push(my_guid, crate::creature_anim::Gesture::Talk);
+        }
+    }
+}
+
 /// On a clean right-click, select the press pick's unit and act by the cursor's classification
 /// (the INTERACT leg `0x492820`): a GameObject, a corpse, an attack, loot, skin, or the
 /// `UNIT_NPC_FLAGS` ladder ([`service_arm`]). The range gray (`unable`) suppresses every send but
-/// attack, which the server holds until in reach; there is no auto-approach yet.
-// `ui_feedback` is the overflow bundle past the 16-SystemParam ceiling.
-#[allow(clippy::type_complexity)]
+/// attack, which the server holds until in reach; with Click to Move on, each dispatcher walks
+/// there instead (`CanAutoInteract` is their approach flag, `0x60c170`, `0x5d6c6f`).
 pub(super) fn act_on_right_click(
     mut clicks: MessageReader<WorldRightClick>,
     // The press pick: the reference picks once, on the down edge (`0x481f00`).
     press: Res<PressPick>,
     mut selection: ResMut<Selection>,
-    mut seam: crate::creature_anim::AttackSeam,
-    self_player: Query<(Entity, &Guid, Has<Engaged>), With<SelfPlayer>>,
-    // Through `creature_anim::gesture`, the chat path's entry, as the reference's dispatcher does.
-    mut gestures: ResMut<crate::creature_anim::GestureQueue>,
-    mut go_inputs: GoLockInputs,
-    player_actions: Res<crate::ui_action::PlayerActions>,
-    // The skin leg's spell (`[0xb700e4]`), already gated by the classifier.
-    learned: Res<crate::ui_action::LearnedAbilities>,
-    // The GameObject leg also reads the object's anim state (the Action gate).
-    stores: Query<(&ObjectStore, Option<&crate::go_anim::GoAnim>)>,
-    mut service: ServiceArms,
-    ui_feedback: (
-        ResMut<crate::ui_action::UiErrorKeys>,
-        ResMut<crate::ui_action::CastErrors>,
-        ResMut<crate::ui_mail::MailOpen>,
-        ResMut<crate::ui_item_text::ItemTextOpen>,
-        // The opener queue: this system cannot also hold `CastLadder` (a second `Items` and
-        // `CastErrors` borrow), so the lock verdict goes to `ui_action::drain::drain_go_openers`.
-        ResMut<crate::ui_action::GoOpenerCasts>,
-        // The stone's refusals need the roster, so they run in `drain_meeting_stone_joins`.
-        MessageWriter<crate::ui_dialog_verbs::MeetingStoneUse>,
-    ),
+    mut dispatch: Dispatch,
 ) {
-    let (mut ui_error_keys, mut cast_errors, mut mail, mut item_text, mut openers, mut stone_uses) =
-        ui_feedback;
     if clicks.read().last().is_none() {
         return;
     }
     let (hovered, hovered_object, cursor) = (&press.hovered, &press.object, &press.cursor);
-    // The reference's one mounted predicate, the player's `UNIT_FIELD_MOUNTDISPLAYID`.
-    let self_store = self_player
-        .single()
-        .ok()
-        .and_then(|(e, _, _)| stores.get(e).ok())
-        .map(|(s, _)| s);
-    let self_mounted = self_store.is_some_and(|s| s.0.unit_mount_display_id() != 0);
+    let walk = dispatch.auto.can_auto_interact();
+    let self_mounted = dispatch.mounted();
     // A GameObject is used, never falling through to units: `OnUse 0x5f8660` gates on
     // highlightable (our `Point` cursor, silent), then usable (`0x5f3130`), whose lock arm toasts
-    // first, even out of range. Out of range (`unable`) this shows nothing; the reference shows
-    // `ERR_USE_TOO_FAR` (`0x5f874b`) unless its auto-walk `0x610300` starts (`AutoInteract` on).
+    // first, even out of range.
     if go_is_nearest(hovered, hovered_object) {
         // Traced (tag `use`): a `Point` cursor and the range gray both refuse silently here.
         if benilla_assets::trace::enabled_for("use") {
             let ty = hovered_object
                 .target
-                .and_then(|e| stores.get(e).ok())
+                .and_then(|e| dispatch.stores.get(e).ok())
                 .map_or(-1, |(s, _)| s.0.gameobject_type_id());
             benilla_assets::trace::line(
                 "use",
@@ -231,109 +639,21 @@ pub(super) fn act_on_right_click(
             );
         }
         if cursor.kind != cursor_mode::CursorKind::Point {
-            if let Some(guid) = hovered_object.guid {
-                let go = hovered_object
-                    .target
-                    .and_then(|e| stores.get(e).ok())
-                    .map(|(s, anim)| (s, crate::go_anim::go_state(anim, s)));
-                // The GameObject's own mounted gate (`0x5f31a8`) returns before the opener: no
-                // packet, no cast. It applies only without a Lock.dbc row (`0x5f8180`, a pointer
-                // test, so an all-empty row counts, unlike `LockCatalog::is_locked`); a locked
-                // object is refused by its opener cast. Only MAILBOX is exempt (`0x5f31bb`).
-                // Silent: the key has no text or sound, and `0x4945b0` drops the empty string.
-                let lock_id = go_inputs.templates.get(guid).map_or(0, |t| t.lock_id);
-                let has_lock_row = lock_id != 0
-                    && go_inputs
-                        .locks
-                        .as_deref()
-                        .is_some_and(|l| l.0.slots(lock_id).is_some());
-                let go_type = go.map_or(-1, |(s, _)| s.0.gameobject_type_id());
-                if self_mounted && !has_lock_row && go_type != cursor_mode::GO_TYPE_MAILBOX {
-                    debug!(
-                        "right-click gameobject {guid:#x}: refused, mounted (lock-less type {go_type}, silent)"
-                    );
-                    return;
-                }
-                // MAILBOX (type 19) opens locally: its use handler `0x5f6820` sends no
-                // `CMSG_GAMEOBJ_USE`, and `MAIL_SHOW` → `CheckInbox` asks for the list.
-                if go.is_some_and(|(s, _)| s.0.gameobject_type_id() == cursor_mode::GO_TYPE_MAILBOX)
-                {
-                    if !cursor.unable {
-                        debug!("right-click mailbox: open mail window {guid:#x}");
-                        mail.click(guid);
-                    }
-                    return;
-                }
-                // TEXT (type 9) opens locally (`0x5f58c0` → `0x4e32e0(goGuid, 0)`; vmangos' `Use`
-                // has no type-9 case); a re-click closes it, and the page is read at paint time.
-                if go.is_some_and(|(s, _)| s.0.gameobject_type_id() == cursor_mode::GO_TYPE_TEXT) {
-                    if !cursor.unable {
-                        if item_text.toggle_closed(guid) {
-                            debug!("right-click text gameobject: re-click closes {guid:#x}");
-                        } else {
-                            debug!("right-click text gameobject: read {guid:#x}");
-                            item_text.open_pages(guid);
-                        }
-                    }
-                    return;
-                }
-                // MEETINGSTONE (type 23) has its own use slot `0x5f69d0`: four client-side
-                // refusals, then `CMSG 0x292 {u64 goGuid}` (`0x4c9ff0`), never `CMSG_GAMEOBJ_USE`,
-                // whose type-23 arm in vmangos does nothing (`GameObject.cpp:1836`). Types 9, 19,
-                // 23 and 28 override the shared sender `0x5f33e0`.
-                if go.is_some_and(|(s, _)| {
-                    s.0.gameobject_type_id() == cursor_mode::GO_TYPE_MEETINGSTONE
-                }) {
-                    if !cursor.unable {
-                        debug!("right-click meeting stone: {guid:#x}");
-                        stone_uses.write(crate::ui_dialog_verbs::MeetingStoneUse { go_guid: guid });
-                    }
-                    return;
-                }
-                // By lock: used, opened by its opener cast, or refused locally (`0x5f3427..`).
-                match resolve_go_action(
-                    guid,
-                    &mut go_inputs,
-                    &player_actions.spells,
-                    go,
-                    self_store,
-                    &seam.net,
-                ) {
-                    GoAction::Use if cursor.unable => {}
-                    GoAction::OpenLock(_) | GoAction::OpenByKey(_) if cursor.unable => {}
-                    GoAction::Use => {
-                        debug!("right-click gameobject use: {guid:#x}");
-                        if benilla_assets::trace::enabled_for("use") {
-                            benilla_assets::trace::line(
-                                "use",
-                                &format!("SEND CMSG_GAMEOBJ_USE guid={guid:#x}"),
-                            );
-                        }
-                        let _ = seam.net.0.send(ClientCommand::GameObjUse { guid });
-                    }
-                    // Both opener arms queue for the one cast path, as the reference reaches
-                    // `TryCast 0x6e4b60` from the use sender (`0x5f35c0`) like a button press.
-                    GoAction::OpenLock(spell_id) => {
-                        debug!("right-click gameobject open-lock: cast {spell_id} at {guid:#x}");
-                        openers.0.push(crate::ui_action::GoOpener::Spell {
-                            spell_id,
-                            go_guid: guid,
-                        });
-                    }
-                    GoAction::OpenByKey(it) => {
-                        debug!(
-                            "right-click gameobject open-by-key: use item ({},{}) blk {} at {guid:#x}",
-                            it.bag_index, it.slot, it.spell_index
-                        );
-                        openers.0.push(crate::ui_action::GoOpener::Key(it));
-                    }
-                    GoAction::Refuse(err) => {
-                        debug!("right-click gameobject {guid:#x}: locked, refused ({err:?})");
-                        if let Some(err) = err {
-                            ui_error_keys.0.push(err);
-                        }
-                    }
-                }
+            if let (Some(entity), Some(guid)) = (hovered_object.target, hovered_object.guid) {
+                // Walking, the range arm (`0x5f330c`) is the object's own: the PickLock cursor
+                // never grays, and the gray folds the lock in.
+                let in_reach = if walk {
+                    let go_type = dispatch
+                        .stores
+                        .get(entity)
+                        .map_or(-1, |(s, _)| s.0.gameobject_type_id());
+                    dispatch
+                        .dist_sq(entity)
+                        .is_some_and(|d2| d2 <= cursor_mode::go_interact_range_sq(go_type))
+                } else {
+                    !cursor.unable
+                };
+                dispatch.use_gameobject(entity, guid, in_reach, walk);
             }
         }
         return;
@@ -345,7 +665,7 @@ pub(super) fn act_on_right_click(
     // skin cast (`0x5f05e0`). Your own corpse takes neither: the resurrect prompt comes from the
     // 40 yd `CORPSE_IN_RANGE` poll (`0x492130`), never a click.
     if let (Some(entity), Some(guid)) = (hovered.corpse, hovered.corpse_guid) {
-        let store = stores.get(entity).ok().map(|(s, _)| s);
+        let store = dispatch.stores.get(entity).ok().map(|(s, _)| s);
         if benilla_assets::trace::enabled_for("use") {
             benilla_assets::trace::line(
                 "use",
@@ -359,47 +679,42 @@ pub(super) fn act_on_right_click(
                 ),
             );
         }
+        let (lootable, insignia) = (
+            store.is_some_and(|s| s.0.corpse_lootable()),
+            store.is_some_and(|s| s.0.corpse_pvp_insignia()),
+        );
         // A rider fails leg 1 (`0x5d6c2a jg`) with no error and falls to leg 2, silently.
-        if !self_mounted && store.is_some_and(|s| s.0.corpse_lootable()) {
+        if !self_mounted && lootable {
             // Not standing: the client-local red `ERR_LOOT_NOTSTANDING`, no packet (`0x5d6c3b` →
             // `GetStandState 0x5ed570`, non-zero → `0x496720(0x85)`).
-            let standing = self_store.is_none_or(|s| s.0.unit_stand_state() == 0);
-            if !standing {
+            if dispatch
+                .self_store()
+                .is_some_and(|s| s.0.unit_stand_state() != 0)
+            {
                 debug!("right-click corpse loot: refused, not standing ({guid:#x})");
-                ui_error_keys
+                dispatch
+                    .feedback
+                    .errors
                     .0
                     .push(crate::ui_action::UiError::key("ERR_LOOT_NOTSTANDING"));
                 return;
             }
             // Range rides the cursor's gray, so the pouch is never lit where the click refuses.
             if !cursor.unable {
-                debug!("right-click corpse loot: {guid:#x}");
-                let _ = seam.net.0.send(ClientCommand::Loot { guid });
-                // Predicted, as for a unit corpse (`[player+0x1d28]` armed at the send).
-                seam.loot_latch.0 = Some(guid);
+                dispatch.loot_corpse(entity, guid, walk);
             }
-        } else if store.is_some_and(|s| s.0.corpse_pvp_insignia()) {
+        } else if insignia {
             // Leg 2. `skin_player_corpse` mirrors `[0xb700e8]`, `None` for every 1.12.1 player,
             // so this is inert as in the reference; the unfriendly test is not built.
-            if let Some(spell_id) = learned.skin_player_corpse {
-                if !cursor.unable {
-                    // The cast's mounted check, where a mounted click lands; the record comes off
-                    // [`GoLockInputs`]' catalog, this system's only `Spells` handle.
-                    let def = go_inputs
-                        .spells
-                        .as_ref()
-                        .and_then(|s| s.catalog.get(spell_id));
-                    if crate::spell::validator::cast_mounted_refusal(self_mounted, def) {
-                        debug!("right-click corpse insignia: refused locally — mounted (0x39)");
-                        cast_errors.push_local(spell_id, 0x39);
-                    } else {
-                        debug!("right-click corpse insignia: {guid:#x} (spell {spell_id})");
-                        let _ = seam.net.0.send(ClientCommand::CastSpell {
-                            spell_id,
-                            target: Some(guid),
-                        });
-                    }
-                }
+            if let Some(spell_id) = dispatch.learned.skin_player_corpse {
+                dispatch.skin(
+                    entity,
+                    guid,
+                    spell_id,
+                    crate::player::Subject::Corpse,
+                    !cursor.unable,
+                    walk,
+                );
             }
         }
         return;
@@ -410,7 +725,7 @@ pub(super) fn act_on_right_click(
     // The dispatcher's attack arm (`0x60c18c`), not the sword: a dead, ghost or mounted player
     // still takes it and is refused inside (`0x60c1a1`, `0x60c1bc`), never reaching a service.
     let attack = press.attack_fork.0;
-    let target = stores.get(entity).ok().map(|(s, _)| s);
+    let target = dispatch.stores.get(entity).ok().map(|(s, _)| s);
     // ── The dead-target fork of the unit dispatcher `0x60bea0` ──
     // Loot routes by classification (dead and `UNIT_DYNFLAG_LOOTABLE`), not the cursor kind, whose
     // Pickup(8) a live vendor shares. A rider skips the loot leg for the skin leg (`0x60bf98`),
@@ -421,7 +736,7 @@ pub(super) fn act_on_right_click(
         dead_fork,
         target.is_some_and(|s| s.0.unit_lootable()),
         target.is_some_and(|s| s.0.unit_flags() & cursor_mode::UNIT_FLAG_SKINNABLE != 0),
-        learned.skinning.is_some(),
+        dispatch.learned.skinning.is_some(),
     );
     if benilla_assets::trace::enabled_for("use") {
         benilla_assets::trace::line(
@@ -445,17 +760,17 @@ pub(super) fn act_on_right_click(
             ),
         );
     }
-    let me = self_player.single().ok();
+    let me = dispatch.me();
     // A mid-combat click on a vendor or corpse switches and stops, never swings (`0x5ecb70`); the
     // sword, not the fork, as the re-swing also needs the player's own legs.
     let outcome = scan::commit(
         &mut selection,
-        &mut seam,
+        &mut dispatch.seam,
         entity,
         guid,
         target,
         me.is_some_and(|(_, _, e)| e),
-        me.map(|(_, g, _)| g.0),
+        me.map(|(_, g, _)| g),
         press.attack(),
     );
     match unit_branch(attack, dead_fork, leg) {
@@ -463,7 +778,8 @@ pub(super) fn act_on_right_click(
             // Silent after the select: the click's `0x60c247 call 0x5ecb70` has no `DisplayError`,
             // and the red `ERR_ATTACK_*` lines are `0x612df0`'s (the Attack action, pet attack,
             // TryCast). The predicate is `0x612df0`'s; `0x5ecb70`'s own set is not transcribed.
-            if crate::ui_action::attack_actor_blocked(self_store, me.map(|(_, g, _)| g.0)).is_some()
+            if crate::ui_action::attack_actor_blocked(dispatch.self_store(), me.map(|(_, g, _)| g))
+                .is_some()
             {
                 // refused: the selection stands, no swing, nothing said
             } else {
@@ -471,46 +787,37 @@ pub(super) fn act_on_right_click(
                 // `0x5ecb70`'s body through the seam; `swung` means the commit's re-swing already
                 // went out, which `0x5eccda` keeps from sending twice.
                 let engaged = me.is_some_and(|(_, _, e)| e);
-                seam.start(guid, engaged || outcome.swung, false);
+                dispatch.seam.start(guid, engaged || outcome.swung, false);
             }
         }
         UnitBranch::Dead(DeadUnitLeg::Loot) => {
-            // `CMSG_LOOT`, no talk gesture; the stand-state check (`0x60bfb7` → `0x60c007 push
-            // 0x85`) matches the corpse leg's.
-            if self_store.is_some_and(|s| s.0.unit_stand_state() != 0) {
+            // The stand-state check (`0x60bfb7` → `0x60c007 push 0x85`) matches the corpse leg's.
+            if dispatch
+                .self_store()
+                .is_some_and(|s| s.0.unit_stand_state() != 0)
+            {
                 debug!("right-click loot: refused, not standing ({guid:#x})");
-                ui_error_keys
+                dispatch
+                    .feedback
+                    .errors
                     .0
                     .push(crate::ui_action::UiError::key("ERR_LOOT_NOTSTANDING"));
-            } else if !cursor.unable {
-                debug!("right-click loot: {guid:#x}");
-                let _ = seam.net.0.send(ClientCommand::Loot { guid });
-                // Predicted at the send, as the reference's sender (`0x5df253`) arms
-                // `[player+0x1d28]` and kneels before any reply; the anim driver reads the latch.
-                seam.loot_latch.0 = Some(guid);
+            } else {
+                dispatch.loot_unit(entity, guid, !cursor.unable, walk);
             }
         }
         UnitBranch::Dead(DeadUnitLeg::Skin) => {
             // The skin leg (`0x60c01f`): the known Skinning spell (`[0xb700e4]`) at a corpse the
-            // loot leg declined, lootable ones included while mounted. Its cast mounted check
-            // (`0x6094f0`, reason `0x39`) is the one place a rider is told anything.
-            if !cursor.unable {
-                if let Some(spell_id) = learned.skinning {
-                    let def = go_inputs
-                        .spells
-                        .as_ref()
-                        .and_then(|s| s.catalog.get(spell_id));
-                    if crate::spell::validator::cast_mounted_refusal(self_mounted, def) {
-                        debug!("right-click skin: refused locally — mounted (0x39)");
-                        cast_errors.push_local(spell_id, 0x39);
-                    } else {
-                        debug!("right-click skin: {guid:#x} (spell {spell_id})");
-                        let _ = seam.net.0.send(ClientCommand::CastSpell {
-                            spell_id,
-                            target: Some(guid),
-                        });
-                    }
-                }
+            // loot leg declined, lootable ones included while mounted.
+            if let Some(spell_id) = dispatch.learned.skinning {
+                dispatch.skin(
+                    entity,
+                    guid,
+                    spell_id,
+                    crate::player::Subject::Unit { dead: true },
+                    !cursor.unable,
+                    walk,
+                );
             }
         }
         // Terminal: a dead unit that took no leg does nothing; only the alive branch (`0x60c162`)
@@ -518,95 +825,76 @@ pub(super) fn act_on_right_click(
         UnitBranch::Dead(DeadUnitLeg::Nothing) => {
             debug!("right-click unit {guid:#x}: dead fork took no leg — nothing sent");
         }
-        UnitBranch::Service if !cursor.unable => {
-            // The reference's own `UNIT_NPC_FLAGS` ladder (`0x5f0289`), not the cursor kind, which
-            // its cursor ladder (`0x482336`) projects lossily; the re-click gate comes first.
-            if interaction_already_open_on(guid, &service.interact) {
-                debug!(
-                    "right-click interact: {guid:#x} — its window is already open, nothing sent"
-                );
-                return;
-            }
-            let npc_flags = stores
+        UnitBranch::Service => dispatch.talk(entity, guid, !cursor.unable, walk),
+    }
+}
+
+/// The verb an approach owed, once it arrived (`0x60fa20`, run at the stop): the dispatcher alone,
+/// with no walk, no select and no cursor. Each looks its object up by type (`0x468460`), and the
+/// loot's asks for a unit (`0x60fa41`), so a corpse object walked to is not looted.
+pub(super) fn act_on_arrival(
+    mut dispatch: Dispatch,
+    index: Res<crate::net::GuidIndex>,
+    kinds: Query<&crate::net::NetEntity>,
+) {
+    use crate::player::{ApproachVerb, Subject};
+    use benilla_protocol::EntityKind;
+    let Some((verb, guid)) = dispatch.auto.approach.arrived.take() else {
+        return;
+    };
+    let Some(&entity) = index.0.get(&guid) else {
+        return;
+    };
+    let kind = kinds.get(entity).ok().map(|k| k.kind);
+    let unit = matches!(kind, Some(EntityKind::Unit | EntityKind::Player));
+    let d2 = dispatch.dist_sq(entity).unwrap_or(f32::INFINITY);
+    debug!(
+        "approach: arrived for {verb:?} at {guid:#x}, {:.2} yd",
+        d2.sqrt()
+    );
+    match verb {
+        ApproachVerb::Talk if unit => dispatch.talk(entity, guid, d2 <= SERVICE_RANGE_SQ, false),
+        // `0x5df2a0`'s own lootable test (`0x6003a0`), which the click's dead fork made earlier.
+        ApproachVerb::Loot if unit => {
+            if dispatch
+                .stores
                 .get(entity)
-                .map(|(s, _)| s.0.unit_npc_flags())
-                .unwrap_or(0);
-            // Peeked, not taken: the cursor clears only once a sale goes out. The reference sends
-            // the cursor's stored guid; we resolve the held `(bag, slot)`, which a pickup locks,
-            // and a slot with no guid opens the list instead.
-            let cursor_sale = service
-                .script
-                .as_deref()
-                .and_then(|s| s.cursor_item())
-                .and_then(|item| {
-                    let slot0 = u8::try_from(item.slot.saturating_sub(1)).unwrap_or(0);
-                    self_store.and_then(|s| {
-                        crate::ui_items::slot_guid(&s.0, item.bag, slot0, &go_inputs.objects)
-                    })
-                });
-            let Some(arm) = service_arm(npc_flags, service.quest.status(guid)) else {
-                // `0x5f05ca`: no consulted bit does nothing, gesture included.
-                debug!("right-click interact: {guid:#x} matches no service bit — nothing sent");
-                return;
-            };
-            match service_action(
-                arm,
-                guid,
-                self_store.is_some_and(|s| s.0.player_is_ghost()),
-                cursor_sale,
-            ) {
-                ServiceAction::Send(cmd) => {
-                    debug!("right-click interact: {guid:#x} ({arm:?})");
-                    let _ = seam.net.0.send(cmd);
-                }
-                ServiceAction::SellFromCursor(cmd) => {
-                    debug!("right-click interact: {guid:#x} (vendor — selling the held item)");
-                    let _ = seam.net.0.send(cmd);
-                    // The sell clear: the slot stays greyed until the server's update.
-                    if let Some(script) = service.script.as_deref_mut() {
-                        script.take_cursor_item_for_sale();
-                    }
-                }
-                ServiceAction::AskBinder => {
-                    debug!(
-                        "right-click interact: {guid:#x} (innkeeper — CONFIRM_BINDER, no packet)"
-                    );
-                    service.binder.ask(guid);
-                }
-                ServiceAction::AskSpiritHealer => {
-                    debug!("right-click interact: {guid:#x} (spirit healer — CONFIRM_XP_LOSS, no packet)");
-                    service.death.ask_spirit_healer(guid);
-                }
-                ServiceAction::AcquireSpiritGuide => {
-                    debug!("right-click interact: {guid:#x} (spirit guide — adopting, 0x2E2)");
-                    let outcome = service.spirit.click_guide(guid);
-                    if outcome.cancel_aura {
-                        if let Some(script) = service.script.as_deref_mut() {
-                            script.fire_event("AREA_SPIRIT_HEALER_OUT_OF_RANGE", vec![]);
-                        }
-                        let _ = seam.net.0.send(ClientCommand::CancelAura {
-                            spell_id: crate::ui_dialog_verbs::AREA_SPIRIT_HEALER_AURA,
-                        });
-                    }
-                    if let Some(healer) = outcome.query {
-                        let _ = seam
-                            .net
-                            .0
-                            .send(ClientCommand::AreaSpiritHealerQuery { healer });
-                    }
-                }
-                ServiceAction::Silent(why) => {
-                    debug!("right-click interact: {guid:#x} ({arm:?}) — silent: {why}");
-                }
-            }
-            // Talk on every taken arm, silent ones too (each arm of `0x5f0130` ends `call
-            // 0x60bb30(0)`); the anim's WeaponFlags `0x10` stows a drawn weapon for good.
-            if let Some((_, my_guid, _)) = me {
-                gestures.push(my_guid.0, crate::creature_anim::Gesture::Talk);
+                .is_ok_and(|(s, _)| s.0.unit_lootable())
+            {
+                let reach = dispatch.melee_reach(entity);
+                let can_loot = dispatch.auto.can_auto_interact() || d2 <= reach * reach;
+                dispatch.loot_unit(entity, guid, can_loot, false);
             }
         }
-        // Beyond the 5.5556 yd service range nothing is sent (no auto-approach yet).
-        UnitBranch::Service => {}
+        ApproachVerb::Use if kind == Some(EntityKind::GameObject) => {
+            let go_type = dispatch
+                .stores
+                .get(entity)
+                .map_or(-1, |(s, _)| s.0.gameobject_type_id());
+            dispatch.use_gameobject(
+                entity,
+                guid,
+                d2 <= cursor_mode::go_interact_range_sq(go_type),
+                false,
+            );
+        }
+        // The spell by the target: a corpse or a player's body takes `[0xb700e8]` (`0x5f0608`).
+        ApproachVerb::Skin => {
+            let spell = if matches!(kind, Some(EntityKind::Corpse | EntityKind::Player)) {
+                dispatch.learned.skin_player_corpse
+            } else {
+                dispatch.learned.skinning
+            };
+            if let Some(spell_id) = spell {
+                let subject = if kind == Some(EntityKind::Corpse) {
+                    Subject::Corpse
+                } else {
+                    Subject::Unit { dead: true }
+                };
+                dispatch.skin(entity, guid, spell_id, subject, true, false);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1614,6 +1902,9 @@ mod tests {
         world.init_resource::<crate::ui_item_text::ItemTextOpen>();
         world.init_resource::<crate::ui_action::GoOpenerCasts>();
         world.init_resource::<Messages<crate::ui_dialog_verbs::MeetingStoneUse>>();
+        world.init_resource::<crate::player::Approach>();
+        world.init_resource::<crate::player::FollowState>();
+        world.init_resource::<crate::player::Player>();
         world.spawn((SelfPlayer, Guid(ME)));
         let boar = world
             .spawn((Guid(BOAR), store(&[(F_HEALTH, 100), (F_MAXHEALTH, 100)])))
@@ -1770,6 +2061,108 @@ mod tests {
 
     /// Out of interact range the click sends nothing, like the shared arms; the reference shows
     /// `ERR_USE_TOO_FAR` unless its auto-walk (`0x610300`) starts.
+    const VENDOR: u64 = 0x7E0D;
+
+    /// Our body alive at the origin, Click to Move set as `walk`, and a vendor at `at`.
+    fn walking_world(
+        at: Vec3,
+        walk: bool,
+    ) -> (World, Entity, crossbeam_channel::Receiver<ClientCommand>) {
+        const F_NPC_FLAGS: u16 = 147;
+        let (tx, rx) = crossbeam_channel::unbounded::<ClientCommand>();
+        let (mut world, _boar) = right_click_world();
+        world.insert_resource(NetCommands(tx));
+        world.resource_mut::<crate::player::Approach>().enabled = walk;
+        let me = world
+            .query_filtered::<Entity, With<SelfPlayer>>()
+            .single(&world)
+            .unwrap();
+        world.entity_mut(me).insert((
+            store(&[(F_HEALTH, 100), (F_MAXHEALTH, 100)]),
+            Transform::default(),
+        ));
+        let vendor = world
+            .spawn((
+                Guid(VENDOR),
+                store(&[(F_HEALTH, 100), (F_MAXHEALTH, 100), (F_NPC_FLAGS, 0x4)]),
+                Transform::from_translation(at),
+                crate::net::NetEntity {
+                    kind: benilla_protocol::EntityKind::Unit,
+                    display_id: None,
+                    scale: 1.0,
+                },
+            ))
+            .id();
+        world
+            .resource_mut::<crate::net::GuidIndex>()
+            .0
+            .insert(VENDOR, vendor);
+        (world, vendor, rx)
+    }
+
+    fn click_vendor(world: &mut World, vendor: Entity) {
+        *world.resource_mut::<PressPick>() = PressPick {
+            hovered: Hovered {
+                target: Some(vendor),
+                guid: Some(VENDOR),
+                distance: 14.0,
+                ..Hovered::default()
+            },
+            cursor: WorldCursor {
+                kind: cursor_mode::CursorKind::Buy,
+                unable: true,
+            },
+            ..PressPick::default()
+        };
+        world
+            .resource_mut::<Messages<WorldRightClick>>()
+            .write(WorldRightClick);
+        world.run_system_once(act_on_right_click).unwrap();
+    }
+
+    /// `0x5f0130`: out of reach, `CanAutoInteract` starts the walk and nothing goes out; with the
+    /// option off the click stays refused.
+    #[test]
+    fn a_far_vendor_click_walks_only_with_click_to_move_on() {
+        for walk in [true, false] {
+            let (mut world, vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), walk);
+            click_vendor(&mut world, vendor);
+            assert_eq!(
+                world.resource::<crate::player::Approach>().active(),
+                walk,
+                "AutoInteract {walk}"
+            );
+            let sent: Vec<ClientCommand> = rx.try_iter().collect();
+            assert!(
+                !sent
+                    .iter()
+                    .any(|c| matches!(c, ClientCommand::ListInventory { .. })),
+                "no list before the walk ends: {sent:?}"
+            );
+        }
+    }
+
+    /// `0x60fa20` on arrival: the ladder alone, with no select and no walk of its own.
+    #[test]
+    fn an_arrival_opens_the_vendor_it_walked_to() {
+        let (mut world, _vendor, rx) = walking_world(Vec3::new(2.5, 0.0, 0.0), true);
+        world.resource_mut::<crate::player::Approach>().arrived =
+            Some((crate::player::ApproachVerb::Talk, VENDOR));
+        world.run_system_once(act_on_arrival).unwrap();
+        let sent: Vec<ClientCommand> = rx.try_iter().collect();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [ClientCommand::ListInventory { guid: VENDOR }]
+            ),
+            "{sent:?}"
+        );
+        assert!(world
+            .resource::<crate::player::Approach>()
+            .arrived
+            .is_none());
+    }
+
     #[test]
     fn an_out_of_range_meeting_stone_click_sends_nothing() {
         const STONE: u64 = 0x5702;
