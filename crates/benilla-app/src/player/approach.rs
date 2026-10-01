@@ -13,10 +13,10 @@ use bevy::prelude::*;
 
 use benilla_protocol::EntityKind;
 
-use crate::net::{Guid, GuidIndex, NetEntity, ObjectStore, SelfPlayer};
+use crate::net::{Embodied, Guid, GuidIndex, NetEntity, ObjectStore, SelfPlayer, UnitSpeeds};
 
 use super::follow::{self, FollowInput, FollowState};
-use super::state::{MoveSpeed, Player};
+use super::state::Player;
 
 /// The verb an approach owes, by its mode in `0xc4d888`; the pending dispatcher `0x60fa20` runs it
 /// at the stop.
@@ -192,7 +192,8 @@ fn goal_distance_sq(verb: ApproachVerb, delta: Vec3, speed: f32, swimming: bool)
     }
 }
 
-/// The arrive distance (`0x610add`-`0x610b07`): the stop distance scaled by speed, except Talk's.
+/// The arrive distance (`0x610add`-`0x610b07`): the stop distance scaled by the mover's current
+/// speed over 7 (`0x7c4c90`, 0 at rest), never below 1×; Talk's is never scaled.
 fn arrive_distance(verb: ApproachVerb, stop: f32, speed: f32) -> f32 {
     if verb == ApproachVerb::Talk {
         stop
@@ -217,7 +218,7 @@ pub(super) fn steer_approach(
     time: Res<Time>,
     mut approach: ResMut<Approach>,
     mut player: ResMut<Player>,
-    speed: Res<MoveSpeed>,
+    mover: Query<&UnitSpeeds, With<Embodied>>,
     index: Res<GuidIndex>,
     targets: Query<(&Transform, Option<&ObjectStore>, Option<&NetEntity>)>,
     input: FollowInput,
@@ -225,6 +226,10 @@ pub(super) fn steer_approach(
     let Some(goal) = approach.goal.as_mut() else {
         return;
     };
+    // `GetCurrentSpeed` on last frame's word, as the reference reads the mover's own.
+    let speed = mover
+        .single()
+        .map_or(0.0, |s| crate::net::current_speed(&s.0, player.move_flags));
     if input.cancels(&player) {
         info!("approach: cancelled by the player's own movement input");
         approach.stop();
@@ -248,7 +253,7 @@ pub(super) fn steer_approach(
     }
     let target = tf.translation;
     let delta = target - player.pos;
-    let d2 = goal_distance_sq(goal.verb, delta, speed.value, player.swimming);
+    let d2 = goal_distance_sq(goal.verb, delta, speed, player.swimming);
     if d2 >= LEASH_SQ {
         info!("approach: beyond 80 yd");
         approach.stop();
@@ -273,7 +278,7 @@ pub(super) fn steer_approach(
     } else {
         goal.aligned = true;
     }
-    let arrive = arrive_distance(goal.verb, goal.stop, speed.value);
+    let arrive = arrive_distance(goal.verb, goal.stop, speed);
     if d2 <= arrive * arrive {
         info!("approach: arrived at {:.2} yd", d2.sqrt());
         // The arrival's canceller faces the target (`0x60fbe8`).
@@ -313,6 +318,7 @@ pub(super) fn plugin(app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::state::MoveSpeed;
     use super::*;
     use benilla_protocol::messages::ObjectFields;
     use bevy::ecs::system::RunSystemOnce;
@@ -327,6 +333,7 @@ mod tests {
         assert_eq!(arrive_distance(ApproachVerb::Loot, 5.0, 7.0), 5.0);
         assert_eq!(arrive_distance(ApproachVerb::Loot, 5.0, 14.0), 10.0);
         assert_eq!(arrive_distance(ApproachVerb::Use, 5.0, 3.5), 5.0);
+        assert_eq!(arrive_distance(ApproachVerb::Use, 5.0, 0.0), 5.0, "at rest");
     }
 
     #[test]
@@ -404,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vendor_out_of_reach_is_walked_to_and_talked_to_on_arrival() {
+    fn a_vendor_out_of_reach_is_walked_to_and_owed_the_talk() {
         let at = Vec3::new(14.0, 0.0, 0.0);
         let mut app = world(at, 0);
         assert_eq!(
@@ -550,6 +557,12 @@ mod tests {
         assert_eq!(
             start(&mut app, ApproachVerb::Use, Subject::GameObject, at),
             Ok(())
+        );
+        frame(&mut app, false);
+        frame(&mut app, false);
+        assert!(
+            app.world().resource::<Approach>().active(),
+            "still turning, where standing still is not stuck"
         );
         for _ in 0..60 {
             frame(&mut app, false);

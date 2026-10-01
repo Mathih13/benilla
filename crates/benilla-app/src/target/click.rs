@@ -466,7 +466,11 @@ impl Dispatch<'_, '_> {
     ) {
         if !in_reach {
             if walk {
-                let stop = crate::player::RANGE_STOP_FRACTION * self.melee_reach(entity);
+                let reach = match subject {
+                    crate::player::Subject::Corpse => cursor_mode::MELEE_FLOOR,
+                    _ => self.melee_reach(entity),
+                };
+                let stop = crate::player::RANGE_STOP_FRACTION * reach;
                 self.approach(
                     crate::player::ApproachVerb::Skin,
                     entity,
@@ -830,8 +834,8 @@ pub(super) fn act_on_right_click(
 }
 
 /// The verb an approach owed, once it arrived (`0x60fa20`, run at the stop): the dispatcher alone,
-/// with no walk, no select and no cursor. Each looks its object up by type (`0x468460`), and the
-/// loot's asks for a unit (`0x60fa41`), so a corpse object walked to is not looted.
+/// with no select, no cursor and no walk but Use's. Each looks its object up by type (`0x468460`),
+/// and the loot's asks for a unit (`0x60fa41`), so a corpse object walked to is not looted.
 pub(super) fn act_on_arrival(
     mut dispatch: Dispatch,
     index: Res<crate::net::GuidIndex>,
@@ -871,11 +875,13 @@ pub(super) fn act_on_arrival(
                 .stores
                 .get(entity)
                 .map_or(-1, |(s, _)| s.0.gameobject_type_id());
+            // Still out of range, `0x5f86b0`'s range arm walks again (`0x610300`).
+            let walk = dispatch.auto.can_auto_interact();
             dispatch.use_gameobject(
                 entity,
                 guid,
                 d2 <= cursor_mode::go_interact_range_sq(go_type),
-                false,
+                walk,
             );
         }
         // The spell by the target: a corpse or a player's body takes `[0xb700e8]` (`0x5f0608`).
@@ -2161,6 +2167,120 @@ mod tests {
             .resource::<crate::player::Approach>()
             .arrived
             .is_none());
+    }
+
+    const CHEST: u64 = 0xC4E5;
+
+    fn spawn_chest(world: &mut World, at: Vec3) -> Entity {
+        let chest = world
+            .spawn((
+                Guid(CHEST),
+                store(&[(GO_TYPE_FIELD, 3)]),
+                Transform::from_translation(at),
+                crate::net::NetEntity {
+                    kind: benilla_protocol::EntityKind::GameObject,
+                    display_id: None,
+                    scale: 1.0,
+                },
+            ))
+            .id();
+        world
+            .resource_mut::<crate::net::GuidIndex>()
+            .0
+            .insert(CHEST, chest);
+        chest
+    }
+
+    /// `0x5df2a0`: beyond melee reach the walk comes first and nothing is looted yet.
+    #[test]
+    fn a_far_body_to_loot_is_walked_to_before_the_loot() {
+        const BODY: u64 = 0xB0D7;
+        const F_DYNAMIC_FLAGS: u16 = 143;
+        let (mut world, _vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
+        let body = world
+            .spawn((
+                Guid(BODY),
+                store(&[(F_HEALTH, 0), (F_MAXHEALTH, 100), (F_DYNAMIC_FLAGS, 0x1)]),
+                Transform::from_xyz(0.0, 0.0, -12.0),
+            ))
+            .id();
+        *world.resource_mut::<PressPick>() = PressPick {
+            hovered: Hovered {
+                target: Some(body),
+                guid: Some(BODY),
+                distance: 12.0,
+                ..Hovered::default()
+            },
+            cursor: WorldCursor {
+                kind: cursor_mode::CursorKind::Pickup,
+                unable: false,
+            },
+            ..PressPick::default()
+        };
+        world
+            .resource_mut::<Messages<WorldRightClick>>()
+            .write(WorldRightClick);
+        world.run_system_once(act_on_right_click).unwrap();
+        assert!(world.resource::<crate::player::Approach>().active());
+        assert!(!rx
+            .try_iter()
+            .any(|c| matches!(c, ClientCommand::Loot { .. })));
+    }
+
+    /// `0x5f86b0` → `0x610300`: a far object's use walks first, its range read off the object.
+    #[test]
+    fn a_far_object_is_walked_to_before_its_use() {
+        let (mut world, _vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
+        let chest = spawn_chest(&mut world, Vec3::new(0.0, 0.0, -20.0));
+        *world.resource_mut::<PressPick>() = PressPick {
+            object: HoveredObject {
+                target: Some(chest),
+                guid: Some(CHEST),
+                distance: 20.0,
+            },
+            cursor: WorldCursor {
+                kind: cursor_mode::CursorKind::Interact,
+                unable: true,
+            },
+            ..PressPick::default()
+        };
+        world
+            .resource_mut::<Messages<WorldRightClick>>()
+            .write(WorldRightClick);
+        world.run_system_once(act_on_right_click).unwrap();
+        assert!(world.resource::<crate::player::Approach>().active());
+        assert!(!rx
+            .try_iter()
+            .any(|c| matches!(c, ClientCommand::GameObjUse { .. })));
+    }
+
+    /// An arrival short of the object's range walks again, as `0x5f86b0`'s range arm does.
+    #[test]
+    fn an_object_still_out_of_range_on_arrival_is_walked_to_again() {
+        let (mut world, _vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
+        spawn_chest(&mut world, Vec3::new(0.0, 0.0, -20.0));
+        world.resource_mut::<crate::player::Approach>().arrived =
+            Some((crate::player::ApproachVerb::Use, CHEST));
+        world.run_system_once(act_on_arrival).unwrap();
+        assert!(world.resource::<crate::player::Approach>().active());
+        assert!(!rx
+            .try_iter()
+            .any(|c| matches!(c, ClientCommand::GameObjUse { .. })));
+    }
+
+    /// The arm's leash (`0x6110a0`): at 80 yd "Target is too far away." and no walk.
+    #[test]
+    fn a_vendor_80_yards_off_is_too_far_to_walk_to() {
+        let (mut world, vendor, _rx) = walking_world(Vec3::new(80.0, 0.0, 0.0), true);
+        click_vendor(&mut world, vendor);
+        assert!(!world.resource::<crate::player::Approach>().active());
+        let keys: Vec<&str> = world
+            .resource::<crate::ui_action::UiErrorKeys>()
+            .0
+            .iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(keys, vec!["ERR_AUTOFOLLOW_TOO_FAR"]);
     }
 
     #[test]
