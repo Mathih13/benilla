@@ -2072,8 +2072,6 @@ mod tests {
         );
     }
 
-    /// Out of interact range the click sends nothing, like the shared arms; the reference shows
-    /// `ERR_USE_TOO_FAR` unless its auto-walk (`0x610300`) starts.
     const VENDOR: u64 = 0x7E0D;
 
     /// Our body alive at the origin, Click to Move set as `walk`, and a vendor at `at`.
@@ -2369,6 +2367,8 @@ mod tests {
         assert_eq!(keys, vec!["ERR_AUTOFOLLOW_TOO_FAR"]);
     }
 
+    /// Out of interact range the click sends nothing, like the shared arms; the reference shows
+    /// `ERR_USE_TOO_FAR` unless its auto-walk (`0x610300`) starts.
     #[test]
     fn an_out_of_range_meeting_stone_click_sends_nothing() {
         const STONE: u64 = 0x5702;
