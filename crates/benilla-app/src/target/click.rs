@@ -177,8 +177,9 @@ pub(crate) struct Feedback<'w> {
 }
 
 /// The dispatchers, which take the object (`0x5f0130`, `0x5df2a0`, `0x5df130`, `0x5f86b0`,
-/// `0x5f05e0`): a right-click reaches them through [`act_on_right_click`] with Click to Move's
-/// walk, an approach's arrival through [`act_on_arrival`] without it.
+/// `0x5f05e0`): a right-click reaches them through [`act_on_right_click`] and a crate's [`Interact`]
+/// through [`act_on_interact`], both with Click to Move's walk, an approach's arrival through
+/// [`act_on_arrival`] without it.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct Dispatch<'w, 's> {
     seam: crate::creature_anim::AttackSeam<'w, 's>,
@@ -640,7 +641,7 @@ pub(super) fn act_on_right_click(
 /// (`0x493540`). The range gray (`unable`) suppresses every send but attack, which the server holds
 /// until in reach; with Click to Move on, each dispatcher walks there instead (`CanAutoInteract` is
 /// their approach flag, `0x60c170`, `0x5d6c6f`).
-fn interact(dispatch: &mut Dispatch, press: &PressPick, selection: Option<&mut Selection>) {
+fn interact(dispatch: &mut Dispatch, press: &PressPick, selection: Option<&mut ResMut<Selection>>) {
     let (hovered, hovered_object, cursor) = (&press.hovered, &press.object, &press.cursor);
     let walk = dispatch.auto.can_auto_interact();
     let self_mounted = dispatch.mounted();
@@ -2129,6 +2130,33 @@ mod tests {
                 .any(|c| matches!(c, ClientCommand::GameObjUse { .. })),
             "a meeting stone must never send CMSG_GAMEOBJ_USE — the server drops it on the floor"
         );
+    }
+
+    #[test]
+    fn a_right_click_on_a_gameobject_leaves_the_selection_untouched() {
+        const STONE: u64 = 0x5703;
+        let (mut world, _boar) = right_click_world();
+        let stone = world
+            .spawn((Guid(STONE), store(&[(GO_TYPE_FIELD, 23)])))
+            .id();
+        *world.resource_mut::<PressPick>() = PressPick {
+            object: HoveredObject {
+                target: Some(stone),
+                guid: Some(STONE),
+                distance: 5.0,
+            },
+            cursor: WorldCursor {
+                kind: cursor_mode::CursorKind::Interact,
+                unable: false,
+            },
+            ..PressPick::default()
+        };
+        world
+            .resource_mut::<Messages<WorldRightClick>>()
+            .write(WorldRightClick);
+        world.clear_trackers();
+        world.run_system_once(act_on_right_click).unwrap();
+        assert!(!world.is_resource_changed::<Selection>());
     }
 
     const VENDOR: u64 = 0x7E0D;
