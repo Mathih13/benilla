@@ -204,6 +204,13 @@ pub(crate) struct Dispatch<'w, 's> {
     auto: crate::player::AutoMove<'w, 's>,
 }
 
+/// The Loot walk's stop radius: the arm (`0x611130`) takes the square root (`0x6111ab`) of what
+/// the mode's stop function stores, and Loot's is the linear melee reach (`0x6112b6`), 5.0 for a
+/// corpse (`0x611317`).
+fn loot_stop(reach: f32) -> f32 {
+    reach.sqrt()
+}
+
 impl Dispatch<'_, '_> {
     fn me(&self) -> Option<(Entity, u64, bool)> {
         self.self_player
@@ -404,7 +411,7 @@ impl Dispatch<'_, '_> {
     }
 
     /// `0x5df130`: `CMSG_LOOT` at a lootable corpse, walked to first when `walk` and beyond its
-    /// 5 yd (`0x5df1c3`). A walk that does not start falls through to the send.
+    /// 5 yd (`0x5df1c3`), stopping at [`loot_stop`] of 5. A walk that does not start falls through to the send.
     fn loot_corpse(&mut self, entity: Entity, guid: u64, walk: bool) {
         if walk
             && self
@@ -415,7 +422,7 @@ impl Dispatch<'_, '_> {
                 entity,
                 guid,
                 crate::player::Subject::Corpse,
-                cursor_mode::CORPSE_INTERACT_RANGE_SQ.sqrt(),
+                loot_stop(cursor_mode::MELEE_FLOOR),
             )
         {
             return;
@@ -441,7 +448,7 @@ impl Dispatch<'_, '_> {
                 entity,
                 guid,
                 crate::player::Subject::Unit { dead: true },
-                reach,
+                loot_stop(reach),
             )
         {
             return;
@@ -2225,6 +2232,85 @@ mod tests {
         assert!(!rx
             .try_iter()
             .any(|c| matches!(c, ClientCommand::Loot { .. })));
+    }
+
+    /// `0x611130`: a Loot walk stops at the square root (`0x6111ab`) of the linear melee reach
+    /// `0x6112b6` stores: `sqrt(5)` for a corpse (`0x611317`), `sqrt(max(rA + rB + 1.3333, 5))`
+    /// for a unit.
+    #[test]
+    fn a_loot_walk_stops_at_the_square_root_of_the_melee_reach() {
+        const BODY: u64 = 0xB0D7;
+        const CORPSE: u64 = 0xC0D5;
+        const F_DYNAMIC_FLAGS: u16 = 143;
+        const F_COMBAT_REACH: u16 = 130;
+        let loot_click = |world: &mut World, hovered: Hovered| {
+            *world.resource_mut::<PressPick>() = PressPick {
+                hovered,
+                cursor: WorldCursor {
+                    kind: cursor_mode::CursorKind::Pickup,
+                    unable: false,
+                },
+                ..PressPick::default()
+            };
+            world
+                .resource_mut::<Messages<WorldRightClick>>()
+                .write(WorldRightClick);
+            world.run_system_once(act_on_right_click).unwrap();
+        };
+        // A unit of reach 4 against our default 1.5: 4 + 1.5 + 1.3333 = 6.8333.
+        let (mut world, _vendor, _rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
+        let body = world
+            .spawn((
+                Guid(BODY),
+                store(&[
+                    (F_HEALTH, 0),
+                    (F_MAXHEALTH, 100),
+                    (F_DYNAMIC_FLAGS, 0x1),
+                    (F_COMBAT_REACH, 4.0_f32.to_bits()),
+                ]),
+                Transform::from_xyz(0.0, 0.0, -12.0),
+            ))
+            .id();
+        loot_click(
+            &mut world,
+            Hovered {
+                target: Some(body),
+                guid: Some(BODY),
+                distance: 12.0,
+                ..Hovered::default()
+            },
+        );
+        let stop = world
+            .resource::<crate::player::Approach>()
+            .stop_distance()
+            .expect("the unit walk starts");
+        assert!(
+            (stop - (4.0_f32 + 1.5 + 1.333_333_3).sqrt()).abs() < 1e-3,
+            "{stop}"
+        );
+        // A corpse object has no unit to look up: reach 5.0, stop sqrt(5).
+        let (mut world, _vendor, _rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
+        let corpse = world
+            .spawn((
+                Guid(CORPSE),
+                store(&[(benilla_protocol::field::FIELD_CORPSE_DYNAMIC_FLAGS, 0x1)]),
+                Transform::from_xyz(0.0, 0.0, -12.0),
+            ))
+            .id();
+        loot_click(
+            &mut world,
+            Hovered {
+                corpse: Some(corpse),
+                corpse_guid: Some(CORPSE),
+                distance: 12.0,
+                ..Hovered::default()
+            },
+        );
+        let stop = world
+            .resource::<crate::player::Approach>()
+            .stop_distance()
+            .expect("the corpse walk starts");
+        assert!((stop - 5.0_f32.sqrt()).abs() < 1e-5, "{stop}");
     }
 
     /// `0x5f86b0` → `0x610300`: a far object's use walks first, its range read off the object.

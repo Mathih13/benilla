@@ -94,6 +94,11 @@ impl Approach {
     pub(crate) fn stop(&mut self) {
         self.goal = None;
     }
+
+    #[cfg(test)]
+    pub(crate) fn stop_distance(&self) -> Option<f32> {
+        self.goal.as_ref().map(|g| g.stop)
+    }
 }
 
 /// `CanAutoInteract` (`0x60f900`): alive, driving our own body, and the option on.
