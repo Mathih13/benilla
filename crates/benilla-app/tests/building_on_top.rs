@@ -5,7 +5,7 @@
 use benilla_app::{Interact, Objects};
 use bevy::prelude::*;
 
-/// What such a crate writes: the nearest unit it finds, interacted with.
+/// What such a crate writes: an object it found, interacted with.
 fn interact_with_the_nearest(objects: Objects, mut interact: MessageWriter<Interact>) {
     if let Some((_, entity, _)) = objects.iter().next() {
         interact.write(Interact(entity));
