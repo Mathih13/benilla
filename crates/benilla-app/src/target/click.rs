@@ -620,11 +620,8 @@ impl Dispatch<'_, '_> {
     }
 }
 
-/// On a clean right-click, select the press pick's unit and act by the cursor's classification
-/// (the INTERACT leg `0x492820`): a GameObject, a corpse, an attack, loot, skin, or the
-/// `UNIT_NPC_FLAGS` ladder ([`service_arm`]). The range gray (`unable`) suppresses every send but
-/// attack, which the server holds until in reach; with Click to Move on, each dispatcher walks
-/// there instead (`CanAutoInteract` is their approach flag, `0x60c170`, `0x5d6c6f`).
+/// On a clean right-click, the INTERACT leg `0x492820` on the press pick: select it, then
+/// [`interact`].
 pub(super) fn act_on_right_click(
     mut clicks: MessageReader<WorldRightClick>,
     // The press pick: the reference picks once, on the down edge (`0x481f00`).
@@ -635,6 +632,15 @@ pub(super) fn act_on_right_click(
     if clicks.read().last().is_none() {
         return;
     }
+    interact(&mut dispatch, &press, Some(&mut selection));
+}
+
+/// Act on a pick by the cursor's classification of it: a GameObject, a corpse, an attack, loot,
+/// skin, or the `UNIT_NPC_FLAGS` ladder ([`service_arm`]); only the click selects first
+/// (`0x493540`). The range gray (`unable`) suppresses every send but attack, which the server holds
+/// until in reach; with Click to Move on, each dispatcher walks there instead (`CanAutoInteract` is
+/// their approach flag, `0x60c170`, `0x5d6c6f`).
+fn interact(dispatch: &mut Dispatch, press: &PressPick, selection: Option<&mut Selection>) {
     let (hovered, hovered_object, cursor) = (&press.hovered, &press.object, &press.cursor);
     let walk = dispatch.auto.can_auto_interact();
     let self_mounted = dispatch.mounted();
@@ -784,16 +790,19 @@ pub(super) fn act_on_right_click(
     let me = dispatch.me();
     // A mid-combat click on a vendor or corpse switches and stops, never swings (`0x5ecb70`); the
     // sword, not the fork, as the re-swing also needs the player's own legs.
-    let outcome = scan::commit(
-        &mut selection,
-        &mut dispatch.seam,
-        entity,
-        guid,
-        target,
-        me.is_some_and(|(_, _, e)| e),
-        me.map(|(_, g, _)| g),
-        press.attack(),
-    );
+    let outcome = match selection {
+        Some(selection) => scan::commit(
+            selection,
+            &mut dispatch.seam,
+            entity,
+            guid,
+            target,
+            me.is_some_and(|(_, _, e)| e),
+            me.map(|(_, g, _)| g),
+            press.attack(),
+        ),
+        None => scan::CommitOutcome::default(),
+    };
     match unit_branch(attack, dead_fork, leg) {
         UnitBranch::Attack => {
             // Silent after the select: the click's `0x60c247 call 0x5ecb70` has no `DisplayError`,
@@ -847,6 +856,42 @@ pub(super) fn act_on_right_click(
             debug!("right-click unit {guid:#x}: dead fork took no leg — nothing sent");
         }
         UnitBranch::Service => dispatch.talk(entity, guid, !cursor.unable, walk),
+    }
+}
+
+/// Interact with an object as its own interact slot does: a unit's `0x60bea0`, a GameObject's
+/// `0x5f8660`, a corpse's `0x5d6bf0`, the entry points 1.12 client mods call on an object they pick.
+/// A right-click also selects the object first (`0x492820`); this does not.
+#[derive(Message, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Interact(pub Entity);
+
+/// Each [`Interact`], its object classified as a press over it would be.
+pub(super) fn act_on_interact(
+    mut requests: MessageReader<Interact>,
+    kinds: Query<(&Guid, &crate::net::NetEntity)>,
+    mut set: ParamSet<(cursor_mode::CursorInputs, Dispatch)>,
+) {
+    use benilla_protocol::EntityKind;
+    for &Interact(entity) in requests.read() {
+        let Ok((guid, net)) = kinds.get(entity) else {
+            continue;
+        };
+        let mut pick = PressPick::default();
+        match net.kind {
+            EntityKind::Unit | EntityKind::Player => {
+                (pick.hovered.target, pick.hovered.guid) = (Some(entity), Some(guid.0));
+            }
+            EntityKind::Corpse => {
+                (pick.hovered.corpse, pick.hovered.corpse_guid) = (Some(entity), Some(guid.0));
+            }
+            EntityKind::GameObject => {
+                (pick.object.target, pick.object.guid) = (Some(entity), Some(guid.0));
+            }
+            EntityKind::DynamicObject | EntityKind::Other => continue,
+        }
+        (pick.cursor, pick.attack_fork) =
+            cursor_mode::classify(&set.p0(), &pick.hovered, &pick.object);
+        interact(&mut set.p1(), &pick, None);
     }
 }
 
@@ -1928,6 +1973,10 @@ mod tests {
         world.init_resource::<crate::player::Approach>();
         world.init_resource::<crate::player::FollowState>();
         world.init_resource::<crate::player::Player>();
+        world.init_resource::<Messages<Interact>>();
+        world.init_resource::<crate::net::Reputations>();
+        world.init_resource::<crate::ui_loot::LootConfig>();
+        world.init_resource::<ButtonInput<KeyCode>>();
         world.spawn((SelfPlayer, Guid(ME)));
         let boar = world
             .spawn((Guid(BOAR), store(&[(F_HEALTH, 100), (F_MAXHEALTH, 100)])))
