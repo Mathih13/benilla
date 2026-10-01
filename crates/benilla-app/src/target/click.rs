@@ -294,7 +294,8 @@ impl Dispatch<'_, '_> {
     }
 
     /// `0x5f86b0`, `OnUse` past its highlightable gate: the GameObject's own mounted gate, its type's
-    /// use handler, then its lock. A usable object out of `in_reach` goes to [`Self::walk_to_object`].
+    /// use handler, then its lock. A usable object out of `in_reach` goes to
+    /// [`Self::walk_to_object`].
     fn use_gameobject(&mut self, entity: Entity, guid: u64, in_reach: bool, walk: bool) {
         let self_mounted = self.mounted();
         let self_store = self
@@ -418,7 +419,8 @@ impl Dispatch<'_, '_> {
     }
 
     /// `0x5df130`: `CMSG_LOOT` at a lootable corpse, walked to first when `walk` and beyond its
-    /// 5 yd (`0x5df1c3`), stopping at [`loot_stop`] of 5. A walk that does not start falls through to the send.
+    /// 5 yd (`0x5df1c3`), stopping at [`loot_stop`] of 5. A walk that does not start falls through
+    /// to the send.
     fn loot_corpse(&mut self, entity: Entity, guid: u64, walk: bool) {
         if walk
             && self
@@ -640,7 +642,8 @@ pub(super) fn act_on_right_click(
     // highlightable (our `Point` cursor, silent), then usable (`0x5f3130`), whose lock arm toasts
     // first, even out of range.
     if go_is_nearest(hovered, hovered_object) {
-        // Traced (tag `use`): a `Point` cursor refuses silently; the range gray raises `ERR_USE_TOO_FAR`.
+        // Traced (tag `use`): a `Point` cursor refuses silently; the range gray raises
+        // `ERR_USE_TOO_FAR`.
         if benilla_assets::trace::enabled_for("use") {
             let ty = hovered_object
                 .target
