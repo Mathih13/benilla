@@ -124,6 +124,14 @@ struct UnitFeedMemo {
     action_bar_toggles: Option<u8>,
 }
 
+/// The bare unit feed, for a test driving the stock unit frames off engine state.
+#[cfg(test)]
+pub(crate) fn add_unit_feed(app: &mut App) {
+    app.init_resource::<UnitFeedState>()
+        .add_message::<crate::net::FieldChanged>()
+        .add_systems(Update, feed_units);
+}
+
 /// Adds the per-frame unit feed; the `Unit*` bindings live in `benilla-ui`.
 pub(crate) struct UiUnitPlugin;
 

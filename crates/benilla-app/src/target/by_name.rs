@@ -521,7 +521,7 @@ pub(super) fn follow_requests(
 #[allow(clippy::type_complexity)] // one bundled param, the app's convention for big query sets
 pub(crate) struct SelectCommit<'w, 's> {
     pub(super) selection: ResMut<'w, Selection>,
-    pub(super) seam: crate::creature_anim::AttackSeam<'w, 's>,
+    pub(crate) seam: crate::creature_anim::AttackSeam<'w, 's>,
     // Our own body: the guid, the store `can_attack` reads, and whether we are mid-swing.
     me: Query<
         'w,
@@ -595,6 +595,16 @@ impl SelectCommit<'_, '_> {
     pub(super) fn clear(&mut self) {
         let engaged = self.engaged();
         super::click::deselect(&mut self.selection, &mut self.seam, engaged);
+    }
+
+    /// `0x48f3a0`'s select on a looted object, which tests `TYPEMASK_UNIT` first (`0x48f3af`).
+    pub(crate) fn select_unit(&mut self, guid: u64) {
+        let Some(&entity) = self.index.0.get(&guid) else {
+            return;
+        };
+        if self.stores.get(entity).is_ok_and(ObjectStore::is_unit) {
+            self.commit(entity, guid);
+        }
     }
 
     /// Select a resolved guid, `0x489a40`'s arm 1, through [`scan::commit`].
