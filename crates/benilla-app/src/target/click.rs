@@ -2824,15 +2824,20 @@ mod tests {
     }
 
     /// `0x5e0378`: a right-click on the ground walks there through `CanAutoInteract`, sending
-    /// nothing and leaving the selection; a held payload is dropped (`0x492ca9`) and the walk
+    /// nothing and keeping the selection; a held payload is dropped (`0x492ca9`) and the walk
     /// still starts.
     #[test]
     fn a_ground_right_click_walks_there_only_with_click_to_move_on() {
         for (walk, held) in [(true, false), (true, true), (false, false)] {
-            let (mut world, _vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), walk);
+            let (mut world, vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), walk);
             world
                 .resource_mut::<crate::ui_script::CursorPayloadHeld>()
                 .0 = held;
+            // `0x5e0320` returns without deselecting: the vendor stays the target.
+            let vendor_guid = world.get::<Guid>(vendor).unwrap().0;
+            let mut selection = world.resource_mut::<Selection>();
+            selection.target = Some(vendor);
+            selection.guid = Some(vendor_guid);
             right_click_world_at(
                 &mut world,
                 PickOcclusion {
@@ -2847,7 +2852,7 @@ mod tests {
                 assert!((approach.stop_distance().unwrap() - 0.5).abs() < 1e-6);
             }
             assert!(rx.try_iter().next().is_none());
-            assert_eq!(world.resource::<Selection>().guid, None);
+            assert_eq!(world.resource::<Selection>().guid, Some(vendor_guid));
         }
     }
 

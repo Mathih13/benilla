@@ -248,8 +248,10 @@ impl AutoMove<'_, '_> {
     }
 
     /// `0x60fcc0`'s walk, for an attack on an enemy out of melee: to where it stands, stopping
-    /// `stop` short. The reference drops the point to the ground under the enemy (`0x60fe25`);
-    /// here it keeps the enemy's height, which off the water arrives the same, flat within the stop.
+    /// `stop` short.
+    /// Deviation: the reference re-projects the point's height onto the first walkable facet a
+    /// zero-size box gather finds at the enemy (`0x60fe25`-`0x60fe51`); here it keeps the enemy's
+    /// height. The snap radius is the stop, so the two differ only while swimming or on a steep facet.
     /// Deviation: the reference stores the world point unconverted and reads it back as deck-local
     /// (`0x60fe6c`, `0x610e95`), so on a transport it walks astray; here it rides the deck.
     pub(crate) fn walk_into_melee(&mut self, at: Vec3, stop: f32) -> Result<(), Refused> {
@@ -270,6 +272,9 @@ impl AutoMove<'_, '_> {
         self.arm(Toward::Face(facing), at, 0.0).is_ok()
     }
 
+    /// Deviation: the reference converts back through the transport the player stands on each
+    /// frame (`0x610e6b`), so stepping off mid-walk sends the point astray; here the deck is fixed
+    /// at the arm.
     fn anchor(&self, at: Vec3) -> Anchor {
         let frame = self.player.ride.as_ref().map(|r| r.entity);
         match frame.and_then(|e| self.transports.get(e).ok().map(|tf| (e, tf))) {
