@@ -54,8 +54,8 @@ pub(crate) const TALK_STOP: f32 = 5.555_555_3 * 0.5;
 pub(crate) const RANGE_STOP_FRACTION: f32 = 0.9;
 /// The ground walk stops half a yard short (`0x60e740`).
 const GROUND_STOP: f32 = 0.5;
-/// No approach starts or lasts at 80 yd or more: modes 5-10's row in `0x860a58` (`0x60e5d1`); the
-/// ground and sky rows have none.
+/// No approach starts or lasts at 80 yd or more: the rows of modes 5-7, 9 and 10 in `0x860a58`
+/// (`0x60e5d1`); the ground and sky rows have none.
 const LEASH_SQ: f32 = 6400.0;
 /// Within this many yards on the ground the goal's height is ignored (`0x80c4c8`).
 const FLAT_SNAP: f32 = 0.5;
@@ -250,6 +250,8 @@ impl AutoMove<'_, '_> {
     /// `0x60fcc0`'s walk, for an attack on an enemy out of melee: to where it stands, stopping
     /// `stop` short. The reference drops the point to the ground under the enemy (`0x60fe25`);
     /// here it keeps the enemy's height, which off the water arrives the same, flat within the stop.
+    /// Deviation: the reference stores the world point unconverted and reads it back as deck-local
+    /// (`0x60fe6c`, `0x610e95`), so on a transport it walks astray; here it rides the deck.
     pub(crate) fn walk_into_melee(&mut self, at: Vec3, stop: f32) -> Result<(), Refused> {
         if !self.can_auto_interact() {
             return Err(Refused::Silent);

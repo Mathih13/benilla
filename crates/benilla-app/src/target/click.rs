@@ -2916,11 +2916,11 @@ mod tests {
             .any(|c| matches!(c, ClientCommand::AttackSwing { guid: WOLF })));
     }
 
-    /// The mounted gate (`0x60c1bc`) comes before the walk.
+    /// The mounted gate (`0x60c1bc`) skips the walk and the swing alike.
     #[test]
     fn a_mounted_attack_does_not_walk() {
         const F_MOUNT: u16 = benilla_protocol::field::FIELD_UNIT_MOUNTDISPLAYID;
-        let (mut world, _vendor, _rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
+        let (mut world, _vendor, rx) = walking_world(Vec3::new(14.0, 0.0, 0.0), true);
         let me = world
             .query_filtered::<Entity, With<SelfPlayer>>()
             .single(&world)
@@ -2952,6 +2952,11 @@ mod tests {
             .write(WorldRightClick);
         world.run_system_once(act_on_right_click).unwrap();
         assert!(!world.resource::<crate::player::Approach>().active());
+        assert!(
+            !rx.try_iter()
+                .any(|c| matches!(c, ClientCommand::AttackSwing { .. })),
+            "the mounted gate skips StartAttack too"
+        );
     }
 
     /// The melee row's 80 yd leash (`0x60e652`) refuses with `ERR_AUTOFOLLOW_TOO_FAR` (`0x61110c`);
