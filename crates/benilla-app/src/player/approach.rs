@@ -135,6 +135,8 @@ struct Goal {
     /// Last frame's position (`0xc4da84`).
     last_pos: Vec3,
     held: bool,
+    /// The swim pitch the sky arm sets (`0x6101ee`), applied on the walk's first frame.
+    pitch: Option<f32>,
 }
 
 impl Approach {
@@ -174,7 +176,7 @@ pub(crate) fn can_auto_interact(enabled: bool, me: Option<&ObjectStore>, player:
 pub(crate) struct AutoMove<'w, 's> {
     pub(crate) approach: ResMut<'w, Approach>,
     follow: ResMut<'w, FollowState>,
-    player: ResMut<'w, Player>,
+    player: Res<'w, Player>,
     me: Query<'w, 's, (&'static Guid, &'static ObjectStore), With<SelfPlayer>>,
     stand: MessageWriter<'w, super::StandStateRequest>,
     transports: Query<'w, 's, &'static Transform>,
@@ -234,12 +236,15 @@ impl AutoMove<'_, '_> {
         if dir == Vec3::ZERO || !self.can_auto_interact() {
             return false;
         }
-        if self.player.swimming {
-            self.player.mover_pitch = sky_pitch(dir.y);
-        }
         let facing = follow::bearing_to(Vec3::new(dir.x, 0.0, dir.z));
         let at = self.player.pos;
-        self.arm(Toward::Sky(facing), at, 0.0).is_ok()
+        if self.arm(Toward::Sky(facing), at, 0.0).is_err() {
+            return false;
+        }
+        if let Some(goal) = self.approach.goal.as_mut() {
+            goal.pitch = self.player.swimming.then(|| sky_pitch(dir.y));
+        }
+        true
     }
 
     /// `0x60fcc0`'s walk, for an attack on an enemy out of melee: to where it stands, stopping
@@ -293,6 +298,7 @@ impl AutoMove<'_, '_> {
             aligned: false,
             last_pos: self.player.pos,
             held: false,
+            pitch: None,
         });
         if !standing {
             self.stand.write(super::StandStateRequest { state: 0 });
@@ -381,6 +387,9 @@ pub(super) fn steer_approach(
         return;
     }
     let toward = goal.toward;
+    if let Some(pitch) = goal.pitch.take() {
+        player.mover_pitch = pitch;
+    }
     let target = match toward {
         Toward::Object { verb, guid } => {
             let Some((tf, store, kind)) = index.0.get(&guid).and_then(|e| targets.get(*e).ok())
@@ -993,6 +1002,7 @@ mod tests {
             .world_mut()
             .run_system_once(|mut auto: AutoMove| auto.walk_toward_sky(Vec3::new(1.0, 1.0, 0.0)))
             .unwrap());
+        frame(&mut app, false);
         let pitch = app.world().resource::<Player>().mover_pitch;
         assert!(
             (pitch - std::f32::consts::FRAC_PI_4).abs() < 1e-5,
