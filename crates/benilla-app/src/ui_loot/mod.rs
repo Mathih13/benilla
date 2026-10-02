@@ -363,7 +363,8 @@ impl LootLatch {
 /// A movement start that closes the loot: the reference's guard `0x60e990`, called by every
 /// movement-start emitter, turning included, but not by mouse-look facing. No loot target reaches
 /// the range gate `0x493230`, so there is no distance leash. vmangos also releases on movement
-/// (`MovementHandler.cpp:1104`), but the close is the client's.
+/// (`MovementHandler.cpp:1104`), but the close is the client's. A loot response that lands while
+/// we move sets it too (`0x5ebc3a`).
 #[derive(Resource, Default)]
 pub(crate) struct LootMoveStart(pub(crate) bool);
 
