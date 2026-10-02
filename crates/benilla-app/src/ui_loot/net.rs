@@ -762,6 +762,7 @@ mod tests {
         world.init_resource::<PendingItemOps>();
         world.init_resource::<LockTransitions>();
         world.init_resource::<bevy::ecs::message::Messages<crate::target::DeselectGuid>>();
+        world.init_resource::<bevy::ecs::message::Messages<crate::player::StandStateRequest>>();
         world.spawn((
             SelfPlayer,
             Guid(1),
@@ -910,6 +911,71 @@ mod tests {
         world
             .entity_mut(me)
             .insert(crate::creature_anim::Engaged(KOBOLD));
+        world.resource_mut::<LootLatch>().0 = Some(CORPSE);
+        respond(&mut world, CORPSE, 1);
+        let sent: Vec<_> = rx.try_iter().collect();
+        assert!(
+            matches!(
+                sent[..],
+                [ClientCommand::AttackStop, ClientCommand::SetSelection { guid }] if guid == CORPSE
+            ),
+            "{sent:?}"
+        );
+    }
+
+    /// `StartAttack`'s target gate (`0x5ecc16`-`0x5ecc29`): a body is no swing target even when
+    /// hostile, so looting one mid-swing stops and selects, and swings at nothing.
+    #[test]
+    fn looting_a_hostile_body_while_swinging_never_swings_at_it() {
+        use crate::net::{ObjectStore, SelfPlayer};
+        use benilla_protocol::field::{FIELD_UNIT_FACTIONTEMPLATE, FIELD_UNIT_HEALTH};
+        use benilla_protocol::messages::{ObjectFields, ObjectType};
+        const UNIT_FIELD_BYTES_0: u16 = 36;
+        let data = benilla_formats::wow_data_or_skip!();
+        let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+        let (factions, stormwind, reps) = crate::target::stormwind_fixture(&mut chain, 0);
+        let me_store = ObjectStore(
+            ObjectFields::from_pairs(&[
+                (OBJECT_FIELD_TYPE, TYPE_PLAYER),
+                (FIELD_UNIT_HEALTH, 100),
+                (FIELD_UNIT_FACTIONTEMPLATE, stormwind),
+                (UNIT_FIELD_BYTES_0, crate::target::HUMAN_WARRIOR),
+            ])
+            .into_created(ObjectType::Player),
+        );
+        let creature = |template, health| {
+            ObjectStore(
+                ObjectFields::from_pairs(&[
+                    (OBJECT_FIELD_TYPE, TYPE_UNIT),
+                    (FIELD_UNIT_HEALTH, health),
+                    (FIELD_UNIT_FACTIONTEMPLATE, template),
+                ])
+                .into_created(ObjectType::Unit),
+            )
+        };
+        let hostile = (1u32..4096)
+            .find(|&t| {
+                crate::target::can_attack(
+                    Some(&creature(t, 100)),
+                    Some(&factions),
+                    &reps,
+                    Some(&me_store),
+                )
+            })
+            .expect("a template a Stormwind human can attack");
+
+        let (mut world, rx) = tabbed_world();
+        world.insert_resource(factions);
+        world.insert_resource(reps);
+        let me = world
+            .query_filtered::<Entity, With<SelfPlayer>>()
+            .single(&world)
+            .expect("us");
+        world
+            .entity_mut(me)
+            .insert((me_store, crate::creature_anim::Engaged(KOBOLD)));
+        let corpse = world.resource::<crate::net::GuidIndex>().0[&CORPSE];
+        world.entity_mut(corpse).insert(creature(hostile, 0));
         world.resource_mut::<LootLatch>().0 = Some(CORPSE);
         respond(&mut world, CORPSE, 1);
         let sent: Vec<_> = rx.try_iter().collect();

@@ -610,9 +610,9 @@ impl SelectCommit<'_, '_> {
     /// Select a resolved guid, `0x489a40`'s arm 1, through [`scan::commit`].
     pub(super) fn commit(&mut self, entity: Entity, guid: u64) {
         let me = self.me.single().ok();
-        // `scan::commit` takes the new target's attackability from its caller: the same
-        // `can_attack` the cursor and TAB pass.
-        let attackable = super::relations::can_attack(
+        // The re-swing's gate is `StartAttack`'s on the new target (`0x5ecc16`): alive, then
+        // `CanAttack`, so a body is switched to and never swung at.
+        let attackable = scan::attack_target_valid(
             self.stores.get(entity).ok(),
             self.factions.as_deref(),
             &self.reputations,
