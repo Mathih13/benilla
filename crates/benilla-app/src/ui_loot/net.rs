@@ -27,9 +27,8 @@ pub(super) fn register(app: &mut App) {
 
 /// An admitted response selects a looted unit (`0x5ebc35` → `0x48f3a0`) before the window opens
 /// (`0x4c1cb0`), so the outgoing target's teardown closes a window still open on it. One that lands
-/// while our own body moves takes the move-start close (`0x5ebc3a`-`0x5ebc51`). Deviation: the
-/// close waits for the drain, so `LOOT_CLOSED` fires a frame after `LOOT_OPENED` and the window
-/// paints once; the reference fires both in this handler.
+/// while our own body moves takes the move-start close (`0x5ebc3a`-`0x5ebc51`), which the feed runs
+/// after it fires `LOOT_OPENED`, or the drain when the window waits on an item template.
 fn on_response(
     In(ev): In<SessionEvent>,
     mut select: crate::target::SelectCommit,
@@ -1242,7 +1241,8 @@ mod tests {
     }
 
     /// The issue's spot on the stock frames: a body's window that opens on the run is shown by
-    /// `LOOT_OPENED` and hidden by `LOOT_CLOSED` (`LootFrame.lua:13-16`, `:53-55`), its one release
+    /// `LOOT_OPENED` and hidden by `LOOT_CLOSED` in the same frame (`LootFrame.lua:13-16`,
+    /// `:53-55`), its one release
     /// sent, and `TargetFrame` lets the body go; standing, the window and the target stay.
     #[test]
     fn the_stock_loot_frame_closes_on_a_body_looted_on_the_run() {
@@ -1284,14 +1284,16 @@ mod tests {
 
             app.world_mut().resource_mut::<LootLatch>().0 = Some(CORPSE);
             respond(app.world_mut(), CORPSE, 1);
-            for _ in 0..3 {
-                app.update();
-            }
+            // One frame: the reference opens and closes in the response's handler.
+            app.update();
             let (events, shown): (String, bool) = app
                 .world()
                 .non_send_resource::<UiScript>()
                 .eval("return table.concat(LOOT_EVENTS, ','), LootFrame:IsShown() == 1")
                 .unwrap();
+            for _ in 0..2 {
+                app.update();
+            }
             let releases = rx
                 .try_iter()
                 .filter(|c| matches!(c, ClientCommand::LootRelease { guid } if *guid == CORPSE))
@@ -1303,7 +1305,10 @@ mod tests {
                 assert_eq!(target_frame_name(&app), "Kobold Worker");
             } else {
                 assert_eq!(events, "LOOT_OPENED,LOOT_CLOSED");
-                assert!(!shown, "on the run, the window closes");
+                assert!(
+                    !shown,
+                    "on the run, the window closes in the frame it opens"
+                );
                 assert_eq!(releases, 1, "released once");
                 assert_eq!(target_frame_name(&app), "", "and the body is let go");
             }
