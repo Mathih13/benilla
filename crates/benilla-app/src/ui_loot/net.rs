@@ -1194,17 +1194,18 @@ mod tests {
                 TOUGH_JERKY,
                 Some(crate::items::test_template("Tough Jerky")),
             );
-        let mut cfg = super::super::LootConfig::default();
-        cfg.auto_loot = true;
-        app.insert_resource(cfg)
-            .init_resource::<crate::ui_chat::ChatLog>()
-            .init_resource::<crate::names::NameCache>()
-            .init_resource::<ButtonInput<KeyCode>>()
-            .insert_non_send_resource(benilla_ui::script::UiScript::new().expect("VM"))
-            .add_systems(
-                Update,
-                (super::super::feed_loot, super::super::drain_loot).chain(),
-            );
+        app.insert_resource(super::super::LootConfig {
+            auto_loot: true,
+            ..Default::default()
+        })
+        .init_resource::<crate::ui_chat::ChatLog>()
+        .init_resource::<crate::names::NameCache>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        .insert_non_send_resource(benilla_ui::script::UiScript::new().expect("VM"))
+        .add_systems(
+            Update,
+            (super::super::feed_loot, super::super::drain_loot).chain(),
+        );
 
         app.world_mut().resource_mut::<LootLatch>().0 = Some(CORPSE);
         app.world_mut()
