@@ -996,7 +996,11 @@ pub(super) fn act_on_arrival(
 ) {
     use crate::player::{ApproachVerb, Subject};
     use benilla_protocol::EntityKind;
-    // Owed until no `0x20ff` bit is left, as the stop handler runs it (`0x60e352`).
+    // Owed while any `0x20ff` bit is set: the reference drains it from the movement emitter
+    // `0x60e0a0` only at a stop, strafe stop, root or unroot ack that leaves none (`0x60e352`), never
+    // at a landing. Deviation: it runs on the first frame with none, so an arrival that sends no stop
+    // (mid-air, rooted, under a held turn key) acts at once or on landing or release, where the
+    // reference waits for the next ground stop and can act long after, wherever the player then is.
     if dispatch.moving() {
         return;
     }
@@ -3104,8 +3108,8 @@ mod tests {
         }
     }
 
-    /// `0x60e352`: the stop handler runs the owed verb (`0x60fa20`) only once no `0x20ff` bit is
-    /// left, and the cell stays armed until then.
+    /// `0x60e352`: the owed verb (`0x60fa20`) runs only once no `0x20ff` bit is left, and the cell
+    /// stays armed until then.
     #[test]
     fn a_verb_owed_on_arrival_waits_for_a_word_with_no_move_bit() {
         use crate::creature_anim::move_flags as f;
