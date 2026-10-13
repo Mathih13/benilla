@@ -324,6 +324,32 @@ impl Vm {
         self.pcall_value(f, &[], -1)
     }
 
+    /// Run `f`, which may raise (a metamethod, a host call), protected: on an error the stack,
+    /// frames and open upvalues above where it started unwind, as a `pcall` unwinds them, and
+    /// the error value is the answer.
+    pub fn protected<T>(
+        &mut self,
+        f: impl FnOnce(&mut Vm) -> Result<T, LuaError>,
+    ) -> Result<T, Value> {
+        let (frames, c_depth, top, handlers) = (
+            self.frames.len(),
+            self.c_depth,
+            self.top,
+            self.handlers.len(),
+        );
+        match f(self) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.close_upvals(top);
+                self.frames.truncate(frames);
+                self.c_depth = c_depth;
+                self.top = top;
+                self.handlers.truncate(handlers);
+                Err(e.value)
+            }
+        }
+    }
+
     /// Call `f` protected: its results, or its error value with the state unwound.
     pub fn pcall_value(
         &mut self,
