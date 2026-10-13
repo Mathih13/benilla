@@ -730,7 +730,7 @@ impl<'a> Parser<'a> {
                     } else {
                         let k = self.checkname()?;
                         self.check(Tok::Char(b'='))?;
-                        fields.push(Field::Pair(Expr::Str(k), self.expr()?));
+                        fields.push(Field::Named(k, self.expr()?));
                     }
                 }
                 Tok::Char(b'[') => {

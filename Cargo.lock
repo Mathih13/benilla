@@ -606,6 +606,7 @@ name = "benilla-lua"
 version = "0.2.0"
 dependencies = [
  "benilla-formats",
+ "benilla-ui",
  "mlua",
  "roxmltree",
 ]

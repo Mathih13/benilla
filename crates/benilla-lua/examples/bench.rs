@@ -1,0 +1,63 @@
+//! Times each workload in this interpreter and in the fork benilla runs today (plain mlua, the
+//! same dialect). `cargo run --release -p benilla-lua --example bench`.
+
+use std::time::Instant;
+
+const WORKLOADS: &[(&str, &str)] = &[
+    ("calls (fib 27)", "local function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end return fib(27)"),
+    ("numeric loop", "local s = 0 for i = 1, 5000000 do s = s + i * 2 - 1 end return s"),
+    ("table array", "local t = {} for i = 1, 1000000 do t[i] = i end local s = 0 for i = 1, 1000000 do s = s + t[i] end return s"),
+    ("table hash (string keys)", "local t = {} for i = 1, 200000 do t['k' .. i] = i end local s = 0 for k, v in pairs(t) do s = s + v end return s"),
+    ("method calls (OOP)", "local C = {} C.__index = C function C:add(x) self.v = self.v + x return self end local o = setmetatable({v = 0}, C) for i = 1, 1000000 do o:add(1) end return o.v"),
+    ("closures", "local s = 0 for i = 1, 300000 do local f = function(x) return x + i end s = s + f(1) end return s"),
+    ("string ops", "local n = 0 for i = 1, 100000 do local s = 'item' .. i .. ':' .. (i * 2) local a, b, k, v = string.find(s, '(%a+)(%d+)') n = n + string.len(s) + string.len(string.upper(k)) end return n"),
+    ("gsub/format", "local n = 0 for i = 1, 50000 do local s = string.format('%d-%s-%5.2f', i, 'x', i / 3) s = string.gsub(s, '%-', '+') n = n + string.len(s) end return n"),
+    ("tinsert/sort", "local t = {} for i = 1, 100000 do table.insert(t, math.mod(i * 7919, 100003)) end table.sort(t) return t[1]"),
+];
+
+fn time<F: FnMut()>(mut f: F) -> f64 {
+    // Best of three.
+    (0..3)
+        .map(|_| {
+            let t = Instant::now();
+            f();
+            t.elapsed().as_secs_f64() * 1000.0
+        })
+        .fold(f64::MAX, f64::min)
+}
+
+fn main() {
+    println!(
+        "{:<28} {:>10} {:>10} {:>8}",
+        "workload", "ours ms", "fork ms", "ratio"
+    );
+    let mut geo = 0.0;
+    for (name, src) in WORKLOADS {
+        let mut ours_out = String::new();
+        let ours = time(|| {
+            let mut vm = benilla_lua::new_state();
+            let r = vm.exec(src.as_bytes(), b"=bench").expect("runs");
+            ours_out = vm.display(r[0]);
+        });
+        let mut fork_out = String::new();
+        let fork = time(|| {
+            let lua = mlua::Lua::new();
+            // The fork's 5.1 has `math.fmod`; 1.12 calls it `math.mod`.
+            lua.load("math.mod = math.fmod").exec().unwrap();
+            let v: mlua::Value = lua.load(*src).eval().expect("runs");
+            fork_out = lua.coerce_string(v).unwrap().unwrap().to_string_lossy();
+        });
+        let ratio = ours / fork;
+        geo += ratio.ln();
+        let check = if ours_out == fork_out {
+            ""
+        } else {
+            "  (answers differ!)"
+        };
+        println!("{name:<28} {ours:>10.1} {fork:>10.1} {ratio:>7.2}x{check}");
+    }
+    println!(
+        "geometric mean: {:.2}x the fork's time",
+        (geo / WORKLOADS.len() as f64).exp()
+    );
+}

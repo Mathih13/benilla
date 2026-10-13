@@ -133,7 +133,9 @@ pub enum UnOp {
 pub enum Field {
     /// A positional item.
     Item(Expr),
-    /// `name = v` or `[k] = v`.
+    /// `name = v`, which counts toward 5.0's hash size hint.
+    Named(Bytes, Expr),
+    /// `[k] = v`, which counts toward neither hint.
     Pair(Expr, Expr),
 }
 
