@@ -138,7 +138,7 @@ fn setfenv(vm: &mut Vm, nargs: usize) -> R<usize> {
         V::Func(fr) => match vm.heap.func_mut(fr) {
             FuncObj::Lua { env, .. } => {
                 *env = t;
-                vm.fenv_gen += 1;
+                vm.fenv_gen = vm.fenv_gen.wrapping_add(1);
             }
             FuncObj::Native { .. } => {
                 return Err(vm.error_at(1, "`setfenv' cannot change environment of given function"))

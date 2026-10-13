@@ -81,6 +81,8 @@ pub enum Op {
     NewTable(Reg, u32, u8),
     /// `R(a+1) = R(b); R(a) = R(b)[RK(c)]`.
     SelfOp(Reg, Reg, Rk),
+    /// `SelfOp` for a string constant name: the method call `o:m()`.
+    SelfField(Reg, Reg, u16),
     /// `R(a) = R(b) op R(c)`. A constant operand has its own ops (`AddK`, `AddKR`).
     Add(Reg, Reg, Reg),
     Sub(Reg, Reg, Reg),

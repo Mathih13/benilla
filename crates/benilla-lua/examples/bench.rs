@@ -65,18 +65,24 @@ fn main() {
     );
     let mut geo = 0.0;
     for (name, src) in WORKLOADS {
+        // Measured as the LuaJIT script measures (`target/vmtest/luabench.lua`): one state, the
+        // chunk compiled once outside the clock, the best of three runs in that warm state.
+        let mut vm = benilla_lua::new_state();
+        let f = vm.load(src.as_bytes(), b"=bench").expect("compiles");
+        let fr = vm.root(f);
         let mut ours_out = String::new();
         let ours = time(|| {
-            let mut vm = benilla_lua::new_state();
-            let r = vm.exec(src.as_bytes(), b"=bench").expect("runs");
+            let f = vm.rooted(fr);
+            let r = vm.pcall_value(f, &[], -1).expect("runs");
             ours_out = vm.display(r[0]);
         });
+        let lua = mlua::Lua::new();
+        // The fork's 5.1 has `math.fmod`; 1.12 calls it `math.mod`.
+        lua.load("math.mod = math.fmod").exec().unwrap();
+        let ff = lua.load(*src).into_function().expect("compiles");
         let mut fork_out = String::new();
         let fork = time(|| {
-            let lua = mlua::Lua::new();
-            // The fork's 5.1 has `math.fmod`; 1.12 calls it `math.mod`.
-            lua.load("math.mod = math.fmod").exec().unwrap();
-            let v: mlua::Value = lua.load(*src).eval().expect("runs");
+            let v: mlua::Value = ff.call(()).expect("runs");
             fork_out = lua.coerce_string(v).unwrap().unwrap().to_string_lossy();
         });
         let ratio = ours / fork;

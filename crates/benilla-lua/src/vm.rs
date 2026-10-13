@@ -45,7 +45,7 @@ struct Frame {
     env: TableRef,
     /// `Vm::fenv_gen` when `env` was read: a `setfenv` since moves it, and the next global
     /// access rereads the closure's environment.
-    env_gen: u64,
+    env_gen: u32,
     /// The constant table and register count, so resuming the frame reads no prototype.
     consts: *const Value,
     maxstack: u16,
@@ -56,6 +56,9 @@ struct Frame {
     /// Returning from this frame ends the `execute` that entered it.
     boundary: bool,
 }
+
+// A call writes one cache line of frame.
+const _: () = assert!(std::mem::size_of::<Frame>() == 64);
 
 impl Frame {
     /// The index of the next instruction, for error positions.
@@ -129,7 +132,7 @@ pub struct Vm {
     pub(crate) retired: Vec<(Rc<Proto>, Box<[u32]>)>,
     /// Bumped by every `setfenv` of a Lua function, so a running frame's cached environment
     /// knows to reread.
-    pub(crate) fenv_gen: u64,
+    pub(crate) fenv_gen: u32,
     /// Values a host holds outside the VM (a handle to a table or function), each a collector
     /// root while its count is above zero: mlua's registry references.
     roots: Vec<(Value, u32)>,
@@ -1788,6 +1791,32 @@ impl Vm {
                     }
                 }};
             }
+            /// A string key missing from table `tr`, through its metatable: the common one level
+            /// (`__index` a table holding the key) inline, a longer chain by `index_meta_fast`.
+            /// `None` when the full `index` must run.
+            macro_rules! meta_field {
+                ($tr:expr, $key:expr) => {{
+                    let (tr, key): (TableRef, Value) = ($tr, $key);
+                    match self.heap.table(tr).meta {
+                        None => Some(Value::Nil),
+                        Some(m) => {
+                            let idx = self.heap.table(m).get_str(Value::Str(self.names.index));
+                            match idx.as_table() {
+                                Some(t2) => {
+                                    let v = self.heap.table(t2).get_str(key);
+                                    if !v.is_nil() {
+                                        Some(v)
+                                    } else {
+                                        self.index_meta_fast(tr, &key)
+                                    }
+                                }
+                                None if idx.is_nil() => Some(Value::Nil),
+                                None => None,
+                            }
+                        }
+                    }
+                }};
+            }
             /// A comparison with one constant side.
             macro_rules! cmpk {
                 ($cmp:expr, $cond:expr, $x:expr, $y:expr, $off:expr) => {{
@@ -1886,13 +1915,32 @@ impl Vm {
                                 r!(a) = v;
                                 continue;
                             }
-                            if let Some(v) = self.index_meta_fast(tr, &key) {
+                            if let Some(v) = meta_field!(tr, key) {
                                 r!(a) = v;
                                 continue;
                             }
                         }
                         let t = r!(b);
                         let v = slow!(self.index(t, key, Some(b as usize)))?;
+                        r!(a) = v;
+                    }
+                    Op::SelfField(a, b, kx) => {
+                        let key = kv!(kx);
+                        let obj = r!(b);
+                        r!(a + 1) = obj;
+                        if let Some(tr) = obj.as_table() {
+                            let tab = self.heap.table(tr);
+                            let v = tab.get_str(key);
+                            if !v.is_nil() || tab.meta.is_none() {
+                                r!(a) = v;
+                                continue;
+                            }
+                            if let Some(v) = meta_field!(tr, key) {
+                                r!(a) = v;
+                                continue;
+                            }
+                        }
+                        let v = slow!(self.index(obj, key, Some(b as usize)))?;
                         r!(a) = v;
                     }
                     Op::SetField(a, kx, c) => {
@@ -2335,6 +2383,7 @@ fn objname_in(p: &Proto, heap: &Heap, pc: usize, reg: usize) -> Option<(&'static
         Op::GetTable(_, _, c) => Some(("field", kname(c))),
         Op::GetField(_, _, kx) => Some(("field", kname(kx + RK_CONST))),
         Op::SelfOp(_, _, c) => Some(("method", kname(c))),
+        Op::SelfField(_, _, kx) => Some(("method", kname(kx + RK_CONST))),
         _ => None,
     }
 }
@@ -2374,7 +2423,7 @@ fn symbexec(p: &Proto, lastpc: usize, reg: usize) -> Option<usize> {
             | Op::Concat(a, ..)
             | Op::Closure(a, _) => writes(a, 1),
             Op::LoadNil(a, b) => (a as usize..=b as usize).contains(&reg),
-            Op::SelfOp(a, ..) => writes(a, 2),
+            Op::SelfOp(a, ..) | Op::SelfField(a, ..) => writes(a, 2),
             Op::Call(a, ..) | Op::TailCall(a, ..) => reg >= a as usize,
             Op::ForLoop(a, _) | Op::ForLoopUp(a, _) => writes(a, 1),
             Op::TForLoop(a, n) => reg >= a as usize + 2 && reg < a as usize + 2 + n as usize,

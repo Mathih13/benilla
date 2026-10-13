@@ -773,7 +773,10 @@ impl<'a> Fc<'a> {
                     r as Rk
                 };
                 self.line = *line;
-                self.emit(Op::SelfOp(base, o, rk));
+                match self.str_const(rk) {
+                    Some(k) => self.emit(Op::SelfField(base, o, k)),
+                    None => self.emit(Op::SelfOp(base, o, rk)),
+                };
                 (args, *line, 2)
             }
             _ => unreachable!("a call"),

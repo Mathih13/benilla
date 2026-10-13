@@ -52,14 +52,21 @@ impl StrObj {
     }
 }
 
-/// An empty intern slot. No entry equals it: a string id is under `1 << STR_ID_BITS`.
-const STRT_EMPTY: u64 = u64::MAX;
+/// An empty intern slot. No entry equals it: string ids stop below `(1 << STR_ID_BITS) - 1`.
+const STRT_EMPTY: u32 = u32::MAX;
+const STR_ID_MASK: u32 = (1 << STR_ID_BITS) - 1;
 
-/// An intern slot for string `id` of hash `hash`: the hash rides in the slot, so a probe
-/// compares it without touching the string.
+/// An intern slot, four bytes so a large table stays in cache: string `id` in the low
+/// `STR_ID_BITS`, eight bits of its hash above, so a probe passes most other strings without
+/// touching them.
 #[inline]
-fn strt_entry(hash: u32, id: u32) -> u64 {
-    (hash as u64) << 32 | id as u64
+fn strt_entry(hash: u32, id: u32) -> u32 {
+    id | strt_tag(hash)
+}
+
+#[inline]
+fn strt_tag(hash: u32) -> u32 {
+    (hash & 0xff) << STR_ID_BITS
 }
 
 /// Where a probe for `hash` starts in a table of `mask + 1` slots: the hash mixed, so 5.0's
@@ -223,7 +230,7 @@ pub struct Census {
 pub struct Heap {
     strs: Arena<StrObj>,
     /// The intern table: open addressing, linear probing, at most half full.
-    strt: Vec<u64>,
+    strt: Vec<u32>,
     tables: Arena<Table>,
     funcs: Arena<FuncObj>,
     upvals: Arena<UpvalObj>,
@@ -272,9 +279,10 @@ impl Heap {
             if e == STRT_EMPTY {
                 break;
             }
-            if (e >> 32) as u32 == hash {
-                let id = e as u32;
-                if self.strs.get(id).bytes() == s {
+            if e & !STR_ID_MASK == strt_tag(hash) {
+                let id = e & STR_ID_MASK;
+                let o = self.strs.get(id);
+                if o.hash == hash && o.bytes() == s {
                     return StrRef {
                         id,
                         hash: hash & STR_HASH_MASK,
@@ -286,11 +294,9 @@ impl Heap {
         self.bytes += 32 + s.len();
         let id = self.strs.alloc(StrObj::new(s, hash));
         self.strt[b] = strt_entry(hash, id);
-        // A string value holds its id in `STR_ID_BITS`: sixteen million live strings.
-        assert!(
-            id < 1 << STR_ID_BITS,
-            "more live strings than a value can name"
-        );
+        // A string value holds its id in `STR_ID_BITS`: sixteen million live strings, the
+        // last id left free so no slot reads as empty.
+        assert!(id < STR_ID_MASK, "more live strings than a value can name");
         if self.strs.live() * 2 > self.strt.len() {
             self.resize_strt(self.strt.len() * 2);
         }
