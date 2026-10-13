@@ -19,12 +19,40 @@ pub struct StrObj {
     next: u32,
 }
 
+/// What a call needs of a Lua function's prototype, copied into the closure so a call
+/// reads it without following the prototype pointer.
+#[derive(Clone, Copy, Debug)]
+pub struct Shape {
+    pub nparams: u8,
+    pub vararg: bool,
+    pub maxstack: u16,
+    /// The first instruction, so a call starts its frame without reaching the prototype.
+    /// Valid as long as the prototype, which the closure holds.
+    pub code: *const crate::proto::Op,
+    /// The constant table, for the same reason.
+    pub consts: *const Value,
+}
+
+impl Shape {
+    pub fn of(p: &Proto) -> Shape {
+        Shape {
+            nparams: p.nparams,
+            vararg: p.vararg,
+            maxstack: p.maxstack,
+            code: p.code.as_ptr(),
+            consts: p.consts.as_ptr(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum FuncObj {
     Lua {
         proto: Rc<Proto>,
         upvals: Box<[u32]>,
         env: TableRef,
+        /// The prototype's call shape; replaced with it on a hot reload.
+        shape: Shape,
     },
     Native {
         f: NativeFn,
@@ -377,7 +405,9 @@ impl Heap {
                     }
                     self.funcs.marks[f.0 as usize] = true;
                     match self.funcs.get(f.0) {
-                        FuncObj::Lua { proto, upvals, env } => {
+                        FuncObj::Lua {
+                            proto, upvals, env, ..
+                        } => {
                             gray.push(Value::Table(*env));
                             gray_upvals.extend_from_slice(upvals);
                             mark_proto(proto, &mut gray, &mut seen_protos);

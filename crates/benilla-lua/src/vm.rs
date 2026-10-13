@@ -24,13 +24,14 @@ const MAXCALLS: usize = 4096;
 /// 5.0's `MAXTAGLOOP`.
 const MAXTAGLOOP: u32 = 100;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Frame {
     func: FuncRef,
-    /// The stack slot of the called function, where its results go.
-    func_idx: usize,
-    base: usize,
-    pc: usize,
+    /// The first register; the called function sits just below, where its results go.
+    base: u32,
+    /// The next instruction, saved as C Lua saves `savedpc`: a pointer, so resuming the frame
+    /// reads one value to dispatch. Null for a native.
+    ip: *const Op,
     /// Results the caller wants; -1 for all.
     nresults: i32,
     /// The code this frame runs, null for a native. Valid while the frame exists: its closure is
@@ -40,12 +41,37 @@ struct Frame {
     /// The closure's upvalue list and environment as the call found them, so entering the
     /// frame reads no closure. The list is valid as `proto` is; the environment is reread
     /// when `Vm::fenv_gen` moves.
-    upvals: *const [u32],
+    upvals: *const u32,
     env: TableRef,
+    /// The constant table and register count, so resuming the frame reads no prototype.
+    consts: *const Value,
+    maxstack: u16,
     /// Tail calls this frame replaced, which 5.0 counts as stack levels.
     tailcalls: u32,
     /// Returning from this frame ends the `execute` that entered it.
     boundary: bool,
+}
+
+impl Frame {
+    /// The index of the next instruction, for error positions.
+    fn pc(&self) -> usize {
+        if self.proto.is_null() {
+            return 0;
+        }
+        // SAFETY: a live Lua frame's `ip` points into its prototype's code.
+        unsafe { self.ip.offset_from((*self.proto).code.as_ptr()) as usize }
+    }
+
+    #[inline(always)]
+    fn base(&self) -> usize {
+        self.base as usize
+    }
+
+    /// The stack slot of the called function, where its results go.
+    #[inline(always)]
+    fn func_idx(&self) -> usize {
+        self.base as usize - 1
+    }
 }
 
 /// Metamethod and library names, interned once.
@@ -226,10 +252,12 @@ impl Vm {
         let ast = crate::parse::parse(src, chunkname)?;
         let proto = crate::compile::compile(&ast, &mut self.heap)?;
         let env = self.globals;
+        let shape = crate::heap::Shape::of(&proto);
         Ok(Value::Func(self.heap.new_func(FuncObj::Lua {
             proto,
             upvals: Box::new([]),
             env,
+            shape,
         })))
     }
 
@@ -301,6 +329,8 @@ impl Vm {
     }
 
     /// `luaG_runerror`: the message with the current Lua function's position.
+    #[cold]
+    #[inline(never)]
     pub fn rt_error(&mut self, msg: &str) -> LuaError {
         let mut out = self.where_(0);
         out.extend_from_slice(msg.as_bytes());
@@ -326,7 +356,7 @@ impl Vm {
         // SAFETY: a live frame's code is alive (see `Frame::proto`).
         match unsafe { f.proto.as_ref() } {
             Some(p) => {
-                let pc = f.pc.saturating_sub(1);
+                let pc = f.pc().saturating_sub(1);
                 let line = p.lines.get(pc).copied().unwrap_or(0);
                 if line == 0 {
                     return Vec::new();
@@ -365,7 +395,7 @@ impl Vm {
     }
 
     pub(crate) fn native_base(&self) -> usize {
-        self.frames.last().unwrap().base
+        self.frames.last().unwrap().base()
     }
 
     pub(crate) fn running(&self) -> FuncRef {
@@ -398,11 +428,13 @@ impl Vm {
         let f = &self.frames[fi];
         // SAFETY: a live frame's code is alive (see `Frame::proto`).
         let p = unsafe { f.proto.as_ref() }?;
-        let pc = f.pc.saturating_sub(1);
+        let pc = f.pc().saturating_sub(1);
         objname_in(p, &self.heap, pc, reg)
     }
 
     /// `luaG_typeerror`: `attempt to <op> <kind> `<name>' (a <type> value)`.
+    #[cold]
+    #[inline(never)]
     fn type_error(&mut self, v: Value, reg: Option<usize>, op: &str) -> LuaError {
         let t = v.type_name();
         let fi = self.frames.len() - 1;
@@ -417,6 +449,8 @@ impl Vm {
         self.rt_error(&msg)
     }
 
+    #[cold]
+    #[inline(never)]
     fn order_error(&mut self, a: Value, b: Value) -> LuaError {
         let (t1, t2) = (a.type_name(), b.type_name());
         // 5.0 compares the third character of the two type names.
@@ -452,6 +486,7 @@ impl Vm {
     // ── upvalues ─────────────────────────────────────────────────────────────────────────────
 
     /// `luaF_findupval`: the open upvalue for stack slot `idx`, made if absent.
+    #[inline(never)]
     fn find_upval(&mut self, idx: usize) -> u32 {
         match self.open.binary_search_by_key(&idx, |&(i, _)| i) {
             Ok(p) => self.open[p].1,
@@ -464,6 +499,7 @@ impl Vm {
     }
 
     /// `luaF_close`: every open upvalue at or above `level` takes its value.
+    #[inline(never)]
     fn close_upvals(&mut self, level: usize) {
         while let Some(&(idx, u)) = self.open.last() {
             if idx < level {
@@ -471,14 +507,6 @@ impl Vm {
             }
             *self.heap.upval_mut(u) = UpvalObj::Closed(self.stack[idx]);
             self.open.pop();
-        }
-    }
-
-    #[inline]
-    fn upval_get(&self, u: u32) -> Value {
-        match self.heap.upval(u) {
-            UpvalObj::Open(i) => self.stack[i as usize],
-            UpvalObj::Closed(v) => v,
         }
     }
 
@@ -507,6 +535,8 @@ impl Vm {
     }
 
     /// `call_binTM`: the first operand's metamethod, else the second's; it must be a function.
+    #[cold]
+    #[inline(never)]
     fn bin_tm(&mut self, a: Value, b: Value, name: StrRef) -> Result<Option<Value>, LuaError> {
         let mut tm = self.tm(a, name);
         if tm.is_nil() {
@@ -521,7 +551,7 @@ impl Vm {
     /// `luaV_gettable`'s common miss, without calls: `t[key]` was nil and `t` has a metatable;
     /// follow `__index` while it is a table. `None` when a function, a non-table or a long
     /// chain needs the full path.
-    #[inline]
+    #[inline(never)]
     fn index_meta_fast(&self, mut tr: TableRef, key: &Value) -> Option<Value> {
         for _ in 0..4 {
             let Some(m) = self.heap.table(tr).meta else {
@@ -543,6 +573,8 @@ impl Vm {
     }
 
     /// `luaV_gettable`. `reg` names the indexed value for an error.
+    #[cold]
+    #[inline(never)]
     pub fn index(&mut self, t: Value, key: Value, reg: Option<usize>) -> Result<Value, LuaError> {
         let mut t = t;
         let mut reg = reg;
@@ -581,6 +613,8 @@ impl Vm {
     }
 
     /// `luaV_settable`: 5.0 makes the key in a table before it consults `__newindex`.
+    #[cold]
+    #[inline(never)]
     pub fn setindex(
         &mut self,
         t: Value,
@@ -633,6 +667,8 @@ impl Vm {
 
     /// 5.0's `Arith`. Numbers (and numeric strings) compute, `^` through the global `__pow`;
     /// anything else tries the operands' metamethods.
+    #[cold]
+    #[inline(never)]
     fn arith(
         &mut self,
         op: Arith,
@@ -680,6 +716,8 @@ impl Vm {
     }
 
     /// `luaV_equalObj`: tables and userdata consult a shared `__eq`.
+    #[cold]
+    #[inline(never)]
     pub fn equals(&mut self, a: Value, b: Value) -> Result<bool, LuaError> {
         match (a.unpack(), b.unpack()) {
             (V::Table(x), V::Table(y)) if x != y => {}
@@ -730,6 +768,8 @@ impl Vm {
         self.heap.str(a).cmp(self.heap.str(b))
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn less_than(&mut self, a: Value, b: Value) -> Result<bool, LuaError> {
         match (a.unpack(), b.unpack()) {
             (V::Num(x), V::Num(y)) => Ok(x < y),
@@ -742,6 +782,8 @@ impl Vm {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn less_equal(&mut self, a: Value, b: Value) -> Result<bool, LuaError> {
         match (a.unpack(), b.unpack()) {
             (V::Num(x), V::Num(y)) => Ok(x <= y),
@@ -762,6 +804,8 @@ impl Vm {
 
     /// 5.0's `luaV_concat` over `stack[first..=last]`, collapsing from the right; the result is
     /// left in `stack[first]`.
+    #[cold]
+    #[inline(never)]
     fn concat(&mut self, first: usize, last: usize) -> Result<(), LuaError> {
         let mut total = last - first + 1;
         let mut last = last;
@@ -804,7 +848,7 @@ impl Vm {
                         } else {
                             (a, top - 2)
                         };
-                        let base = self.frames.last().unwrap().base;
+                        let base = self.frames.last().unwrap().base();
                         return Err(self.type_error(bad, Some(reg - base), "concatenate"));
                     }
                 },
@@ -881,6 +925,8 @@ impl Vm {
     }
 
     /// 5.0's `luaD_precall`.
+    #[cold]
+    #[inline(never)]
     fn precall(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<Called, LuaError> {
         let mut nargs = nargs;
         let fref = loop {
@@ -895,7 +941,7 @@ impl Vm {
                             .frames
                             .last()
                             .filter(|f| !f.proto.is_null())
-                            .map(|f| func_idx - f.base);
+                            .map(|f| func_idx - f.base());
                         return Err(self.type_error(other, reg, "call"));
                     }
                     self.ensure(func_idx + nargs + 2);
@@ -911,7 +957,9 @@ impl Vm {
             return Err(self.rt_error("stack overflow"));
         }
         match self.heap.func(fref) {
-            FuncObj::Lua { proto, upvals, env } => {
+            FuncObj::Lua {
+                proto, upvals, env, ..
+            } => {
                 let pp = Rc::as_ptr(proto);
                 let (fup, fenv): (*const [u32], TableRef) = (&**upvals, *env);
                 // SAFETY: the closure being called holds this code, and the closure sits in the
@@ -955,12 +1003,13 @@ impl Vm {
                 self.top = frame_top;
                 self.frames.push(Frame {
                     func: fref,
-                    func_idx,
-                    base,
-                    pc: 0,
+                    base: base as u32,
+                    ip: proto.code.as_ptr(),
                     nresults: nres,
+                    consts: proto.consts.as_ptr(),
+                    maxstack: proto.maxstack,
                     proto: pp,
-                    upvals: fup,
+                    upvals: fup.cast::<u32>(),
                     env: fenv,
                     tailcalls: 0,
                     boundary: false,
@@ -973,12 +1022,13 @@ impl Vm {
                 self.top = base + nargs;
                 self.frames.push(Frame {
                     func: fref,
-                    func_idx,
-                    base,
-                    pc: 0,
+                    base: base as u32,
+                    ip: std::ptr::null(),
                     nresults: nres,
+                    consts: std::ptr::null(),
+                    maxstack: 0,
                     proto: std::ptr::null(),
-                    upvals: &[],
+                    upvals: std::ptr::null(),
                     env: self.globals,
                     tailcalls: 0,
                     boundary: false,
@@ -993,6 +1043,8 @@ impl Vm {
     }
 
     /// 5.0's `luaD_poscall`: `n` results from `first` move to `dest`, adjusted to `wanted`.
+    #[cold]
+    #[inline(never)]
     fn poscall(&mut self, dest: usize, first: usize, n: usize, wanted: i32) {
         // One result wanted, at least one given: the common call in an expression.
         if wanted == 1 && n >= 1 {
@@ -1020,7 +1072,7 @@ impl Vm {
     /// The `i`th argument (0-based) of the running native, or nil.
     pub fn arg(&self, nargs: usize, i: usize) -> Value {
         if i < nargs {
-            self.stack[self.frames.last().unwrap().base + i]
+            self.stack[self.frames.last().unwrap().base() + i]
         } else {
             Value::Nil
         }
@@ -1028,7 +1080,7 @@ impl Vm {
 
     /// The running native's arguments.
     pub fn args(&self, nargs: usize) -> &[Value] {
-        let b = self.frames.last().unwrap().base;
+        let b = self.frames.last().unwrap().base();
         &self.stack[b..b + nargs]
     }
 
@@ -1054,7 +1106,7 @@ impl Vm {
         }
         // SAFETY: a live frame's code is alive (see `Frame::proto`).
         let p = unsafe { caller.proto.as_ref() }?;
-        let pc = caller.pc.checked_sub(1)?;
+        let pc = caller.pc().checked_sub(1)?;
         match p.code.get(pc)? {
             Op::Call(a, ..) | Op::TailCall(a, ..) => objname_in(p, &self.heap, pc, *a as usize),
             _ => None,
@@ -1105,6 +1157,8 @@ impl Vm {
     }
 
     /// A full collection; 5.0 then sets the threshold to twice what lives.
+    #[cold]
+    #[inline(never)]
     pub fn full_gc(&mut self) {
         let mut roots: Vec<Value> = self.stack[..self.top].to_vec();
         roots.push(Value::Table(self.globals));
@@ -1151,23 +1205,52 @@ impl Vm {
     /// keeps `base` in a register. Anything that can grow the stack (a call, a metamethod, an
     /// upvalue that touches the stack) is followed by `refresh!`, which recomputes it.
     fn execute(&mut self) -> Result<(), LuaError> {
+        // The running frame's state, kept in locals as C Lua's `luaV_execute` keeps it. A Lua
+        // call sets it straight from the callee; a return reloads it from the caller's frame.
+        let mut fi: usize;
+        let mut proto: *const Proto;
+        let mut base: usize;
+        let mut fref: FuncRef;
+        let mut ip: *const Op;
+        let mut upvals: *const u32;
+        let mut env: TableRef;
+        let mut env_gen: u64;
+        let mut k: *const Value;
+        let mut maxstack: usize;
+        let mut regs: *mut Value;
         'frame: loop {
-            let fi = self.frames.len() - 1;
-            let frame = self.frames.last().expect("a Lua frame");
-            // SAFETY: the top frame is a Lua frame, and its code outlives it (`Frame::proto`).
-            let proto: &Proto = unsafe { &*frame.proto };
-            let (base, mut pc, fref) = (frame.base, frame.pc, frame.func);
-            // SAFETY: the upvalue list lives as the code does (`Frame::upvals`).
-            let upvals: &[u32] = unsafe { &*frame.upvals };
-            let mut env = frame.env;
-            // A `setfenv` since the call is caught on first use: start one generation behind.
-            let mut env_gen = self.fenv_gen.wrapping_sub(1);
-            let code = &proto.code[..];
-            let k = &proto.consts[..];
-            let maxstack = proto.maxstack as usize;
-            // SAFETY: `precall` grew the stack to cover `base + maxstack`, and the stack never
-            // shrinks.
-            let mut regs: *mut Value = unsafe { self.stack.as_mut_ptr().add(base) };
+            {
+                fi = self.frames.len() - 1;
+                let frame = self.frames.last().expect("a Lua frame");
+                proto = frame.proto;
+                base = frame.base();
+                fref = frame.func;
+                ip = frame.ip;
+                upvals = frame.upvals;
+                env = frame.env;
+                // A `setfenv` since the call is caught on first use: start one generation behind.
+                env_gen = self.fenv_gen.wrapping_sub(1);
+                k = frame.consts;
+                maxstack = frame.maxstack as usize;
+                // SAFETY: `precall` grew the stack to cover `base + maxstack`, and the stack never
+                // shrinks.
+                regs = unsafe { self.stack.as_mut_ptr().add(base) };
+            }
+            // SAFETY: the upvalue list lives as the code does (`Frame::upvals`), and the
+            // compiler indexes only the upvalues the function has.
+            macro_rules! upval {
+                ($i:expr) => {
+                    unsafe { *upvals.add($i as usize) }
+                };
+            }
+            // SAFETY: the compiler only encodes constants this function has.
+            macro_rules! kv {
+                ($i:expr) => {{
+                    let i = $i as usize;
+                    debug_assert!(i < unsafe { (*proto).consts.len() });
+                    unsafe { *k.add(i) }
+                }};
+            }
             macro_rules! refresh {
                 () => {
                     // SAFETY: as above.
@@ -1189,10 +1272,7 @@ impl Vm {
                 ($x:expr) => {{
                     let x: Rk = $x;
                     if x >= RK_CONST {
-                        // SAFETY: the compiler only encodes constants this function has.
-                        let i = (x - RK_CONST) as usize;
-                        debug_assert!(i < k.len());
-                        unsafe { *k.get_unchecked(i) }
+                        kv!(x - RK_CONST)
                     } else {
                         r!(x)
                     }
@@ -1205,9 +1285,9 @@ impl Vm {
                     let x: Rk = $x;
                     if x >= RK_CONST {
                         let i = (x - RK_CONST) as usize;
-                        debug_assert!(i < k.len());
-                        // SAFETY: as `rk!`.
-                        unsafe { k.get_unchecked(i) }
+                        debug_assert!(i < unsafe { (*proto).consts.len() });
+                        // SAFETY: as `kv!`.
+                        unsafe { &*k.add(i) }
                     } else {
                         let i = x as usize;
                         debug_assert!(i < maxstack && base + i < self.stack.len());
@@ -1240,7 +1320,7 @@ impl Vm {
             }
             macro_rules! save {
                 () => {
-                    self.frames[fi].pc = pc
+                    self.frames[fi].ip = ip
                 };
             }
             /// A call that may run Lua: the pc saved first, the registers refreshed after.
@@ -1266,17 +1346,90 @@ impl Vm {
             }
             macro_rules! jump {
                 ($off:expr) => {
-                    pc = (pc as isize + $off as isize) as usize
+                    // SAFETY: the compiler's jumps land inside the function.
+                    ip = unsafe { ip.offset($off as isize) }
                 };
             }
+            /// 5.0's `OP_RETURN`: `n` values from `R(a)` to the caller's frame.
+            macro_rules! ret {
+                ($a:expr, $n:expr) => {{
+                    let a = $a;
+                    let n: usize = $n;
+                    let first = base + a as usize;
+                    if !self.open.is_empty() {
+                        self.close_upvals(base);
+                    }
+                    // The returning frame's two fields that matter, read in place; its slot sits
+                    // just below `regs`.
+                    let (nresults, boundary) = {
+                        let me = self.frames.last().unwrap();
+                        (me.nresults, me.boundary)
+                    };
+                    let func_idx = base - 1;
+                    self.frames.truncate(fi);
+                    if nresults == 1 && n >= 1 {
+                        // One result, the common call in an expression, into the callee's slot
+                        // just below this frame's registers.
+                        // SAFETY: `base` is at least 1 for a Lua frame; `regs` is current.
+                        let v = r!(a);
+                        unsafe { *regs.sub(1) = v };
+                    } else if nresults == 0 {
+                        // None, a call statement.
+                        self.top = func_idx;
+                    } else {
+                        self.poscall(func_idx, first, n, nresults);
+                    }
+                    if boundary {
+                        if nresults == 1 && n >= 1 {
+                            self.top = func_idx + 1;
+                        }
+                        return Ok(());
+                    }
+                    // Back in the calling Lua frame: a fixed result count restores its top.
+                    let caller = self.frames.last().unwrap();
+                    if nresults >= 0 {
+                        self.top = caller.base() + caller.maxstack as usize;
+                    }
+                    continue 'frame;
+                }};
+            }
+            macro_rules! arithk {
+                ($a:expr, $b:expr, $kx:expr, $op:tt, $kind:expr) => {{
+                    let y = kv!($kx);
+                    if let (Some(x), Some(yn)) = (r!($b).as_num(), y.as_num()) {
+                        r!($a) = Value::num_raw(x $op yn);
+                    } else {
+                        let x = r!($b);
+                        let v = slow!(self.arith($kind, x, y, (Some($b as usize), None)))?;
+                        r!($a) = v;
+                    }
+                }};
+            }
+            /// A comparison with one constant side.
+            macro_rules! cmpk {
+                ($cmp:expr, $cond:expr, $x:expr, $y:expr, $off:expr) => {{
+                    let (x, y): (Value, Value) = ($x, $y);
+                    let res = match ($cmp, x.as_num(), y.as_num()) {
+                        (Cmp::Lt, Some(p), Some(q)) => p < q,
+                        (Cmp::Le, Some(p), Some(q)) => p <= q,
+                        // A constant is never a table or userdata, so `__eq` never applies.
+                        (Cmp::Eq, _, _) => x.raw_eq(y),
+                        (Cmp::Lt, _, _) => slow!(self.less_than(x, y))?,
+                        (Cmp::Le, _, _) => slow!(self.less_equal(x, y))?,
+                    };
+                    if res == $cond {
+                        jump!($off);
+                    }
+                }};
+            }
             loop {
-                debug_assert!(pc < code.len());
+                debug_assert!(unsafe { (*proto).code.as_ptr_range().contains(&ip) });
                 // SAFETY: every function ends in `Return`, and every jump lands inside it.
-                let op = unsafe { *code.get_unchecked(pc) };
-                pc += 1;
+                let op = unsafe { *ip };
+                ip = unsafe { ip.add(1) };
                 match op {
                     Op::Move(a, b) => r!(a) = r!(b),
-                    Op::LoadK(a, kx) => r!(a) = k[kx as usize],
+                    Op::LoadK(a, kx) => r!(a) = kv!(kx),
                     Op::LoadNil(a, b) => {
                         for i in a..=b {
                             r!(i) = Value::Nil;
@@ -1284,17 +1437,26 @@ impl Vm {
                     }
                     Op::LoadBool(a, b) => r!(a) = Value::Bool(b),
                     Op::GetUpval(a, u) => {
-                        let v = self.upval_get(upvals[u as usize]);
+                        let v = match self.heap.upval(upval!(u)) {
+                            // An open upvalue is a stack slot, below this frame's registers or
+                            // among them: addressed from `regs`, which is current.
+                            UpvalObj::Open(i) => {
+                                debug_assert!((i as usize) < self.stack.len());
+                                // SAFETY: an open upvalue's slot is inside the stack.
+                                unsafe { *regs.sub(base).add(i as usize) }
+                            }
+                            UpvalObj::Closed(v) => v,
+                        };
                         r!(a) = v;
                     }
                     Op::SetUpval(a, u) => {
                         let v = r!(a);
-                        self.upval_set(upvals[u as usize], v);
+                        self.upval_set(upval!(u), v);
                         refresh!();
                     }
                     Op::GetGlobal(a, kx) => {
                         let env = env!();
-                        let key = k[kx as usize];
+                        let key = kv!(kx);
                         let tab = self.heap.table(env);
                         let v = tab.get(key);
                         if !v.is_nil() || tab.meta.is_none() {
@@ -1307,7 +1469,7 @@ impl Vm {
                     Op::SetGlobal(a, kx) => {
                         let env = env!();
                         let v = r!(a);
-                        let key = k[kx as usize];
+                        let key = kv!(kx);
                         let tab = self.heap.table_mut(env);
                         if tab.meta.is_none() && tab.set(key, v).is_ok() {
                             continue;
@@ -1382,6 +1544,12 @@ impl Vm {
                     Op::Sub(a, b, c) => arith!(a, b, c, -, Arith::Sub),
                     Op::Mul(a, b, c) => arith!(a, b, c, *, Arith::Mul),
                     Op::Div(a, b, c) => arith!(a, b, c, /, Arith::Div),
+                    Op::AddK(a, b, kx) => arithk!(a, b, kx, +, Arith::Add),
+                    Op::SubK(a, b, kx) => arithk!(a, b, kx, -, Arith::Sub),
+                    Op::MulK(a, b, kx) => arithk!(a, b, kx, *, Arith::Mul),
+                    Op::DivK(a, b, kx) => arithk!(a, b, kx, /, Arith::Div),
+                    Op::JmpCmpK(cmp, cond, b, kx, off) => cmpk!(cmp, cond, r!(b), kv!(kx), off),
+                    Op::JmpCmpKR(cmp, cond, kx, c, off) => cmpk!(cmp, cond, kv!(kx), r!(c), off),
                     Op::Pow(a, b, c) => {
                         // 5.0's `^` always goes through the global `__pow`.
                         let (x, y) = (rk!(b), rk!(c));
@@ -1453,20 +1621,25 @@ impl Vm {
                                 proto: p,
                                 upvals: fup,
                                 env: fenv,
+                                shape,
                             } = self.heap.func(f)
                             {
-                                if !p.vararg && self.frames.len() < MAXCALLS {
-                                    let np = p.nparams as usize;
+                                // `fi + 1` frames are live: the depth without reading the
+                                // frame list.
+                                if !shape.vararg && fi + 1 < MAXCALLS {
+                                    let np = shape.nparams as usize;
+                                    let consts = shape.consts;
                                     let nbase = func_idx + 1;
-                                    let ftop = nbase + p.maxstack as usize;
+                                    let ftop = nbase + shape.maxstack as usize;
                                     let frame = Frame {
                                         func: f,
-                                        func_idx,
-                                        base: nbase,
-                                        pc: 0,
+                                        base: nbase as u32,
+                                        ip: shape.code,
                                         nresults: c as i32 - 1,
+                                        consts: shape.consts,
+                                        maxstack: shape.maxstack,
                                         proto: Rc::as_ptr(p),
-                                        upvals: &**fup,
+                                        upvals: fup.as_ptr(),
                                         env: *fenv,
                                         tailcalls: 0,
                                         boundary: false,
@@ -1479,7 +1652,20 @@ impl Vm {
                                     }
                                     self.top = ftop;
                                     self.frames.push(frame);
-                                    continue 'frame;
+                                    // Enter the callee from what is in hand, not from the
+                                    // frame just written.
+                                    fi += 1;
+                                    proto = frame.proto;
+                                    base = nbase;
+                                    fref = f;
+                                    ip = frame.ip;
+                                    upvals = frame.upvals;
+                                    env = frame.env;
+                                    env_gen = self.fenv_gen;
+                                    k = consts;
+                                    maxstack = ftop - nbase;
+                                    refresh!();
+                                    continue;
                                 }
                             }
                         }
@@ -1518,7 +1704,7 @@ impl Vm {
                         }
                         self.close_upvals(base);
                         let me = self.frames.pop().unwrap();
-                        let dest = me.func_idx;
+                        let dest = me.func_idx();
                         self.stack.copy_within(func_idx..func_idx + nargs + 1, dest);
                         self.top = dest + nargs + 1;
                         match self.precall(dest, nargs, me.nresults) {
@@ -1536,40 +1722,14 @@ impl Vm {
                         }
                     }
                     Op::Return(a, b) => {
-                        let first = base + a as usize;
                         let n = if b == 0 {
-                            self.top - first
+                            self.top - (base + a as usize)
                         } else {
                             b as usize - 1
                         };
-                        if !self.open.is_empty() {
-                            self.close_upvals(base);
-                        }
-                        let me = self.frames.pop().unwrap();
-                        if me.nresults == 1 && n >= 1 {
-                            // One result, the common call in an expression.
-                            self.stack[me.func_idx] = r!(a);
-                        } else if me.nresults == 0 {
-                            // None, a call statement.
-                            self.top = me.func_idx;
-                        } else {
-                            self.poscall(me.func_idx, first, n, me.nresults);
-                        }
-                        if me.boundary {
-                            if me.nresults == 1 && n >= 1 {
-                                self.top = me.func_idx + 1;
-                            }
-                            return Ok(());
-                        }
-                        // Back in the calling Lua frame: a fixed result count restores its top.
-                        let caller = self.frames.last().unwrap();
-                        if me.nresults >= 0 {
-                            // SAFETY: the caller is a live Lua frame (`Frame::proto`).
-                            let cp = unsafe { &*caller.proto };
-                            self.top = caller.base + cp.maxstack as usize;
-                        }
-                        continue 'frame;
+                        ret!(a, n);
                     }
+                    Op::Return1(a) => ret!(a, 1),
                     Op::ForLoop(a, off) => {
                         // Three numbers already: the step alone, nothing to convert back.
                         if let (Some(idx), Some(limit), Some(step)) =
@@ -1632,9 +1792,10 @@ impl Vm {
                             r!(a as usize + 2 + i) = r!(cb + i);
                         }
                         if r!(a + 2).is_nil() {
-                            pc += 1;
+                            ip = unsafe { ip.add(1) };
                         } else {
-                            let Op::Jmp(back) = code[pc] else {
+                            // SAFETY: a `TForLoop` is always followed by its `Jmp`.
+                            let Op::Jmp(back) = (unsafe { *ip }) else {
                                 unreachable!()
                             };
                             jump!(1 + back);
@@ -1670,20 +1831,23 @@ impl Vm {
                         refresh!();
                     }
                     Op::Closure(a, px) => {
-                        let p = proto.protos[px as usize].clone();
+                        // SAFETY: as `Frame::proto`.
+                        let p = unsafe { &*proto }.protos[px as usize].clone();
                         let env = env!();
                         let mut ups = Vec::with_capacity(p.upvals.len());
                         for &(in_stack, idx) in &p.upvals {
                             ups.push(if in_stack {
                                 self.find_upval(base + idx as usize)
                             } else {
-                                upvals[idx as usize]
+                                upval!(idx)
                             });
                         }
+                        let shape = crate::heap::Shape::of(&p);
                         let f = self.heap.new_func(FuncObj::Lua {
                             proto: p,
                             upvals: ups.into_boxed_slice(),
                             env,
+                            shape,
                         });
                         r!(a) = Value::Func(f);
                         save!();
@@ -1744,6 +1908,10 @@ fn symbexec(p: &Proto, lastpc: usize, reg: usize) -> Option<usize> {
             | Op::Mul(a, ..)
             | Op::Div(a, ..)
             | Op::Pow(a, ..)
+            | Op::AddK(a, ..)
+            | Op::SubK(a, ..)
+            | Op::MulK(a, ..)
+            | Op::DivK(a, ..)
             | Op::Unm(a, _)
             | Op::Not(a, _)
             | Op::Concat(a, ..)

@@ -219,6 +219,8 @@ impl<'a> Fc<'a> {
             match &mut self.code[pos] {
                 Op::Jmp(o)
                 | Op::JmpCmp(_, _, _, _, o)
+                | Op::JmpCmpK(_, _, _, _, o)
+                | Op::JmpCmpKR(_, _, _, _, o)
                 | Op::JmpIf(_, _, o)
                 | Op::ForLoop(_, o)
                 | Op::TForPrep(_, o) => *o = off,
@@ -576,14 +578,18 @@ impl<'a> Fc<'a> {
         if exprs.len() == 1 {
             if let Expr::Local(id) = &exprs[0] {
                 let r = self.reg_of[*id as usize];
-                self.emit(Op::Return(r, 2));
+                self.emit(Op::Return1(r));
                 return Ok(());
             }
         }
         let base = self.freereg;
         let multi = self.explist(exprs)?;
-        let b = if multi { 0 } else { exprs.len() as u8 + 1 };
-        self.emit(Op::Return(base, b));
+        if !multi && exprs.len() == 1 {
+            self.emit(Op::Return1(base));
+        } else {
+            let b = if multi { 0 } else { exprs.len() as u8 + 1 };
+            self.emit(Op::Return(base, b));
+        }
         Ok(())
     }
 
@@ -900,7 +906,15 @@ impl<'a> Fc<'a> {
                     let rb = self.exp2rk(l)?;
                     let rc = self.exp2rk(r)?;
                     self.line = *line;
-                    self.emit(make(dst, rb, rc));
+                    let k = |x: Rk| x - RK_CONST;
+                    let op = match (op, rb < RK_CONST, rc >= RK_CONST) {
+                        (BinOp::Add, true, true) => Op::AddK(dst, rb as Reg, k(rc)),
+                        (BinOp::Sub, true, true) => Op::SubK(dst, rb as Reg, k(rc)),
+                        (BinOp::Mul, true, true) => Op::MulK(dst, rb as Reg, k(rc)),
+                        (BinOp::Div, true, true) => Op::DivK(dst, rb as Reg, k(rc)),
+                        _ => make(dst, rb, rc),
+                    };
+                    self.emit(op);
                 }
             },
         }
@@ -961,7 +975,13 @@ impl<'a> Fc<'a> {
                 };
                 let (b, c) = if swap { (rc, rb) } else { (rb, rc) };
                 self.line = *line;
-                let j = self.emit(Op::JmpCmp(cmp, jump_when != neg, b, c, 0));
+                let cond = jump_when != neg;
+                let op = match (b < RK_CONST, c < RK_CONST) {
+                    (true, false) => Op::JmpCmpK(cmp, cond, b as Reg, c - RK_CONST, 0),
+                    (false, true) => Op::JmpCmpKR(cmp, cond, b - RK_CONST, c as Reg, 0),
+                    _ => Op::JmpCmp(cmp, cond, b, c, 0),
+                };
+                let j = self.emit(op);
                 self.freereg = save;
                 Ok(vec![j])
             }

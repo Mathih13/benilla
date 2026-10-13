@@ -54,7 +54,13 @@ impl Vm {
         }
         let mut retired = Vec::new();
         for f in self.heap.funcs_mut() {
-            let FuncObj::Lua { proto, upvals, .. } = f else {
+            let FuncObj::Lua {
+                proto,
+                upvals,
+                shape,
+                ..
+            } = f
+            else {
                 continue;
             };
             // The main function ran once; it is not swapped.
@@ -80,6 +86,7 @@ impl Vm {
                 .collect();
             match remap {
                 Some(ups) => {
+                    *shape = crate::heap::Shape::of(new);
                     let old_proto = std::mem::replace(proto, new.clone());
                     let old_ups = std::mem::replace(upvals, ups.into_boxed_slice());
                     retired.push((old_proto, old_ups));

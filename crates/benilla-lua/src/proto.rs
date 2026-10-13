@@ -51,6 +51,11 @@ pub enum Op {
     Mul(Reg, Rk, Rk),
     Div(Reg, Rk, Rk),
     Pow(Reg, Rk, Rk),
+    /// `R(a) = R(b) op K(c)`: the common `i + 1`, without the register-or-constant test.
+    AddK(Reg, Reg, u16),
+    SubK(Reg, Reg, u16),
+    MulK(Reg, Reg, u16),
+    DivK(Reg, Reg, u16),
     Unm(Reg, Reg),
     Not(Reg, Reg),
     /// `R(a) = R(b) .. ... .. R(c)`.
@@ -58,6 +63,10 @@ pub enum Op {
     Jmp(i32),
     /// Jump when `cmp(RK(b), RK(c)) == cond`.
     JmpCmp(Cmp, bool, Rk, Rk, i32),
+    /// `cmp(R(b), K(c))`: the common `n < 2`, `x == nil`.
+    JmpCmpK(Cmp, bool, Reg, u16, i32),
+    /// `cmp(K(b), R(c))`: `n > 2`, swapped into `2 < n`.
+    JmpCmpKR(Cmp, bool, u16, Reg, i32),
     /// Jump when the truth of `R(a)` is `cond`.
     JmpIf(Reg, bool, i32),
     /// `b` is the argument count + 1 (0: up to the top), `c` the result count + 1 (0: all).
@@ -65,6 +74,8 @@ pub enum Op {
     TailCall(Reg, u8),
     /// Return `R(a)..`, `b - 1` values (0: up to the top).
     Return(Reg, u8),
+    /// Return `R(a)` alone.
+    Return1(Reg),
     /// 5.0's numeric loop step: `R(a) += R(a+2)`, and while within `R(a+1)`, jump.
     ForLoop(Reg, i32),
     /// 5.0's `TFORPREP`: a table generator becomes `next` over it; then the jump.
