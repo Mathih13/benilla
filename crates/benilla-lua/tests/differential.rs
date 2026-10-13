@@ -45,6 +45,33 @@ const CASES: &[(&str, &str, Expect)] = &[
         "1e+015,1e+100,0.1,0.33333333333333,1.2345678901234e+014,-0.5,100,9.007199254741e+015",
     )),
     ("coerce", r#"return S("10"+5, "3"*"4", 10 .. 20, 1.5 .. "", " 7 " + 0, -"2")"#, Same),
+    // A constant on either side of each operator, metamethods in source order.
+    ("arith_sides", r#"local mt = {}
+        for _, e in {"__add", "__sub", "__mul", "__div"} do
+          -- A fresh local per pass: 5.0 shares the loop variable itself.
+          local name = e
+          mt[e] = function(a, b) return name .. ":" .. type(a) .. "," .. type(b) end
+        end
+        local t = setmetatable({}, mt)
+        return S(1 + t, t + 1, 2 - t, t - 2, 3 * t, t * 3, 4 / t, t / 4, t + t)"#, Same),
+    ("arith_const_errors", r#"return S(E(function() local s = "x" return 2 * s end),
+                 E(function() local x return 1 + x end),
+                 E(function() local s = "x" return s - 1 end), E(function() return 1 / {} end),
+                 E(function() local t = {} return 2 - t.y end))"#, Same),
+    ("arith_regs", r#"local a, b = 7, "3" return S(a + b, a - b, a * b, a / b, b - a)"#, Same),
+    ("numeric_for", r#"local o = {}
+        for i = 1, 3 do table.insert(o, i) end
+        for i = 3, 1, -1 do table.insert(o, i) end
+        for i = 1, 2, 0.5 do table.insert(o, i) end
+        for i = 1, "2" do table.insert(o, i) end
+        local st = 2 for i = 1, 5, st do table.insert(o, i) end
+        for i = 5, 1 do table.insert(o, "never") end
+        return table.concat(o, " ")"#, Same),
+    ("numeric_for_limit_error", r#"return E(function() for i = 1, "x" do end end)"#, Same),
+    ("numeric_for_start_error", r#"return S(E(function() for i = "a", 2 do end end), E(function() for i = 1, 2, {} do end end))"#, Diverge(
+        "5.0 primes the counter with `SUB` before any `for' check",
+        "attempt to perform arithmetic on a string value\",\"err t:24: attempt to perform arithmetic on a table value",
+    )),
     ("coerce_hex", r#"return E(function() return "0x10" + 0 end)"#, Diverge(
         "MSVC 7.1's strtod reads no hex",
         "attempt to perform arithmetic on a string value",

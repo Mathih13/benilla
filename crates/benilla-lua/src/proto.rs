@@ -81,16 +81,22 @@ pub enum Op {
     NewTable(Reg, u32, u8),
     /// `R(a+1) = R(b); R(a) = R(b)[RK(c)]`.
     SelfOp(Reg, Reg, Rk),
-    Add(Reg, Rk, Rk),
-    Sub(Reg, Rk, Rk),
-    Mul(Reg, Rk, Rk),
-    Div(Reg, Rk, Rk),
+    /// `R(a) = R(b) op R(c)`. A constant operand has its own ops (`AddK`, `AddKR`).
+    Add(Reg, Reg, Reg),
+    Sub(Reg, Reg, Reg),
+    Mul(Reg, Reg, Reg),
+    Div(Reg, Reg, Reg),
     Pow(Reg, Rk, Rk),
     /// `R(a) = R(b) op K(c)`: the common `i + 1`, without the register-or-constant test.
     AddK(Reg, Reg, u16),
     SubK(Reg, Reg, u16),
     MulK(Reg, Reg, u16),
     DivK(Reg, Reg, u16),
+    /// `R(a) = K(b) op R(c)`: the common `2 * i`, operands in source order.
+    AddKR(Reg, u16, Reg),
+    SubKR(Reg, u16, Reg),
+    MulKR(Reg, u16, Reg),
+    DivKR(Reg, u16, Reg),
     Unm(Reg, Reg),
     Not(Reg, Reg),
     /// `R(a) = R(b) .. ... .. R(c)`.
@@ -114,6 +120,8 @@ pub enum Op {
     Return1(Reg),
     /// 5.0's numeric loop step: `R(a) += R(a+2)`, and while within `R(a+1)`, jump.
     ForLoop(Reg, i32),
+    /// `ForLoop` whose step the compiler knows is a positive constant: the test is `<=`.
+    ForLoopUp(Reg, i32),
     /// 5.0's `TFORPREP`: a table generator becomes `next` over it; then the jump.
     TForPrep(Reg, i32),
     /// 5.0's `TFORLOOP`: call `R(a)(R(a+1), R(a+2))` into the `b` variables; on nil, skip the

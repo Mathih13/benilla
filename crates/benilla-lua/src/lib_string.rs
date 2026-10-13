@@ -191,15 +191,20 @@ fn format(vm: &mut Vm, nargs: usize) -> R<usize> {
             }
             b'd' | b'i' => {
                 let n = vm.check_int(nargs, arg)?;
-                out.extend(cfmt::fmt_int(n, &spec).bytes());
+                if spec.is_plain() {
+                    // A bare `%d`: the digits alone.
+                    crate::number::push_g14(n as f64, &mut out);
+                } else {
+                    out.extend_from_slice(cfmt::fmt_int(n, &spec).as_bytes());
+                }
             }
             b'o' | b'u' | b'x' | b'X' => {
                 let n = vm.check_number(nargs, arg)?;
-                out.extend(cfmt::fmt_uint(n as i64 as u32, conv, &spec).bytes());
+                out.extend_from_slice(cfmt::fmt_uint(n as i64 as u32, conv, &spec).as_bytes());
             }
             b'e' | b'E' | b'f' | b'g' | b'G' => {
                 let n = vm.check_number(nargs, arg)?;
-                out.extend(cfmt::fmt_float(n, conv, &spec).bytes());
+                out.extend_from_slice(cfmt::fmt_float(n, conv, &spec).as_bytes());
             }
             b'q' => {
                 let s = vm.check_str(nargs, arg)?;
@@ -224,7 +229,11 @@ fn format(vm: &mut Vm, nargs: usize) -> R<usize> {
                 } else {
                     // `sprintf` reads a C string.
                     let c = &b[..b.iter().position(|&x| x == 0).unwrap_or(b.len())];
-                    out.extend(cfmt::fmt_str(c, &spec));
+                    if spec.is_plain() {
+                        out.extend_from_slice(c);
+                    } else {
+                        out.extend_from_slice(&cfmt::fmt_str(c, &spec));
+                    }
                 }
             }
             _ => return Err(vm.error_at(1, "invalid option in `format'")),
@@ -459,6 +468,9 @@ impl MatchState<'_> {
         Ok(None)
     }
 
+    // Inlined into `do_match`: one frame per pattern level, so a deep match stays within the
+    // CPU's return-address predictor.
+    #[inline(always)]
     fn max_expand(&mut self, s: usize, p: usize, ep: usize) -> M<Option<usize>> {
         let mut i = 0;
         while s + i < self.src.len() && self.single(self.src[s + i], p, ep) {
@@ -475,6 +487,9 @@ impl MatchState<'_> {
         }
     }
 
+    // Inlined into `do_match`: one frame per pattern level, so a deep match stays within the
+    // CPU's return-address predictor.
+    #[inline(always)]
     fn min_expand(&mut self, s: usize, p: usize, ep: usize) -> M<Option<usize>> {
         let mut s = s;
         loop {
@@ -489,6 +504,9 @@ impl MatchState<'_> {
         }
     }
 
+    // Inlined into `do_match`: one frame per pattern level, so a deep match stays within the
+    // CPU's return-address predictor.
+    #[inline(always)]
     fn start_capture(&mut self, s: usize, p: usize, what: isize) -> M<Option<usize>> {
         if self.level >= MAX_CAPTURES {
             return Err(PatErr("too many captures"));
@@ -502,6 +520,9 @@ impl MatchState<'_> {
         Ok(r)
     }
 
+    // Inlined into `do_match`: one frame per pattern level, so a deep match stays within the
+    // CPU's return-address predictor.
+    #[inline(always)]
     fn end_capture(&mut self, s: usize, p: usize) -> M<Option<usize>> {
         let l = self.capture_to_close()?;
         self.capture[l].1 = (s - self.capture[l].0) as isize;

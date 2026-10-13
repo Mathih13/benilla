@@ -15,6 +15,13 @@ use crate::value::Value;
 
 type R<T> = Result<T, SyntaxError>;
 
+/// One operator's register, register-constant and constant-register ops.
+type ArithOps = (
+    fn(Reg, Reg, Reg) -> Op,
+    fn(Reg, Reg, u16) -> Op,
+    fn(Reg, u16, Reg) -> Op,
+);
+
 /// Compile a parsed main function.
 pub fn compile(f: &Func, heap: &mut Heap) -> R<Rc<Proto>> {
     let fc = Fc::new(f, heap, &[], Rc::from(&b""[..]));
@@ -224,6 +231,7 @@ impl<'a> Fc<'a> {
                 | Op::JmpCmpKR(_, _, _, o)
                 | Op::JmpIf(_, _, o)
                 | Op::ForLoop(_, o)
+                | Op::ForLoopUp(_, o)
                 | Op::TForPrep(_, o) => *o = off,
                 op => unreachable!("not a jump: {op:?}"),
             }
@@ -454,7 +462,7 @@ impl<'a> Fc<'a> {
                 self.line = *line;
                 // 5.0 primes the counter one step back, then enters at the loop test; the
                 // variables come into scope after, so an error here names no local.
-                self.emit(Op::Sub(base, base as Rk, base as Rk + 2));
+                self.emit(Op::Sub(base, base, base + 2));
                 let prep = self.jump();
                 self.activate(*var)?;
                 self.activate(*limit)?;
@@ -464,7 +472,17 @@ impl<'a> Fc<'a> {
                 self.block(body)?;
                 self.patch_here(&[prep]);
                 self.line = *line;
-                let l = self.emit(Op::ForLoop(base, 0));
+                // A missing step is 1; a positive literal one tests `<=` alone.
+                let up = match step_e {
+                    None => true,
+                    Some(Expr::Num(n)) => *n > 0.0,
+                    _ => false,
+                };
+                let l = self.emit(if up {
+                    Op::ForLoopUp(base, 0)
+                } else {
+                    Op::ForLoop(base, 0)
+                });
                 self.patch_to(&[l], body_start);
                 let breaks = self.leave_scope();
                 self.patch_here(&breaks);
@@ -929,23 +947,30 @@ impl<'a> Fc<'a> {
                     self.emit(Op::Concat(dst, first, self.freereg - 1));
                 }
                 _ => {
-                    let make = match op {
-                        BinOp::Add => Op::Add,
-                        BinOp::Sub => Op::Sub,
-                        BinOp::Mul => Op::Mul,
-                        BinOp::Div => Op::Div,
-                        _ => Op::Pow,
-                    };
                     let rb = self.exp2rk(l)?;
                     let rc = self.exp2rk(r)?;
                     self.line = *line;
-                    let k = |x: Rk| x - RK_CONST;
-                    let op = match (op, rb < RK_CONST, rc >= RK_CONST) {
-                        (BinOp::Add, true, true) => Op::AddK(dst, rb as Reg, k(rc)),
-                        (BinOp::Sub, true, true) => Op::SubK(dst, rb as Reg, k(rc)),
-                        (BinOp::Mul, true, true) => Op::MulK(dst, rb as Reg, k(rc)),
-                        (BinOp::Div, true, true) => Op::DivK(dst, rb as Reg, k(rc)),
-                        _ => make(dst, rb, rc),
+                    let op = if *op == BinOp::Pow {
+                        Op::Pow(dst, rb, rc)
+                    } else {
+                        let k = |x: Rk| x - RK_CONST;
+                        let (kb, kc) = (rb >= RK_CONST, rc >= RK_CONST);
+                        let (rr, rk, kr): ArithOps = match op {
+                            BinOp::Add => (Op::Add, Op::AddK, Op::AddKR),
+                            BinOp::Sub => (Op::Sub, Op::SubK, Op::SubKR),
+                            BinOp::Mul => (Op::Mul, Op::MulK, Op::MulKR),
+                            _ => (Op::Div, Op::DivK, Op::DivKR),
+                        };
+                        match (kb, kc) {
+                            (false, false) => rr(dst, rb as Reg, rc as Reg),
+                            (false, true) => rk(dst, rb as Reg, k(rc)),
+                            (true, false) => kr(dst, k(rb), rc as Reg),
+                            // Two constants (5.0 folds none): the left one in a register.
+                            (true, true) => {
+                                let b = self.rk2reg(rb)?;
+                                rk(dst, b, k(rc))
+                            }
+                        }
                     };
                     self.emit(op);
                 }

@@ -1667,12 +1667,24 @@ impl Vm {
             }
             macro_rules! arith {
                 ($a:expr, $b:expr, $c:expr, $op:tt, $kind:expr) => {{
-                    if let (Some(x), Some(y)) = (rkref!($b).as_num(), rkref!($c).as_num()) {
+                    let (x, y) = (r!($b), r!($c));
+                    if let (Some(xn), Some(yn)) = (x.as_num(), y.as_num()) {
                         // Canonical numbers in, a canonical number out.
-                        r!($a) = Value::num_raw(x $op y);
+                        r!($a) = Value::num_raw(xn $op yn);
                     } else {
-                        let (x, y) = (rk!($b), rk!($c));
-                        let v = slow!(self.arith($kind, x, y, (rkreg!($b), rkreg!($c))))?;
+                        let v = slow!(self.arith($kind, x, y, (Some($b as usize), Some($c as usize))))?;
+                        r!($a) = v;
+                    }
+                }};
+            }
+            /// `K(b) op R(c)`, in source order for a metamethod and an error.
+            macro_rules! arithkr {
+                ($a:expr, $kx:expr, $c:expr, $op:tt, $kind:expr) => {{
+                    let (x, y) = (kv!($kx), r!($c));
+                    if let (Some(xn), Some(yn)) = (x.as_num(), y.as_num()) {
+                        r!($a) = Value::num_raw(xn $op yn);
+                    } else {
+                        let v = slow!(self.arith($kind, x, y, (None, Some($c as usize))))?;
                         r!($a) = v;
                     }
                 }};
@@ -1742,6 +1754,37 @@ impl Vm {
                         let x = r!($b);
                         let v = slow!(self.arith($kind, x, y, (Some($b as usize), None)))?;
                         r!($a) = v;
+                    }
+                }};
+            }
+            /// 5.0's `OP_FORLOOP` with its conversions and errors, for a loop whose registers are
+            /// not all numbers; the test follows the step's sign.
+            macro_rules! for_slow {
+                ($a:expr, $off:expr) => {{
+                    let (a, off) = ($a, $off);
+                    save!();
+                    if !matches!((r!(a)).unpack(), V::Num(_)) {
+                        return Err(self.rt_error("`for' initial value must be a number"));
+                    }
+                    let Some(limit) = self.tonumber(r!(a + 1)) else {
+                        return Err(self.rt_error("`for' limit must be a number"));
+                    };
+                    let Some(step) = self.tonumber(r!(a + 2)) else {
+                        return Err(self.rt_error("`for' step must be a number"));
+                    };
+                    r!(a + 1) = Value::Num(limit);
+                    r!(a + 2) = Value::Num(step);
+                    let V::Num(idx) = (r!(a)).unpack() else {
+                        unreachable!()
+                    };
+                    let idx = idx + step;
+                    if if step > 0.0 {
+                        idx <= limit
+                    } else {
+                        idx >= limit
+                    } {
+                        jump!(off);
+                        r!(a) = Value::num_raw(idx);
                     }
                 }};
             }
@@ -1927,6 +1970,10 @@ impl Vm {
                     Op::SubK(a, b, kx) => arithk!(a, b, kx, -, Arith::Sub),
                     Op::MulK(a, b, kx) => arithk!(a, b, kx, *, Arith::Mul),
                     Op::DivK(a, b, kx) => arithk!(a, b, kx, /, Arith::Div),
+                    Op::AddKR(a, kx, c) => arithkr!(a, kx, c, +, Arith::Add),
+                    Op::SubKR(a, kx, c) => arithkr!(a, kx, c, -, Arith::Sub),
+                    Op::MulKR(a, kx, c) => arithkr!(a, kx, c, *, Arith::Mul),
+                    Op::DivKR(a, kx, c) => arithkr!(a, kx, c, /, Arith::Div),
                     Op::JmpCmpK(cj, b, kx, off) => cmpk!(cj.cmp(), cj.cond(), r!(b), kv!(kx), off),
                     Op::JmpCmpKR(cj, kx, c, off) => cmpk!(cj.cmp(), cj.cond(), kv!(kx), r!(c), off),
                     Op::Pow(a, b, c) => {
@@ -2113,6 +2160,20 @@ impl Vm {
                         ret!(a, n);
                     }
                     Op::Return1(a) => ret!(a, 1),
+                    Op::ForLoopUp(a, off) => {
+                        if let (Some(idx), Some(limit), Some(step)) =
+                            (r!(a).as_num(), r!(a + 1).as_num(), r!(a + 2).as_num())
+                        {
+                            let idx = idx + step;
+                            if idx <= limit {
+                                jump!(off);
+                                r!(a) = Value::num_raw(idx);
+                            }
+                            continue;
+                        }
+                        // A non-number: `ForLoop`'s path, which converts or raises.
+                        for_slow!(a, off);
+                    }
                     Op::ForLoop(a, off) => {
                         // Three numbers already: the step alone, nothing to convert back.
                         if let (Some(idx), Some(limit), Some(step)) =
@@ -2129,30 +2190,7 @@ impl Vm {
                             }
                             continue;
                         }
-                        save!();
-                        if !matches!((r!(a)).unpack(), V::Num(_)) {
-                            return Err(self.rt_error("`for' initial value must be a number"));
-                        }
-                        let Some(limit) = self.tonumber(r!(a + 1)) else {
-                            return Err(self.rt_error("`for' limit must be a number"));
-                        };
-                        let Some(step) = self.tonumber(r!(a + 2)) else {
-                            return Err(self.rt_error("`for' step must be a number"));
-                        };
-                        r!(a + 1) = Value::Num(limit);
-                        r!(a + 2) = Value::Num(step);
-                        let V::Num(idx) = (r!(a)).unpack() else {
-                            unreachable!()
-                        };
-                        let idx = idx + step;
-                        if if step > 0.0 {
-                            idx <= limit
-                        } else {
-                            idx >= limit
-                        } {
-                            jump!(off);
-                            r!(a) = Value::num_raw(idx);
-                        }
+                        for_slow!(a, off);
                     }
                     Op::TForPrep(a, off) => {
                         if let V::Table(_) = (r!(a)).unpack() {
@@ -2327,6 +2365,10 @@ fn symbexec(p: &Proto, lastpc: usize, reg: usize) -> Option<usize> {
             | Op::SubK(a, ..)
             | Op::MulK(a, ..)
             | Op::DivK(a, ..)
+            | Op::AddKR(a, ..)
+            | Op::SubKR(a, ..)
+            | Op::MulKR(a, ..)
+            | Op::DivKR(a, ..)
             | Op::Unm(a, _)
             | Op::Not(a, _)
             | Op::Concat(a, ..)
@@ -2334,7 +2376,7 @@ fn symbexec(p: &Proto, lastpc: usize, reg: usize) -> Option<usize> {
             Op::LoadNil(a, b) => (a as usize..=b as usize).contains(&reg),
             Op::SelfOp(a, ..) => writes(a, 2),
             Op::Call(a, ..) | Op::TailCall(a, ..) => reg >= a as usize,
-            Op::ForLoop(a, _) => writes(a, 1),
+            Op::ForLoop(a, _) | Op::ForLoopUp(a, _) => writes(a, 1),
             Op::TForLoop(a, n) => reg >= a as usize + 2 && reg < a as usize + 2 + n as usize,
             _ => false,
         };
