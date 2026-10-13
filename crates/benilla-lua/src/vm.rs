@@ -46,6 +46,8 @@ struct Frame {
     /// The constant table and register count, so resuming the frame reads no prototype.
     consts: *const Value,
     maxstack: u16,
+    /// The chunk this frame's code came from (`Heap::sources`).
+    source: u32,
     /// Tail calls this frame replaced, which 5.0 counts as stack levels.
     tailcalls: u32,
     /// Returning from this frame ends the `execute` that entered it.
@@ -127,7 +129,14 @@ pub struct Vm {
     root_free: Vec<u32>,
     /// The instruction-budget hook, and whether one is set (read where loops and calls pass).
     hook: Option<Hook>,
+    /// A hook or a profile is on: the flag the dispatch loop tests.
     hooked: bool,
+    /// Time charged to each chunk while profiling (`set_profiling`).
+    pub profile: Option<Box<Profile>>,
+    /// The embedding host's handle to its own state, which a host closure reads at each call
+    /// instead of capturing it, so a cloned VM's closures reach the clone's host. Weak, so the
+    /// host owning this VM makes no cycle.
+    pub host: Option<std::rc::Weak<dyn std::any::Any>>,
 }
 
 /// The host's hook body; an error it answers is raised where the hook ran.
@@ -141,6 +150,39 @@ pub struct Hook {
     pub step: u64,
     pub f: HookFn,
     counted: u64,
+}
+
+/// Wall time charged to each chunk (`Heap::sources`, by id). A switch between chunks (a call, a
+/// return) and every loop back-edge closes the running segment and charges it to the chunk that
+/// ran it; time in a host function goes to the chunk that called it; time outside Lua to none.
+#[derive(Clone, Debug, Default)]
+pub struct Profile {
+    pub ns: Vec<u64>,
+    /// Segments charged: calls into and returns to each chunk, and its loop iterations.
+    pub segments: Vec<u64>,
+    last: Option<(std::time::Instant, u32)>,
+}
+
+impl Profile {
+    fn mark(&mut self, now: std::time::Instant, source: u32) {
+        if let Some((t, s)) = self.last {
+            let s = s as usize;
+            if self.ns.len() <= s {
+                self.ns.resize(s + 1, 0);
+                self.segments.resize(s + 1, 0);
+            }
+            self.ns[s] += now.duration_since(t).as_nanos() as u64;
+            self.segments[s] += 1;
+        }
+        self.last = Some((now, source));
+    }
+
+    /// Close the running segment: execution left Lua.
+    fn close(&mut self) {
+        let now = std::time::Instant::now();
+        self.mark(now, 0);
+        self.last = None;
+    }
 }
 
 /// One stack level, as `lua_getinfo` describes it with `"Snl"`.
@@ -217,6 +259,8 @@ impl Vm {
             root_free: Vec::new(),
             hook: None,
             hooked: false,
+            profile: None,
+            host: None,
         };
         vm.heap.threshold = 2 * vm.heap.bytes.max(32 * 1024);
         vm
@@ -962,6 +1006,18 @@ impl Vm {
     /// Call the function at `func_idx` with the `nargs` values above it; its results replace
     /// them, `top` just past the last. Runs a Lua function to completion.
     pub fn call_at(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<(), LuaError> {
+        // From the host into Lua: a profile charges what runs until it is back out.
+        let outer = self.frames.is_empty();
+        let r = self.call_at_inner(func_idx, nargs, nres);
+        if outer {
+            if let Some(p) = self.profile.as_mut() {
+                p.close();
+            }
+        }
+        r
+    }
+
+    fn call_at_inner(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<(), LuaError> {
         self.c_depth += 1;
         if self.c_depth >= MAXCCALLS {
             self.c_depth -= 1;
@@ -1088,6 +1144,7 @@ impl Vm {
                     nresults: nres,
                     consts: proto.consts.as_ptr(),
                     maxstack: proto.maxstack,
+                    source: proto.source_id,
                     proto: pp,
                     upvals: fup.cast::<u32>(),
                     env: fenv,
@@ -1108,6 +1165,7 @@ impl Vm {
                     nresults: nres,
                     consts: std::ptr::null(),
                     maxstack: 0,
+                    source: self.heap.cur_source,
                     proto: std::ptr::null(),
                     upvals: std::ptr::null(),
                     env: self.globals,
@@ -1224,13 +1282,37 @@ impl Vm {
 
     pub fn remove_hook(&mut self) {
         self.hook = None;
-        self.hooked = false;
+        self.hooked = self.profile.is_some();
+    }
+
+    /// Start or stop charging time to chunks; starting keeps what was charged so far.
+    pub fn set_profiling(&mut self, on: bool) {
+        if on {
+            self.profile.get_or_insert_with(Default::default);
+        } else {
+            self.profile = None;
+        }
+        self.hooked = self.hook.is_some() || self.profile.is_some();
+    }
+
+    /// The running chunk changed: close the segment and open one for it.
+    #[cold]
+    #[inline(never)]
+    fn prof_switch(&mut self) {
+        let src = self.heap.cur_source;
+        if let Some(p) = self.profile.as_mut() {
+            p.mark(std::time::Instant::now(), src);
+        }
     }
 
     /// `n` more instructions ran; past the step, the hook runs.
     #[cold]
     #[inline(never)]
     fn hook_count(&mut self, n: u64) -> Result<(), LuaError> {
+        let src = self.heap.cur_source;
+        if let Some(p) = self.profile.as_mut() {
+            p.mark(std::time::Instant::now(), src);
+        }
         let Some(h) = self.hook.as_mut() else {
             return Ok(());
         };
@@ -1455,6 +1537,10 @@ impl Vm {
                 env_gen = self.fenv_gen.wrapping_sub(1);
                 k = frame.consts;
                 maxstack = frame.maxstack as usize;
+                self.heap.cur_source = frame.source;
+                if self.hooked {
+                    self.prof_switch();
+                }
                 // SAFETY: `precall` grew the stack to cover `base + maxstack`, and the stack never
                 // shrinks.
                 regs = unsafe { self.stack.as_mut_ptr().add(base) };
@@ -1869,6 +1955,7 @@ impl Vm {
                                         nresults: c as i32 - 1,
                                         consts: shape.consts,
                                         maxstack: shape.maxstack,
+                                        source: shape.source,
                                         proto: Rc::as_ptr(p),
                                         upvals: fup.as_ptr(),
                                         env: *fenv,
@@ -1895,6 +1982,10 @@ impl Vm {
                                     env_gen = self.fenv_gen;
                                     k = consts;
                                     maxstack = ftop - nbase;
+                                    self.heap.cur_source = frame.source;
+                                    if self.hooked {
+                                        self.prof_switch();
+                                    }
                                     refresh!();
                                     continue;
                                 }

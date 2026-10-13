@@ -122,6 +122,8 @@ pub struct Proto {
     /// The function's identity within its chunk, stable across edits that leave its name and
     /// nesting alone: `Frame:OnEvent`, `local helper`, `Init/anon#2`. Hot reload matches on it.
     pub key: Bytes,
+    /// `source`'s id in the heap's chunk list, for profiles and memory censuses.
+    pub source_id: u32,
 }
 
 impl Proto {

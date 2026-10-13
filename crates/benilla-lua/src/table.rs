@@ -38,6 +38,8 @@ pub struct Table {
     pub setn: Option<usize>,
     /// The weak mode the last collection found: bit 0 keys, bit 1 values.
     pub(crate) weak: u8,
+    /// The chunk whose code made this table (`Heap::sources`), for a memory census.
+    pub owner: u32,
 }
 
 /// The result of a key lookup: where its slot is, if it has one.
@@ -102,6 +104,7 @@ impl Table {
             flags: 0,
             setn: None,
             weak: 0,
+            owner: 0,
         };
         t.array.resize(narray, Value::Nil);
         t.set_node_vector(lnhash);

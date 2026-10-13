@@ -27,6 +27,9 @@ mod error;
 pub use conv::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti};
 pub use error::{Error, ErrorContext, ExternalError, Result};
 
+/// The interpreter underneath, for code that works below this API.
+pub use benilla_lua;
+
 pub type Integer = i64;
 pub type Number = f64;
 
@@ -64,13 +67,39 @@ impl Default for Lua {
 impl Lua {
     /// A state with 1.12's libraries open.
     pub fn new() -> Lua {
-        let mut vm = Box::new(benilla_lua::new_state());
+        Lua::over(Box::new(benilla_lua::new_state()))
+    }
+
+    /// A state over `vm`, which learns its host here.
+    fn over(mut vm: Box<Vm>) -> Lua {
         let ptr: *mut Vm = &mut *vm;
-        Lua(Rc::new(Inner {
+        let lua = Lua(Rc::new(Inner {
             _owned: UnsafeCell::new(vm),
             cur: Cell::new(ptr),
             app: RefCell::new(HashMap::new()),
-        }))
+        }));
+        let host: std::rc::Weak<dyn Any> = Rc::downgrade(&lua.0) as std::rc::Weak<dyn Any>;
+        lua.vm().host = Some(host);
+        lua
+    }
+
+    /// The state a host closure runs in: the one the VM it was handed belongs to, so a forked
+    /// VM's closures reach the fork.
+    fn of_vm(vm: &Vm) -> Lua {
+        let any = vm
+            .host
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+            .expect("a VM called back after its Lua state was dropped");
+        Lua(any.downcast::<Inner>().expect("a benilla-mlua VM"))
+    }
+
+    /// An independent copy of this state: the whole VM, every value and closure, with no host
+    /// data; the caller copies the host data it needs (`set_app_data`). A snapshot to restore
+    /// from, or a template to start many runs from.
+    pub fn fork(&self) -> Lua {
+        let vm: Vm = self.vm().clone();
+        Lua::over(Box::new(vm))
     }
 
     /// The VM in effect. Every use is short and holds nothing across a call into Lua.
@@ -189,9 +218,8 @@ impl Lua {
         A: FromLuaMulti,
         R: IntoLuaMulti,
     {
-        let weak = Rc::downgrade(&self.0);
         let host: HostFn = Rc::new(move |vm: &mut Vm, nargs: usize| {
-            let lua = Lua(weak.upgrade().expect("a callback outlived its Lua state"));
+            let lua = Lua::of_vm(vm);
             let prev = lua.0.cur.replace(vm as *mut Vm);
             let res = (|| {
                 let args: MultiValue = lua
@@ -402,11 +430,10 @@ impl Lua {
         F: Fn(&Lua, &Debug) -> Result<VmState> + 'static,
     {
         let step = triggers.every_nth_instruction.unwrap_or(1_000_000) as u64;
-        let weak = Rc::downgrade(&self.0);
         self.vm().set_hook(
             step,
             Rc::new(move |vm: &mut Vm| {
-                let lua = Lua(weak.upgrade().expect("a hook outlived its Lua state"));
+                let lua = Lua::of_vm(vm);
                 let prev = lua.0.cur.replace(vm as *mut Vm);
                 let info = lua.vm().frame_info(0).unwrap_or_default();
                 let r = callback(&lua, &Debug { info });

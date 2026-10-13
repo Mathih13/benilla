@@ -27,6 +27,8 @@ pub struct StrObj {
 /// reads it without following the prototype pointer.
 #[derive(Clone, Copy, Debug)]
 pub struct Shape {
+    /// The chunk the function was compiled from (`Heap::sources`).
+    pub source: u32,
     pub nparams: u8,
     pub vararg: bool,
     pub maxstack: u16,
@@ -40,6 +42,7 @@ pub struct Shape {
 impl Shape {
     pub fn of(p: &Proto) -> Shape {
         Shape {
+            source: p.source_id,
             nparams: p.nparams,
             vararg: p.vararg,
             maxstack: p.maxstack,
@@ -162,6 +165,14 @@ pub fn str_hash(s: &[u8]) -> u32 {
     h
 }
 
+/// One owner's share of the heap.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Census {
+    pub tables: usize,
+    pub functions: usize,
+    pub bytes: usize,
+}
+
 #[derive(Clone)]
 pub struct Heap {
     strs: Arena<StrObj>,
@@ -175,6 +186,12 @@ pub struct Heap {
     pub bytes: usize,
     /// 5.0's `GCthreshold`: a collection runs when `bytes` reaches it.
     pub threshold: usize,
+    /// Every chunk name a prototype was compiled under, by id: the owners a profile and a
+    /// memory census charge to.
+    pub sources: Vec<crate::ast::Bytes>,
+    source_ids: std::collections::HashMap<crate::ast::Bytes, u32>,
+    /// The chunk whose code runs now; a new table is charged to it.
+    pub cur_source: u32,
 }
 
 impl Default for Heap {
@@ -188,6 +205,10 @@ impl Default for Heap {
             users: Arena::default(),
             bytes: 0,
             threshold: 64 * 1024,
+            // Id 0 is the host: whatever no Lua chunk created.
+            sources: vec![Rc::from(&b"=[host]"[..])],
+            source_ids: Default::default(),
+            cur_source: 0,
         }
     }
 }
@@ -254,8 +275,39 @@ impl Heap {
 
     // ── tables ───────────────────────────────────────────────────────────────────────────────
 
+    /// The id of chunk name `name`, made on first sight.
+    pub fn source_id(&mut self, name: &crate::ast::Bytes) -> u32 {
+        if let Some(&id) = self.source_ids.get(name) {
+            return id;
+        }
+        let id = self.sources.len() as u32;
+        self.sources.push(name.clone());
+        self.source_ids.insert(name.clone(), id);
+        id
+    }
+
+    /// Bytes and objects per owner: each table to the chunk that made it, each closure to its
+    /// prototype's chunk. Indexed by source id.
+    pub fn census(&self) -> Vec<Census> {
+        let mut out = vec![Census::default(); self.sources.len()];
+        for t in self.tables.items.iter().flatten() {
+            let c = &mut out[t.owner as usize];
+            c.tables += 1;
+            c.bytes += t.bytes();
+        }
+        for f in self.funcs.items.iter().flatten() {
+            if let FuncObj::Lua { proto, upvals, .. } = f {
+                let c = &mut out[proto.source_id as usize];
+                c.functions += 1;
+                c.bytes += 48 + upvals.len() * 4;
+            }
+        }
+        out
+    }
+
     pub fn new_table(&mut self, narray: usize, lnhash: u8) -> TableRef {
-        let t = Table::new(narray, lnhash);
+        let mut t = Table::new(narray, lnhash);
+        t.owner = self.cur_source;
         self.bytes += t.bytes();
         TableRef(self.tables.alloc(t))
     }

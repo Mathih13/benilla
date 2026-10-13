@@ -193,6 +193,7 @@ impl<'a> Fc<'a> {
             line_defined: f.line_defined,
             locvars: self.locvars,
             key: self.key,
+            source_id: self.heap.source_id(&f.source),
         }))
     }
 
