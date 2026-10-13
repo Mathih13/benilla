@@ -430,11 +430,17 @@ impl Vm {
 
     // ── stack ────────────────────────────────────────────────────────────────────────────────
 
-    #[inline]
+    #[inline(always)]
     pub fn ensure(&mut self, n: usize) {
         if self.stack.len() < n {
-            self.stack.resize(n.next_power_of_two(), Value::Nil);
+            self.grow(n);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, n: usize) {
+        self.stack.resize(n.next_power_of_two(), Value::Nil);
     }
 
     pub fn push(&mut self, v: Value) {
@@ -1540,8 +1546,19 @@ impl Vm {
                             self.close_upvals(base);
                         }
                         let me = self.frames.pop().unwrap();
-                        self.poscall(me.func_idx, first, n, me.nresults);
+                        if me.nresults == 1 && n >= 1 {
+                            // One result, the common call in an expression.
+                            self.stack[me.func_idx] = r!(a);
+                        } else if me.nresults == 0 {
+                            // None, a call statement.
+                            self.top = me.func_idx;
+                        } else {
+                            self.poscall(me.func_idx, first, n, me.nresults);
+                        }
                         if me.boundary {
+                            if me.nresults == 1 && n >= 1 {
+                                self.top = me.func_idx + 1;
+                            }
                             return Ok(());
                         }
                         // Back in the calling Lua frame: a fixed result count restores its top.
