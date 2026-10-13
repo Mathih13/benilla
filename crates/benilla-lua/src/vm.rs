@@ -33,7 +33,10 @@ struct Frame {
     pc: usize,
     /// Results the caller wants; -1 for all.
     nresults: i32,
-    proto: Option<Rc<Proto>>,
+    /// The code this frame runs, null for a native. Valid while the frame exists: its closure is
+    /// a collector root, and a hot reload retires the code it replaces instead of dropping it
+    /// (`Vm::retired`).
+    proto: *const Proto,
     /// Tail calls this frame replaced, which 5.0 counts as stack levels.
     tailcalls: u32,
     /// Returning from this frame ends the `execute` that entered it.
@@ -82,6 +85,11 @@ pub struct Vm {
     pub rand_seed: u32,
     /// Collect at every safe point: a test switch that finds a value the roots miss.
     pub gc_stress: bool,
+    /// Code and upvalue lists a hot reload replaced, kept while a frame may still run them.
+    pub(crate) retired: Vec<(Rc<Proto>, Box<[u32]>)>,
+    /// Bumped by every `setfenv` of a Lua function, so a running frame's cached environment
+    /// knows to reread.
+    pub(crate) fenv_gen: u64,
 }
 
 /// What a call produced, for the dispatch loop.
@@ -138,6 +146,8 @@ impl Vm {
             handlers: Vec::new(),
             rand_seed: 1,
             gc_stress: false,
+            retired: Vec::new(),
+            fenv_gen: 0,
         };
         vm.heap.threshold = 2 * vm.heap.bytes.max(32 * 1024);
         vm
@@ -308,7 +318,8 @@ impl Vm {
             return Vec::new();
         };
         let f = &self.frames[fi];
-        match &f.proto {
+        // SAFETY: a live frame's code is alive (see `Frame::proto`).
+        match unsafe { f.proto.as_ref() } {
             Some(p) => {
                 let pc = f.pc.saturating_sub(1);
                 let line = p.lines.get(pc).copied().unwrap_or(0);
@@ -334,7 +345,7 @@ impl Vm {
                 return Some(Some(self.frames[i].func));
             }
             lv -= 1;
-            if self.frames[i].proto.is_some() {
+            if !self.frames[i].proto.is_null() {
                 lv -= self.frames[i].tailcalls as i64;
             }
             if lv < 0 {
@@ -342,6 +353,10 @@ impl Vm {
             }
         }
         None
+    }
+
+    pub(crate) fn frames_empty(&self) -> bool {
+        self.frames.is_empty()
     }
 
     pub(crate) fn native_base(&self) -> usize {
@@ -362,7 +377,7 @@ impl Vm {
                 return Some(i);
             }
             level -= 1;
-            if self.frames[i].proto.is_some() {
+            if !self.frames[i].proto.is_null() {
                 level -= self.frames[i].tailcalls as i64;
             }
             if level < 0 {
@@ -376,7 +391,8 @@ impl Vm {
     /// on, from the locals and a symbolic run of the code up to the current instruction.
     fn objname(&self, fi: usize, reg: usize) -> Option<(&'static str, Vec<u8>)> {
         let f = &self.frames[fi];
-        let p = f.proto.as_ref()?;
+        // SAFETY: a live frame's code is alive (see `Frame::proto`).
+        let p = unsafe { f.proto.as_ref() }?;
         let pc = f.pc.saturating_sub(1);
         objname_in(p, &self.heap, pc, reg)
     }
@@ -842,7 +858,7 @@ impl Vm {
                         let reg = self
                             .frames
                             .last()
-                            .filter(|f| f.proto.is_some())
+                            .filter(|f| !f.proto.is_null())
                             .map(|f| func_idx - f.base);
                         return Err(self.type_error(other, reg, "call"));
                     }
@@ -860,7 +876,10 @@ impl Vm {
         }
         match self.heap.func(fref) {
             FuncObj::Lua { proto, .. } => {
-                let proto = proto.clone();
+                let pp = Rc::as_ptr(proto);
+                // SAFETY: the closure being called holds this code, and the closure sits in the
+                // stack slot `func_idx` for the whole call.
+                let proto = unsafe { &*pp };
                 let base = func_idx + 1;
                 let np = proto.nparams as usize;
                 let frame_top = base + proto.maxstack as usize;
@@ -897,7 +916,7 @@ impl Vm {
                     base,
                     pc: 0,
                     nresults: nres,
-                    proto: Some(proto),
+                    proto: pp,
                     tailcalls: 0,
                     boundary: false,
                 });
@@ -913,7 +932,7 @@ impl Vm {
                     base,
                     pc: 0,
                     nresults: nres,
-                    proto: None,
+                    proto: std::ptr::null(),
                     tailcalls: 0,
                     boundary: false,
                 });
@@ -980,7 +999,8 @@ impl Vm {
         if me.tailcalls > 0 {
             return None;
         }
-        let p = caller.proto.as_ref()?;
+        // SAFETY: a live frame's code is alive (see `Frame::proto`).
+        let p = unsafe { caller.proto.as_ref() }?;
         let pc = caller.pc.checked_sub(1)?;
         match p.code.get(pc)? {
             Op::Call(a, ..) | Op::TailCall(a, ..) => objname_in(p, &self.heap, pc, *a as usize),
@@ -1076,10 +1096,20 @@ impl Vm {
     fn execute(&mut self) -> Result<(), LuaError> {
         'frame: loop {
             let fi = self.frames.len() - 1;
-            let proto = self.frames[fi].proto.clone().unwrap();
+            // SAFETY: the top frame is a Lua frame, and its code outlives it (`Frame::proto`).
+            let proto: &Proto = unsafe { &*self.frames[fi].proto };
             let base = self.frames[fi].base;
             let mut pc = self.frames[fi].pc;
             let fref = self.frames[fi].func;
+            // The closure's upvalue list and environment, read once per entry. The list lives in
+            // its own allocation, which a hot reload retires rather than frees.
+            let (upvals, mut env): (*const [u32], TableRef) = match self.heap.func(fref) {
+                FuncObj::Lua { upvals, env, .. } => (&**upvals, *env),
+                _ => unreachable!("a Lua frame"),
+            };
+            // SAFETY: as above.
+            let upvals: &[u32] = unsafe { &*upvals };
+            let mut env_gen = self.fenv_gen;
             let code = &proto.code[..];
             let k = &proto.consts[..];
             macro_rules! r {
@@ -1107,6 +1137,18 @@ impl Vm {
                     }
                 }};
             }
+            macro_rules! env {
+                () => {{
+                    if env_gen != self.fenv_gen {
+                        env_gen = self.fenv_gen;
+                        env = match self.heap.func(fref) {
+                            FuncObj::Lua { env, .. } => *env,
+                            _ => unreachable!(),
+                        };
+                    }
+                    env
+                }};
+            }
             macro_rules! save {
                 () => {
                     self.frames[fi].pc = pc
@@ -1125,25 +1167,15 @@ impl Vm {
                     }
                     Op::LoadBool(a, b) => r!(a) = Value::Bool(b),
                     Op::GetUpval(a, u) => {
-                        let uv = match self.heap.func(fref) {
-                            FuncObj::Lua { upvals, .. } => upvals[u as usize],
-                            _ => unreachable!(),
-                        };
-                        r!(a) = self.upval_get(uv);
+                        r!(a) = self.upval_get(upvals[u as usize]);
                     }
                     Op::SetUpval(a, u) => {
-                        let uv = match self.heap.func(fref) {
-                            FuncObj::Lua { upvals, .. } => upvals[u as usize],
-                            _ => unreachable!(),
-                        };
+                        let uv = upvals[u as usize];
                         let v = r!(a);
                         self.upval_set(uv, v);
                     }
                     Op::GetGlobal(a, kx) => {
-                        let env = match self.heap.func(fref) {
-                            FuncObj::Lua { env, .. } => *env,
-                            _ => unreachable!(),
-                        };
+                        let env = env!();
                         let key = k[kx as usize];
                         let v = self.heap.table(env).get(key);
                         r!(a) = if !v.is_nil() || self.heap.table(env).meta.is_none() {
@@ -1154,10 +1186,7 @@ impl Vm {
                         };
                     }
                     Op::SetGlobal(a, kx) => {
-                        let env = match self.heap.func(fref) {
-                            FuncObj::Lua { env, .. } => *env,
-                            _ => unreachable!(),
-                        };
+                        let env = env!();
                         save!();
                         let v = r!(a);
                         self.setindex(Value::Table(env), k[kx as usize], v, None)?;
@@ -1183,8 +1212,17 @@ impl Vm {
                         let v = rk!(c);
                         if let Value::Table(tr) = t {
                             let tab = self.heap.table_mut(tr);
-                            if tab.meta.is_none() && tab.set(key, v).is_ok() {
-                                continue;
+                            if tab.meta.is_none() {
+                                if tab.set(key, v).is_ok() {
+                                    continue;
+                                }
+                            } else if let Some(s) = tab.find(key) {
+                                // An existing value is overwritten raw: `__newindex` is only
+                                // consulted for a nil one.
+                                if !tab.slot(s).is_nil() {
+                                    *tab.slot_mut(s) = v;
+                                    continue;
+                                }
                             }
                         }
                         save!();
@@ -1369,13 +1407,29 @@ impl Vm {
                         // Back in the calling Lua frame: a fixed result count restores its top.
                         let caller = self.frames.last().unwrap();
                         if me.nresults >= 0 {
-                            let cp = caller.proto.as_ref().unwrap();
+                            // SAFETY: the caller is a live Lua frame (`Frame::proto`).
+                            let cp = unsafe { &*caller.proto };
                             self.top = caller.base + cp.maxstack as usize;
                         }
                         continue 'frame;
                     }
                     Op::ForLoop(a, off) => {
                         let ra = base + a as usize;
+                        // Three numbers already: the step alone, nothing to convert back.
+                        if let (Value::Num(idx), Value::Num(limit), Value::Num(step)) =
+                            (self.stack[ra], self.stack[ra + 1], self.stack[ra + 2])
+                        {
+                            let idx = idx + step;
+                            if if step > 0.0 {
+                                idx <= limit
+                            } else {
+                                idx >= limit
+                            } {
+                                pc = (pc as i32 + off) as usize;
+                                self.stack[ra] = Value::Num(idx);
+                            }
+                            continue;
+                        }
                         if !matches!(self.stack[ra], Value::Num(_)) {
                             save!();
                             return Err(self.rt_error("`for' initial value must be a number"));
@@ -1467,10 +1521,8 @@ impl Vm {
                     Op::Close(a) => self.close_upvals(base + a as usize),
                     Op::Closure(a, px) => {
                         let p = proto.protos[px as usize].clone();
-                        let (env, parent_upvals) = match self.heap.func(fref) {
-                            FuncObj::Lua { env, upvals, .. } => (*env, upvals.clone()),
-                            _ => unreachable!(),
-                        };
+                        let env = env!();
+                        let parent_upvals = upvals;
                         let mut ups = Vec::with_capacity(p.upvals.len());
                         for &(in_stack, idx) in &p.upvals {
                             ups.push(if in_stack {

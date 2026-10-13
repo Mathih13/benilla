@@ -48,6 +48,11 @@ impl Vm {
         walk(&root, &mut fresh);
         let mut report = Report::default();
         let mut seen: HashMap<Bytes, bool> = HashMap::new();
+        // Replaced code may still be running in a frame; it is kept until no Lua runs.
+        if self.frames_empty() {
+            self.retired.clear();
+        }
+        let mut retired = Vec::new();
         for f in self.heap.funcs_mut() {
             let FuncObj::Lua { proto, upvals, .. } = f else {
                 continue;
@@ -75,8 +80,9 @@ impl Vm {
                 .collect();
             match remap {
                 Some(ups) => {
-                    *proto = new.clone();
-                    *upvals = ups.into_boxed_slice();
+                    let old_proto = std::mem::replace(proto, new.clone());
+                    let old_ups = std::mem::replace(upvals, ups.into_boxed_slice());
+                    retired.push((old_proto, old_ups));
                     report.closures += 1;
                     seen.insert(key, true);
                 }
@@ -86,6 +92,7 @@ impl Vm {
                 }
             }
         }
+        self.retired.extend(retired);
         for (k, swapped) in &seen {
             if *swapped {
                 report.swapped.push(show(k));

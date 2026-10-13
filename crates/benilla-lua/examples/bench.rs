@@ -27,6 +27,18 @@ fn time<F: FnMut()>(mut f: F) -> f64 {
 }
 
 fn main() {
+    // `bench <name>`: that workload alone in this interpreter, for a profiler.
+    if let Some(only) = std::env::args().nth(1) {
+        let (_, src) = WORKLOADS
+            .iter()
+            .find(|(n, _)| n.contains(&only))
+            .expect("a workload name");
+        for _ in 0..5 {
+            let mut vm = benilla_lua::new_state();
+            vm.exec(src.as_bytes(), b"=bench").expect("runs");
+        }
+        return;
+    }
     println!(
         "{:<28} {:>10} {:>10} {:>8}",
         "workload", "ours ms", "fork ms", "ratio"

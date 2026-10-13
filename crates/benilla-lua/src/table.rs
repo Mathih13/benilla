@@ -222,8 +222,25 @@ impl Table {
     }
 
     /// A raw read.
+    #[inline]
     pub fn get(&self, key: Value) -> Value {
+        if let Some(i) = self.array_index(key) {
+            return self.array[i];
+        }
         self.find(key).map_or(Value::Nil, |s| self.slot(s))
+    }
+
+    /// The array slot an integer key lands in, if the array part holds it.
+    #[inline]
+    fn array_index(&self, key: Value) -> Option<usize> {
+        if let Value::Num(n) = key {
+            let k = n as i32;
+            let i = (k as usize).wrapping_sub(1);
+            if k as f64 == n && i < self.array.len() {
+                return Some(i);
+            }
+        }
+        None
     }
 
     pub fn get_int(&self, k: i32) -> Value {
@@ -231,7 +248,13 @@ impl Table {
     }
 
     /// `luaH_set` then the store: a raw write.
+    #[inline]
     pub fn set(&mut self, key: Value, val: Value) -> Result<(), KeyError> {
+        if let Some(i) = self.array_index(key) {
+            self.flags = 0;
+            self.array[i] = val;
+            return Ok(());
+        }
         let s = self.slot_for(key)?;
         *self.slot_mut(s) = val;
         Ok(())

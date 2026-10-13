@@ -77,6 +77,11 @@ pub fn fmt_g14(n: f64) -> String {
 
 /// `%.<prec>g` in MSVC's spelling.
 pub fn fmt_g(n: f64, prec: usize) -> String {
+    // An integer below `10^prec` prints as its digits: the common case, without float
+    // formatting's exact-decimal arithmetic.
+    if n.fract() == 0.0 && n.abs() < 10f64.powi(prec as i32) && n != 0.0 {
+        return (n as i64).to_string();
+    }
     if n.is_nan() {
         // x87's default NaN has the sign bit set and prints as the indefinite.
         return if n.is_sign_negative() {
