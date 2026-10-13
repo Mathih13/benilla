@@ -27,15 +27,23 @@ fn time<F: FnMut()>(mut f: F) -> f64 {
 }
 
 fn main() {
-    // `bench <name>`: that workload alone in this interpreter, for a profiler.
+    // `bench <name> [fork]`: that workload alone, five times, in this interpreter or the fork,
+    // for a profiler.
     if let Some(only) = std::env::args().nth(1) {
         let (_, src) = WORKLOADS
             .iter()
             .find(|(n, _)| n.contains(&only))
             .expect("a workload name");
+        let fork = std::env::args().nth(2).is_some_and(|a| a == "fork");
         for _ in 0..5 {
-            let mut vm = benilla_lua::new_state();
-            vm.exec(src.as_bytes(), b"=bench").expect("runs");
+            if fork {
+                let lua = mlua::Lua::new();
+                lua.load("math.mod = math.fmod").exec().unwrap();
+                let _: mlua::Value = lua.load(*src).eval().expect("runs");
+            } else {
+                let mut vm = benilla_lua::new_state();
+                vm.exec(src.as_bytes(), b"=bench").expect("runs");
+            }
         }
         return;
     }

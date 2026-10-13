@@ -230,6 +230,37 @@ impl Table {
         self.find(key).map_or(Value::Nil, |s| self.slot(s))
     }
 
+    /// [`Table::get`] with the key read in place.
+    #[inline(always)]
+    pub fn get_ref(&self, key: &Value) -> Value {
+        match *key {
+            Value::Num(n) => {
+                let k = n as i32;
+                let i = (k as usize).wrapping_sub(1);
+                if k as f64 == n && i < self.array.len() {
+                    return self.array[i];
+                }
+            }
+            Value::Str(s) => {
+                let mut i = s.hash as usize & (self.node.len() - 1);
+                loop {
+                    let n = &self.node[i];
+                    if let Value::Str(k) = n.key {
+                        if k.id == s.id {
+                            return n.val;
+                        }
+                    }
+                    if n.next < 0 {
+                        return Value::Nil;
+                    }
+                    i = n.next as usize;
+                }
+            }
+            _ => {}
+        }
+        self.get(*key)
+    }
+
     /// The array slot an integer key lands in, if the array part holds it.
     #[inline]
     fn array_index(&self, key: Value) -> Option<usize> {

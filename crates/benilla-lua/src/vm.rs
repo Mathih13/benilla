@@ -906,8 +906,14 @@ impl Vm {
                 } else if nargs > np {
                     fill_from = base + np;
                 }
-                for v in &mut self.stack[fill_from.min(frame_top)..frame_top] {
-                    *v = Value::Nil;
+                // Missing parameters are nil. The registers above are not cleared, as C Lua
+                // clears them: the compiler writes each before reading it, and the collector
+                // skips a stale handle (`Heap::collect`).
+                let params_end = base + np;
+                if fill_from < params_end {
+                    for v in &mut self.stack[fill_from..params_end] {
+                        *v = Value::Nil;
+                    }
                 }
                 self.top = frame_top;
                 self.frames.push(Frame {
@@ -947,6 +953,12 @@ impl Vm {
 
     /// 5.0's `luaD_poscall`: `n` results from `first` move to `dest`, adjusted to `wanted`.
     fn poscall(&mut self, dest: usize, first: usize, n: usize, wanted: i32) {
+        // One result wanted, at least one given: the common call in an expression.
+        if wanted == 1 && n >= 1 {
+            self.stack[dest] = self.stack[first];
+            self.top = dest + 1;
+            return;
+        }
         if wanted < 0 {
             self.stack.copy_within(first..first + n, dest);
             self.top = dest + n;
@@ -1093,6 +1105,10 @@ impl Vm {
     // ── the interpreter ──────────────────────────────────────────────────────────────────────
 
     /// Run the top Lua frame until the frame that entered with `boundary` returns.
+    ///
+    /// The register file is addressed through `regs`, a raw pointer to `stack[base]`, as C Lua
+    /// keeps `base` in a register. Anything that can grow the stack (a call, a metamethod, an
+    /// upvalue that touches the stack) is followed by `refresh!`, which recomputes it.
     fn execute(&mut self) -> Result<(), LuaError> {
         'frame: loop {
             let fi = self.frames.len() - 1;
@@ -1112,18 +1128,55 @@ impl Vm {
             let mut env_gen = self.fenv_gen;
             let code = &proto.code[..];
             let k = &proto.consts[..];
+            let maxstack = proto.maxstack as usize;
+            // SAFETY: `precall` grew the stack to cover `base + maxstack`, and the stack never
+            // shrinks.
+            let mut regs: *mut Value = unsafe { self.stack.as_mut_ptr().add(base) };
+            macro_rules! refresh {
+                () => {
+                    // SAFETY: as above.
+                    regs = unsafe { self.stack.as_mut_ptr().add(base) }
+                };
+            }
+            // SAFETY for `r!`: `regs` is current (see above), and the compiler addresses no
+            // register at or past `maxstack` (`Fc::reserve`, `Fc::need`).
             macro_rules! r {
                 ($x:expr) => {
-                    self.stack[base + $x as usize]
+                    *{
+                        let i = $x as usize;
+                        debug_assert!(i < maxstack && base + i < self.stack.len());
+                        unsafe { &mut *regs.add(i) }
+                    }
                 };
             }
             macro_rules! rk {
                 ($x:expr) => {{
                     let x: Rk = $x;
                     if x >= RK_CONST {
-                        k[(x - RK_CONST) as usize]
+                        // SAFETY: the compiler only encodes constants this function has.
+                        let i = (x - RK_CONST) as usize;
+                        debug_assert!(i < k.len());
+                        unsafe { *k.get_unchecked(i) }
                     } else {
-                        self.stack[base + x as usize]
+                        r!(x)
+                    }
+                }};
+            }
+            // `rk!` by reference: a fast path reads the tag and payload in place instead of
+            // copying the value out.
+            macro_rules! rkref {
+                ($x:expr) => {{
+                    let x: Rk = $x;
+                    if x >= RK_CONST {
+                        let i = (x - RK_CONST) as usize;
+                        debug_assert!(i < k.len());
+                        // SAFETY: as `rk!`.
+                        unsafe { k.get_unchecked(i) }
+                    } else {
+                        let i = x as usize;
+                        debug_assert!(i < maxstack && base + i < self.stack.len());
+                        // SAFETY: as `r!`.
+                        unsafe { &*regs.add(i) }
                     }
                 }};
             }
@@ -1154,63 +1207,93 @@ impl Vm {
                     self.frames[fi].pc = pc
                 };
             }
+            /// A call that may run Lua: the pc saved first, the registers refreshed after.
+            macro_rules! slow {
+                ($e:expr) => {{
+                    save!();
+                    let v = $e;
+                    refresh!();
+                    v
+                }};
+            }
+            macro_rules! arith {
+                ($a:expr, $b:expr, $c:expr, $op:tt, $kind:expr) => {{
+                    if let (&Value::Num(x), &Value::Num(y)) = (rkref!($b), rkref!($c)) {
+                        r!($a) = Value::Num(x $op y);
+                    } else {
+                        let (x, y) = (rk!($b), rk!($c));
+                        let v = slow!(self.arith($kind, x, y, (rkreg!($b), rkreg!($c))))?;
+                        r!($a) = v;
+                    }
+                }};
+            }
+            macro_rules! jump {
+                ($off:expr) => {
+                    pc = (pc as isize + $off as isize) as usize
+                };
+            }
             loop {
-                let op = code[pc];
+                debug_assert!(pc < code.len());
+                // SAFETY: every function ends in `Return`, and every jump lands inside it.
+                let op = unsafe { *code.get_unchecked(pc) };
                 pc += 1;
                 match op {
                     Op::Move(a, b) => r!(a) = r!(b),
                     Op::LoadK(a, kx) => r!(a) = k[kx as usize],
                     Op::LoadNil(a, b) => {
-                        for v in &mut self.stack[base + a as usize..=base + b as usize] {
-                            *v = Value::Nil;
+                        for i in a..=b {
+                            r!(i) = Value::Nil;
                         }
                     }
                     Op::LoadBool(a, b) => r!(a) = Value::Bool(b),
                     Op::GetUpval(a, u) => {
-                        r!(a) = self.upval_get(upvals[u as usize]);
+                        let v = self.upval_get(upvals[u as usize]);
+                        r!(a) = v;
                     }
                     Op::SetUpval(a, u) => {
-                        let uv = upvals[u as usize];
                         let v = r!(a);
-                        self.upval_set(uv, v);
+                        self.upval_set(upvals[u as usize], v);
+                        refresh!();
                     }
                     Op::GetGlobal(a, kx) => {
                         let env = env!();
                         let key = k[kx as usize];
-                        let v = self.heap.table(env).get(key);
-                        r!(a) = if !v.is_nil() || self.heap.table(env).meta.is_none() {
-                            v
+                        let tab = self.heap.table(env);
+                        let v = tab.get(key);
+                        if !v.is_nil() || tab.meta.is_none() {
+                            r!(a) = v;
                         } else {
-                            save!();
-                            self.index(Value::Table(env), key, None)?
-                        };
+                            let v = slow!(self.index(Value::Table(env), key, None))?;
+                            r!(a) = v;
+                        }
                     }
                     Op::SetGlobal(a, kx) => {
                         let env = env!();
-                        save!();
                         let v = r!(a);
-                        self.setindex(Value::Table(env), k[kx as usize], v, None)?;
+                        let key = k[kx as usize];
+                        let tab = self.heap.table_mut(env);
+                        if tab.meta.is_none() && tab.set(key, v).is_ok() {
+                            continue;
+                        }
+                        slow!(self.setindex(Value::Table(env), key, v, None))?;
                     }
                     Op::GetTable(a, b, c) => {
-                        let t = r!(b);
-                        let key = rk!(c);
-                        if let Value::Table(tr) = t {
+                        if let &Value::Table(tr) = &r!(b) {
                             let tab = self.heap.table(tr);
-                            let v = tab.get(key);
+                            let v = tab.get_ref(rkref!(c));
                             if !v.is_nil() || tab.meta.is_none() {
                                 r!(a) = v;
                                 continue;
                             }
                         }
-                        save!();
-                        let v = self.index(t, key, Some(b as usize))?;
+                        let (t, key) = (r!(b), rk!(c));
+                        let v = slow!(self.index(t, key, Some(b as usize)))?;
                         r!(a) = v;
                     }
                     Op::SetTable(a, b, c) => {
-                        let t = r!(a);
                         let key = rk!(b);
                         let v = rk!(c);
-                        if let Value::Table(tr) = t {
+                        if let &Value::Table(tr) = &r!(a) {
                             let tab = self.heap.table_mut(tr);
                             if tab.meta.is_none() {
                                 if tab.set(key, v).is_ok() {
@@ -1225,50 +1308,39 @@ impl Vm {
                                 }
                             }
                         }
-                        save!();
-                        self.setindex(t, key, v, Some(a as usize))?;
+                        let t = r!(a);
+                        slow!(self.setindex(t, key, v, Some(a as usize)))?;
                     }
                     Op::NewTable(a, b, c) => {
                         let t = self.heap.new_table(b as usize, c);
                         r!(a) = Value::Table(t);
                         save!();
-                        self.top = base + proto.maxstack as usize;
+                        self.top = base + maxstack;
                         self.check_gc();
                     }
                     Op::SelfOp(a, b, c) => {
                         let obj = r!(b);
-                        let key = rk!(c);
                         r!(a + 1) = obj;
-                        if let Value::Table(tr) = obj {
+                        if let &Value::Table(tr) = &r!(b) {
                             let tab = self.heap.table(tr);
-                            let v = tab.get(key);
+                            let v = tab.get_ref(rkref!(c));
                             if !v.is_nil() || tab.meta.is_none() {
                                 r!(a) = v;
                                 continue;
                             }
                         }
-                        save!();
-                        let v = self.index(obj, key, Some(b as usize))?;
+                        let key = rk!(c);
+                        let v = slow!(self.index(obj, key, Some(b as usize)))?;
                         r!(a) = v;
                     }
-                    Op::Arith(op, a, b, c) => {
-                        let x = rk!(b);
-                        let y = rk!(c);
-                        if let (Value::Num(x), Value::Num(y)) = (x, y) {
-                            let v = match op {
-                                Arith::Add => Some(x + y),
-                                Arith::Sub => Some(x - y),
-                                Arith::Mul => Some(x * y),
-                                Arith::Div => Some(x / y),
-                                Arith::Pow => None,
-                            };
-                            if let Some(v) = v {
-                                r!(a) = Value::Num(v);
-                                continue;
-                            }
-                        }
-                        save!();
-                        let v = self.arith(op, x, y, (rkreg!(b), rkreg!(c)))?;
+                    Op::Add(a, b, c) => arith!(a, b, c, +, Arith::Add),
+                    Op::Sub(a, b, c) => arith!(a, b, c, -, Arith::Sub),
+                    Op::Mul(a, b, c) => arith!(a, b, c, *, Arith::Mul),
+                    Op::Div(a, b, c) => arith!(a, b, c, /, Arith::Div),
+                    Op::Pow(a, b, c) => {
+                        // 5.0's `^` always goes through the global `__pow`.
+                        let (x, y) = (rk!(b), rk!(c));
+                        let v = slow!(self.arith(Arith::Pow, x, y, (rkreg!(b), rkreg!(c))))?;
                         r!(a) = v;
                     }
                     Op::Unm(a, b) => {
@@ -1276,9 +1348,8 @@ impl Vm {
                         match self.tonumber(x) {
                             Some(n) => r!(a) = Value::Num(-n),
                             None => {
-                                save!();
                                 let unm = self.names.unm;
-                                match self.bin_tm(x, Value::Nil, unm)? {
+                                match slow!(self.bin_tm(x, Value::Nil, unm))? {
                                     Some(v) => r!(a) = v,
                                     None => {
                                         return Err(self.type_error(
@@ -1291,45 +1362,35 @@ impl Vm {
                             }
                         }
                     }
-                    Op::Not(a, b) => r!(a) = Value::Bool(!r!(b).truthy()),
+                    Op::Not(a, b) => r!(a) = Value::Bool(!r!(b).truthy_ref()),
                     Op::Concat(a, b, c) => {
-                        save!();
-                        self.top = base + proto.maxstack as usize;
-                        self.concat(base + b as usize, base + c as usize)?;
+                        self.top = base + maxstack;
+                        slow!(self.concat(base + b as usize, base + c as usize))?;
                         r!(a) = r!(b);
                         self.check_gc();
                     }
-                    Op::Jmp(off) => pc = (pc as i32 + off) as usize,
+                    Op::Jmp(off) => jump!(off),
                     Op::JmpCmp(cmp, cond, b, c, off) => {
-                        let x = rk!(b);
-                        let y = rk!(c);
-                        let res = match (cmp, x, y) {
-                            (Cmp::Eq, _, _) => {
-                                if x.raw_eq(y) {
-                                    true
-                                } else {
-                                    save!();
-                                    self.equals(x, y)?
+                        let res = match (cmp, rkref!(b), rkref!(c)) {
+                            (Cmp::Lt, &Value::Num(p), &Value::Num(q)) => p < q,
+                            (Cmp::Le, &Value::Num(p), &Value::Num(q)) => p <= q,
+                            (Cmp::Eq, &Value::Num(p), &Value::Num(q)) => p == q,
+                            _ => {
+                                let (x, y) = (rk!(b), rk!(c));
+                                match cmp {
+                                    Cmp::Eq => x.raw_eq(y) || slow!(self.equals(x, y))?,
+                                    Cmp::Lt => slow!(self.less_than(x, y))?,
+                                    Cmp::Le => slow!(self.less_equal(x, y))?,
                                 }
-                            }
-                            (Cmp::Lt, Value::Num(p), Value::Num(q)) => p < q,
-                            (Cmp::Le, Value::Num(p), Value::Num(q)) => p <= q,
-                            (Cmp::Lt, _, _) => {
-                                save!();
-                                self.less_than(x, y)?
-                            }
-                            (Cmp::Le, _, _) => {
-                                save!();
-                                self.less_equal(x, y)?
                             }
                         };
                         if res == cond {
-                            pc = (pc as i32 + off) as usize;
+                            jump!(off);
                         }
                     }
                     Op::JmpIf(a, cond, off) => {
-                        if r!(a).truthy() == cond {
-                            pc = (pc as i32 + off) as usize;
+                        if r!(a).truthy_ref() == cond {
+                            jump!(off);
                         }
                     }
                     Op::Call(a, b, c) => {
@@ -1343,8 +1404,9 @@ impl Vm {
                         match self.precall(func_idx, nargs, c as i32 - 1)? {
                             Called::Lua => continue 'frame,
                             Called::Done => {
+                                refresh!();
                                 if c != 0 {
-                                    self.top = base + proto.maxstack as usize;
+                                    self.top = base + maxstack;
                                 }
                                 self.check_gc();
                             }
@@ -1361,13 +1423,16 @@ impl Vm {
                         // A Lua callee replaces this frame; a native runs and its results
                         // return through the `Return` that follows.
                         let is_lua = matches!(
-                            self.stack[func_idx],
+                            r!(a),
                             Value::Func(f) if matches!(self.heap.func(f), FuncObj::Lua { .. })
                         );
                         if !is_lua {
                             match self.precall(func_idx, nargs, -1)? {
                                 Called::Lua => continue 'frame,
-                                Called::Done => continue,
+                                Called::Done => {
+                                    refresh!();
+                                    continue;
+                                }
                             }
                         }
                         self.close_upvals(base);
@@ -1414,10 +1479,9 @@ impl Vm {
                         continue 'frame;
                     }
                     Op::ForLoop(a, off) => {
-                        let ra = base + a as usize;
                         // Three numbers already: the step alone, nothing to convert back.
-                        if let (Value::Num(idx), Value::Num(limit), Value::Num(step)) =
-                            (self.stack[ra], self.stack[ra + 1], self.stack[ra + 2])
+                        if let (&Value::Num(idx), &Value::Num(limit), &Value::Num(step)) =
+                            (&r!(a), &r!(a + 1), &r!(a + 2))
                         {
                             let idx = idx + step;
                             if if step > 0.0 {
@@ -1425,32 +1489,24 @@ impl Vm {
                             } else {
                                 idx >= limit
                             } {
-                                pc = (pc as i32 + off) as usize;
-                                self.stack[ra] = Value::Num(idx);
+                                jump!(off);
+                                r!(a) = Value::Num(idx);
                             }
                             continue;
                         }
-                        if !matches!(self.stack[ra], Value::Num(_)) {
-                            save!();
+                        save!();
+                        if !matches!(r!(a), Value::Num(_)) {
                             return Err(self.rt_error("`for' initial value must be a number"));
                         }
-                        let limit = match self.tonumber(self.stack[ra + 1]) {
-                            Some(n) => n,
-                            None => {
-                                save!();
-                                return Err(self.rt_error("`for' limit must be a number"));
-                            }
+                        let Some(limit) = self.tonumber(r!(a + 1)) else {
+                            return Err(self.rt_error("`for' limit must be a number"));
                         };
-                        let step = match self.tonumber(self.stack[ra + 2]) {
-                            Some(n) => n,
-                            None => {
-                                save!();
-                                return Err(self.rt_error("`for' step must be a number"));
-                            }
+                        let Some(step) = self.tonumber(r!(a + 2)) else {
+                            return Err(self.rt_error("`for' step must be a number"));
                         };
-                        self.stack[ra + 1] = Value::Num(limit);
-                        self.stack[ra + 2] = Value::Num(step);
-                        let Value::Num(idx) = self.stack[ra] else {
+                        r!(a + 1) = Value::Num(limit);
+                        r!(a + 2) = Value::Num(step);
+                        let Value::Num(idx) = r!(a) else {
                             unreachable!()
                         };
                         let idx = idx + step;
@@ -1459,38 +1515,37 @@ impl Vm {
                         } else {
                             idx >= limit
                         } {
-                            pc = (pc as i32 + off) as usize;
-                            self.stack[ra] = Value::Num(idx);
+                            jump!(off);
+                            r!(a) = Value::Num(idx);
                         }
                     }
                     Op::TForPrep(a, off) => {
-                        let ra = base + a as usize;
-                        if let Value::Table(_) = self.stack[ra] {
-                            self.stack[ra + 1] = self.stack[ra];
+                        if let Value::Table(_) = r!(a) {
+                            r!(a + 1) = r!(a);
                             let g = self.globals;
-                            self.stack[ra] = self.heap.table(g).get(Value::Str(self.names.next));
+                            r!(a) = self.heap.table(g).get(Value::Str(self.names.next));
                         }
-                        pc = (pc as i32 + off) as usize;
+                        jump!(off);
                     }
                     Op::TForLoop(a, nvar) => {
-                        let ra = base + a as usize;
-                        let nvar = nvar as usize;
-                        let cb = ra + nvar + 2;
-                        self.stack[cb] = self.stack[ra];
-                        self.stack[cb + 1] = self.stack[ra + 1];
-                        self.stack[cb + 2] = self.stack[ra + 2];
-                        self.top = cb + 3;
-                        save!();
-                        self.call_at(cb, 2, nvar as i32)?;
-                        self.top = base + proto.maxstack as usize;
-                        self.stack.copy_within(cb..cb + nvar, ra + 2);
-                        if self.stack[ra + 2].is_nil() {
+                        let nv = nvar as usize;
+                        let cb = a as usize + nv + 2;
+                        r!(cb) = r!(a);
+                        r!(cb + 1) = r!(a + 1);
+                        r!(cb + 2) = r!(a + 2);
+                        self.top = base + cb + 3;
+                        slow!(self.call_at(base + cb, 2, nv as i32))?;
+                        self.top = base + maxstack;
+                        for i in 0..nv {
+                            r!(a as usize + 2 + i) = r!(cb + i);
+                        }
+                        if r!(a + 2).is_nil() {
                             pc += 1;
                         } else {
                             let Op::Jmp(back) = code[pc] else {
                                 unreachable!()
                             };
-                            pc = (pc as i32 + 1 + back) as usize;
+                            jump!(1 + back);
                         }
                     }
                     Op::SetList(a, first, n) => {
@@ -1511,24 +1566,26 @@ impl Vm {
                         };
                         let n = self.top - (base + a as usize) - 1;
                         for i in (1..=n).rev() {
-                            let v = r!(a as usize + i);
+                            let v = self.stack[base + a as usize + i];
                             self.heap
                                 .table_mut(t)
                                 .set_int((first as usize + i) as i32, v);
                         }
-                        self.top = base + proto.maxstack as usize;
+                        self.top = base + maxstack;
                     }
-                    Op::Close(a) => self.close_upvals(base + a as usize),
+                    Op::Close(a) => {
+                        self.close_upvals(base + a as usize);
+                        refresh!();
+                    }
                     Op::Closure(a, px) => {
                         let p = proto.protos[px as usize].clone();
                         let env = env!();
-                        let parent_upvals = upvals;
                         let mut ups = Vec::with_capacity(p.upvals.len());
                         for &(in_stack, idx) in &p.upvals {
                             ups.push(if in_stack {
                                 self.find_upval(base + idx as usize)
                             } else {
-                                parent_upvals[idx as usize]
+                                upvals[idx as usize]
                             });
                         }
                         let f = self.heap.new_func(FuncObj::Lua {
@@ -1538,7 +1595,7 @@ impl Vm {
                         });
                         r!(a) = Value::Func(f);
                         save!();
-                        self.top = base + proto.maxstack as usize;
+                        self.top = base + maxstack;
                         self.check_gc();
                     }
                 }
@@ -1590,7 +1647,11 @@ fn symbexec(p: &Proto, lastpc: usize, reg: usize) -> Option<usize> {
             | Op::GetGlobal(a, _)
             | Op::GetTable(a, ..)
             | Op::NewTable(a, ..)
-            | Op::Arith(_, a, ..)
+            | Op::Add(a, ..)
+            | Op::Sub(a, ..)
+            | Op::Mul(a, ..)
+            | Op::Div(a, ..)
+            | Op::Pow(a, ..)
             | Op::Unm(a, _)
             | Op::Not(a, _)
             | Op::Concat(a, ..)

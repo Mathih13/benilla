@@ -44,6 +44,12 @@ impl Value {
         !matches!(self, Value::Nil | Value::Bool(false))
     }
 
+    /// [`Value::truthy`] read in place.
+    #[inline(always)]
+    pub fn truthy_ref(&self) -> bool {
+        !matches!(self, Value::Nil | Value::Bool(false))
+    }
+
     /// `luaO_rawequalObj`.
     pub fn raw_eq(self, other: Value) -> bool {
         match (self, other) {

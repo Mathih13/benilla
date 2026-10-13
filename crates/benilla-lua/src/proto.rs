@@ -46,7 +46,11 @@ pub enum Op {
     NewTable(Reg, u32, u8),
     /// `R(a+1) = R(b); R(a) = R(b)[RK(c)]`.
     SelfOp(Reg, Reg, Rk),
-    Arith(Arith, Reg, Rk, Rk),
+    Add(Reg, Rk, Rk),
+    Sub(Reg, Rk, Rk),
+    Mul(Reg, Rk, Rk),
+    Div(Reg, Rk, Rk),
+    Pow(Reg, Rk, Rk),
     Unm(Reg, Reg),
     Not(Reg, Reg),
     /// `R(a) = R(b) .. ... .. R(c)`.

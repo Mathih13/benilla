@@ -451,7 +451,7 @@ impl<'a> Fc<'a> {
                 self.line = *line;
                 // 5.0 primes the counter one step back, then enters at the loop test; the
                 // variables come into scope after, so an error here names no local.
-                self.emit(Op::Arith(Arith::Sub, base, base as Rk, base as Rk + 2));
+                self.emit(Op::Sub(base, base as Rk, base as Rk + 2));
                 let prep = self.jump();
                 self.activate(*var)?;
                 self.activate(*limit)?;
@@ -890,17 +890,17 @@ impl<'a> Fc<'a> {
                     self.emit(Op::Concat(dst, first, self.freereg - 1));
                 }
                 _ => {
-                    let a = match op {
-                        BinOp::Add => Arith::Add,
-                        BinOp::Sub => Arith::Sub,
-                        BinOp::Mul => Arith::Mul,
-                        BinOp::Div => Arith::Div,
-                        _ => Arith::Pow,
+                    let make = match op {
+                        BinOp::Add => Op::Add,
+                        BinOp::Sub => Op::Sub,
+                        BinOp::Mul => Op::Mul,
+                        BinOp::Div => Op::Div,
+                        _ => Op::Pow,
                     };
                     let rb = self.exp2rk(l)?;
                     let rc = self.exp2rk(r)?;
                     self.line = *line;
-                    self.emit(Op::Arith(a, dst, rb, rc));
+                    self.emit(make(dst, rb, rc));
                 }
             },
         }

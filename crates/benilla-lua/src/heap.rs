@@ -295,6 +295,12 @@ impl Heap {
                 continue;
             }
             let Some(v) = gray.pop() else { break };
+            // A register the VM never cleared may hold a handle whose object died; such a
+            // handle is skipped (`Vm::precall` leaves registers above the parameters as they
+            // were, and the compiler writes every register before it reads it).
+            if !self.is_live(v) {
+                continue;
+            }
             match v {
                 Value::Str(s) => self.strs.marks[s.id as usize] = true,
                 Value::Table(t) => {
@@ -417,6 +423,33 @@ impl Heap {
         // `next` and never reads them. They stay as stale handles, compared by identity only.
         self.bytes = live;
         live
+    }
+
+    /// Whether a value's object still exists; anything not collectable does.
+    fn is_live(&self, v: Value) -> bool {
+        match v {
+            Value::Str(s) => self
+                .strs
+                .items
+                .get(s.id as usize)
+                .is_some_and(Option::is_some),
+            Value::Table(t) => self
+                .tables
+                .items
+                .get(t.0 as usize)
+                .is_some_and(Option::is_some),
+            Value::Func(f) => self
+                .funcs
+                .items
+                .get(f.0 as usize)
+                .is_some_and(Option::is_some),
+            Value::User(u) => self
+                .users
+                .items
+                .get(u.0 as usize)
+                .is_some_and(Option::is_some),
+            _ => true,
+        }
     }
 
     /// `__mode` of a metatable: bit 0 weak keys, bit 1 weak values.
