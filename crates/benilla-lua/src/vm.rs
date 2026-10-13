@@ -130,13 +130,16 @@ pub struct Vm {
     hooked: bool,
 }
 
+/// The host's hook body; an error it answers is raised where the hook ran.
+pub type HookFn = Rc<dyn Fn(&mut Vm) -> Result<(), LuaError>>;
+
 /// A host hook run about every `step` instructions. It is checked where a loop jumps back and
 /// where a call starts, the places a non-terminating script must pass, counting a loop's body
 /// length per iteration; so the dispatch loop pays nothing for it until one is set.
 #[derive(Clone)]
 pub struct Hook {
     pub step: u64,
-    pub f: Rc<dyn Fn(&mut Vm) -> Result<(), LuaError>>,
+    pub f: HookFn,
     counted: u64,
 }
 
@@ -1184,7 +1187,7 @@ impl Vm {
 
     // ── the hook ─────────────────────────────────────────────────────────────────────────────
 
-    pub fn set_hook(&mut self, step: u64, f: Rc<dyn Fn(&mut Vm) -> Result<(), LuaError>>) {
+    pub fn set_hook(&mut self, step: u64, f: HookFn) {
         self.hook = Some(Hook {
             step: step.max(1),
             f,
