@@ -75,11 +75,41 @@ pub fn fmt_g14(n: f64) -> String {
     fmt_g(n, 14)
 }
 
+/// `10^p`, exact for the precisions `%g` is asked for.
+fn pow10(p: usize) -> f64 {
+    const P: [f64; 18] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+        1e17,
+    ];
+    P.get(p).copied().unwrap_or_else(|| 10f64.powi(p as i32))
+}
+
+/// `fmt_g14(n)` appended to `out`; an integer is written without a temporary string.
+pub fn push_g14(n: f64, out: &mut Vec<u8>) {
+    if n.fract() == 0.0 && n.abs() < 1e14 && n != 0.0 {
+        let mut v = n as i64;
+        if v < 0 {
+            out.push(b'-');
+            v = -v;
+        }
+        let mut digits = [0u8; 20];
+        let mut i = digits.len();
+        while v > 0 {
+            i -= 1;
+            digits[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        out.extend_from_slice(&digits[i..]);
+    } else {
+        out.extend_from_slice(fmt_g14(n).as_bytes());
+    }
+}
+
 /// `%.<prec>g` in MSVC's spelling.
 pub fn fmt_g(n: f64, prec: usize) -> String {
     // An integer below `10^prec` prints as its digits: the common case, without float
     // formatting's exact-decimal arithmetic.
-    if n.fract() == 0.0 && n.abs() < 10f64.powi(prec as i32) && n != 0.0 {
+    if n.fract() == 0.0 && n.abs() < pow10(prec) && n != 0.0 {
         return (n as i64).to_string();
     }
     if n.is_nan() {
@@ -140,6 +170,22 @@ mod tests {
         assert_eq!(fmt_g14(123456789012345.0), "1.2345678901234e+014");
         assert_eq!(fmt_g14(12345678901234.0), "12345678901234");
         assert_eq!(fmt_g14(-2.5), "-2.5");
+        for n in [
+            1.0,
+            -7.0,
+            42.0,
+            99999999999999.0,
+            -12345678901234.0,
+            0.0,
+            -0.0,
+            0.5,
+            1e14,
+            1e20,
+        ] {
+            let mut out = Vec::new();
+            push_g14(n, &mut out);
+            assert_eq!(out, fmt_g14(n).into_bytes(), "{n}");
+        }
         assert_eq!(fmt_g14(1.0 / 3.0), "0.33333333333333");
         assert_eq!(fmt_g14(f64::INFINITY), "1.#INF");
         assert_eq!(fmt_g14(0.0001), "0.0001");

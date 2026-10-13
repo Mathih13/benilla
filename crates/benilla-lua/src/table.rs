@@ -40,6 +40,11 @@ pub struct Table {
     pub(crate) weak: u8,
     /// The chunk whose code made this table (`Heap::sources`), for a memory census.
     pub owner: u32,
+    /// The key `next` last returned and its position: a traversal's next step starts there
+    /// without looking the key up. Cleared by anything that moves a key (a new key, a resize),
+    /// so a step after such a change finds the key where 5.0 would.
+    hint_key: std::cell::Cell<Value>,
+    hint_pos: std::cell::Cell<u32>,
 }
 
 /// The result of a key lookup: where its slot is, if it has one.
@@ -105,6 +110,8 @@ impl Table {
             setn: None,
             weak: 0,
             owner: 0,
+            hint_key: std::cell::Cell::new(Value::Nil),
+            hint_pos: std::cell::Cell::new(0),
         };
         t.array.resize(narray, Value::Nil);
         t.set_node_vector(lnhash);
@@ -230,6 +237,22 @@ impl Table {
         self.find(key).map_or(Value::Nil, |s| self.slot(s))
     }
 
+    /// `get` for a key known to be a string: the hash chain alone.
+    #[inline(always)]
+    pub fn get_str(&self, key: Value) -> Value {
+        let mut i = key.str_hash_bits() as usize & (self.node.len() - 1);
+        loop {
+            let n = &self.node[i];
+            if n.key == key {
+                return n.val;
+            }
+            if n.next < 0 {
+                return Value::Nil;
+            }
+            i = n.next as usize;
+        }
+    }
+
     /// [`Table::get`] with the key read in place.
     #[inline(always)]
     pub fn get_ref(&self, key: &Value) -> Value {
@@ -317,6 +340,8 @@ impl Table {
 
     /// 5.0's `newkey`: Brent's variation, then a rehash when the last free node is used.
     fn newkey(&mut self, key: Value) -> Slot {
+        // A new key may move another one (5.0's colliding-node move).
+        self.hint_key.set(Value::Nil);
         let mut mp = self.mainposition(key);
         if !self.node[mp].val.is_nil() {
             let othern0 = self.mainposition(self.node[mp].key);
@@ -415,6 +440,7 @@ impl Table {
 
     /// 5.0's `resize`.
     fn resize(&mut self, nasize: usize, nhsize: u8) {
+        self.hint_key.set(Value::Nil);
         let oldasize = self.array.len();
         let nold = std::mem::take(&mut self.node);
         if nasize > oldasize {
@@ -441,9 +467,10 @@ impl Table {
     /// 5.0's `luaH_next`: the pair after `key`, `Ok(None)` at the end, `Err` for a key not in the
     /// table (`invalid key for 'next'`).
     pub fn next(&self, key: Value) -> Result<Option<(Value, Value)>, InvalidKey> {
-        // `luaH_index`.
+        // `luaH_index`, or where the last step stopped.
         let mut i: i64 = match key {
             Value::Nil => -1,
+            k if k == self.hint_key.get() => self.hint_pos.get() as i64,
             _ => match arrayindex(key) {
                 Some(k) if k <= self.array.len() => k as i64 - 1,
                 _ => match self.find(key) {
@@ -457,7 +484,10 @@ impl Table {
         while (i as usize) < self.array.len() {
             let v = self.array[i as usize];
             if !v.is_nil() {
-                return Ok(Some((Value::Num((i + 1) as f64), v)));
+                let k = Value::Num((i + 1) as f64);
+                self.hint_key.set(k);
+                self.hint_pos.set(i as u32);
+                return Ok(Some((k, v)));
             }
             i += 1;
         }
@@ -465,6 +495,8 @@ impl Table {
         while n < self.node.len() {
             let node = &self.node[n];
             if !node.val.is_nil() {
+                self.hint_key.set(node.key);
+                self.hint_pos.set((n + self.array.len()) as u32);
                 return Ok(Some((node.key, node.val)));
             }
             n += 1;

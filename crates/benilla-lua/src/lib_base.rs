@@ -15,6 +15,7 @@ pub fn open(vm: &mut Vm) {
     vm.register("getfenv", getfenv);
     vm.register("setfenv", setfenv);
     vm.register("next", next);
+    vm.builtin_next = vm.get_global("next");
     vm.register("ipairs", ipairs);
     vm.register("pairs", pairs);
     vm.register("tonumber", tonumber);

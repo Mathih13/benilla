@@ -170,6 +170,13 @@ impl Value {
         }
     }
 
+    /// A string's hash bits, for a value known to be a string.
+    #[inline(always)]
+    pub fn str_hash_bits(self) -> u32 {
+        debug_assert!(matches!(self.unpack(), V::Str(_)));
+        (self.payload() >> STR_ID_BITS) as u32
+    }
+
     #[inline(always)]
     pub fn is_num(self) -> bool {
         self.0 < TAGGED

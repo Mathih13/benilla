@@ -15,12 +15,58 @@ pub type NativeFn = fn(&mut crate::vm::Vm, usize) -> Result<usize, crate::vm::Lu
 /// convention as [`NativeFn`].
 pub type HostFn = Rc<dyn Fn(&mut crate::vm::Vm, usize) -> Result<usize, crate::vm::LuaError>>;
 
+/// The longest string kept inside its object; a longer one is boxed. Most UI strings fit, and
+/// an inline one costs no allocation and no second pointer to compare.
+const INLINE: usize = 22;
+
+#[derive(Clone, Debug)]
+enum StrData {
+    Inline(u8, [u8; INLINE]),
+    Boxed(Box<[u8]>),
+}
+
 #[derive(Clone, Debug)]
 pub struct StrObj {
-    pub bytes: Box<[u8]>,
+    data: StrData,
     pub hash: u32,
-    /// The next string in this intern bucket, or `u32::MAX`.
-    next: u32,
+}
+
+impl StrObj {
+    fn new(s: &[u8], hash: u32) -> StrObj {
+        let data = if s.len() <= INLINE {
+            let mut buf = [0; INLINE];
+            buf[..s.len()].copy_from_slice(s);
+            StrData::Inline(s.len() as u8, buf)
+        } else {
+            StrData::Boxed(s.into())
+        };
+        StrObj { data, hash }
+    }
+
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        match &self.data {
+            StrData::Inline(n, buf) => &buf[..*n as usize],
+            StrData::Boxed(b) => b,
+        }
+    }
+}
+
+/// An empty intern slot. No entry equals it: a string id is under `1 << STR_ID_BITS`.
+const STRT_EMPTY: u64 = u64::MAX;
+
+/// An intern slot for string `id` of hash `hash`: the hash rides in the slot, so a probe
+/// compares it without touching the string.
+#[inline]
+fn strt_entry(hash: u32, id: u32) -> u64 {
+    (hash as u64) << 32 | id as u64
+}
+
+/// Where a probe for `hash` starts in a table of `mask + 1` slots: the hash mixed, so 5.0's
+/// weak low bits do not cluster a linear probe.
+#[inline]
+fn strt_home(hash: u32, mask: usize) -> usize {
+    (hash.wrapping_mul(0x9E37_79B9) as usize >> 7) & mask
 }
 
 /// What a call needs of a Lua function's prototype, copied into the closure so a call
@@ -176,8 +222,8 @@ pub struct Census {
 #[derive(Clone)]
 pub struct Heap {
     strs: Arena<StrObj>,
-    /// The intern table's buckets: the first string of each chain.
-    strt: Vec<u32>,
+    /// The intern table: open addressing, linear probing, at most half full.
+    strt: Vec<u64>,
     tables: Arena<Table>,
     funcs: Arena<FuncObj>,
     upvals: Arena<UpvalObj>,
@@ -198,7 +244,7 @@ impl Default for Heap {
     fn default() -> Self {
         Heap {
             strs: Arena::default(),
-            strt: vec![u32::MAX; 64],
+            strt: vec![STRT_EMPTY; 128],
             tables: Arena::default(),
             funcs: Arena::default(),
             upvals: Arena::default(),
@@ -219,31 +265,33 @@ impl Heap {
     /// The interned string for `s`.
     pub fn intern(&mut self, s: &[u8]) -> StrRef {
         let hash = str_hash(s);
-        let b = hash as usize & (self.strt.len() - 1);
-        let mut i = self.strt[b];
-        while i != u32::MAX {
-            let o = self.strs.get(i);
-            if o.hash == hash && &*o.bytes == s {
-                return StrRef {
-                    id: i,
-                    hash: hash & STR_HASH_MASK,
-                };
+        let mask = self.strt.len() - 1;
+        let mut b = strt_home(hash, mask);
+        loop {
+            let e = self.strt[b];
+            if e == STRT_EMPTY {
+                break;
             }
-            i = o.next;
+            if (e >> 32) as u32 == hash {
+                let id = e as u32;
+                if self.strs.get(id).bytes() == s {
+                    return StrRef {
+                        id,
+                        hash: hash & STR_HASH_MASK,
+                    };
+                }
+            }
+            b = (b + 1) & mask;
         }
         self.bytes += 32 + s.len();
-        let id = self.strs.alloc(StrObj {
-            bytes: s.into(),
-            hash,
-            next: self.strt[b],
-        });
-        self.strt[b] = id;
+        let id = self.strs.alloc(StrObj::new(s, hash));
+        self.strt[b] = strt_entry(hash, id);
         // A string value holds its id in `STR_ID_BITS`: sixteen million live strings.
         assert!(
             id < 1 << STR_ID_BITS,
             "more live strings than a value can name"
         );
-        if self.strs.live() > self.strt.len() {
+        if self.strs.live() * 2 > self.strt.len() {
             self.resize_strt(self.strt.len() * 2);
         }
         StrRef {
@@ -252,13 +300,17 @@ impl Heap {
         }
     }
 
+    /// Rebuild the intern table at `size` slots from the live strings.
     fn resize_strt(&mut self, size: usize) {
-        let mut strt = vec![u32::MAX; size];
-        for (i, slot) in self.strs.items.iter_mut().enumerate() {
+        let mut strt = vec![STRT_EMPTY; size];
+        let mask = size - 1;
+        for (i, slot) in self.strs.items.iter().enumerate() {
             if let Some(o) = slot {
-                let b = o.hash as usize & (size - 1);
-                o.next = strt[b];
-                strt[b] = i as u32;
+                let mut b = strt_home(o.hash, mask);
+                while strt[b] != STRT_EMPTY {
+                    b = (b + 1) & mask;
+                }
+                strt[b] = strt_entry(o.hash, i as u32);
             }
         }
         self.strt = strt;
@@ -270,7 +322,7 @@ impl Heap {
 
     #[inline]
     pub fn str(&self, s: StrRef) -> &[u8] {
-        &self.strs.get(s.id).bytes
+        self.strs.get(s.id).bytes()
     }
 
     // ── tables ───────────────────────────────────────────────────────────────────────────────
@@ -525,7 +577,7 @@ impl Heap {
             if slot.is_some() {
                 if self.strs.marks[i] {
                     self.strs.marks[i] = false;
-                    live += 32 + slot.as_ref().unwrap().bytes.len();
+                    live += 32 + slot.as_ref().unwrap().bytes().len();
                 } else {
                     *slot = None;
                     self.strs.free.push(i as u32);

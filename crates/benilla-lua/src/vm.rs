@@ -43,6 +43,9 @@ struct Frame {
     /// when `Vm::fenv_gen` moves.
     upvals: *const u32,
     env: TableRef,
+    /// `Vm::fenv_gen` when `env` was read: a `setfenv` since moves it, and the next global
+    /// access rereads the closure's environment.
+    env_gen: u64,
     /// The constant table and register count, so resuming the frame reads no prototype.
     consts: *const Value,
     maxstack: u16,
@@ -108,6 +111,10 @@ pub struct Vm {
     frames: Vec<Frame>,
     /// Open upvalues, by stack slot, ascending.
     open: Vec<(usize, u32)>,
+    /// `concat`'s scratch buffer, kept between calls.
+    concat_buf: Vec<u8>,
+    /// The base library's `next`: a generic `for` over it steps the table in place.
+    pub(crate) builtin_next: Value,
     pub globals: TableRef,
     pub registry: TableRef,
     pub names: Names,
@@ -246,6 +253,8 @@ impl Vm {
             top: 0,
             frames: Vec::new(),
             open: Vec::new(),
+            concat_buf: Vec::new(),
+            builtin_next: Value::Nil,
             globals,
             registry,
             names,
@@ -938,29 +947,30 @@ impl Vm {
             let mut n = 2;
             let a = self.stack[top - 2];
             let b = self.stack[top - 1];
-            let (sa, sb) = (self.tostr(a), self.tostr(b));
-            match (sa, sb) {
-                (Some(sa), Some(sb)) => {
-                    self.stack[top - 2] = Value::Str(sa);
-                    self.stack[top - 1] = Value::Str(sb);
-                    if !self.heap.str(sb).is_empty() {
-                        while n < total {
-                            let v = self.stack[top - n - 1];
-                            match self.tostr(v) {
-                                Some(s) => {
-                                    self.stack[top - n - 1] = Value::Str(s);
-                                    n += 1;
-                                }
-                                None => break,
-                            }
+            let strnum = |v: Value| matches!(v.unpack(), V::Str(_) | V::Num(_));
+            match (strnum(a), strnum(b)) {
+                (true, true) => {
+                    if matches!(b.unpack(), V::Str(s) if self.heap.str(s).is_empty()) {
+                        // `a .. ""` is `a` as a string.
+                        let sa = self.tostr(a).expect("a string or number");
+                        self.stack[top - 2] = Value::Str(sa);
+                    } else {
+                        while n < total && strnum(self.stack[top - n - 1]) {
+                            n += 1;
                         }
-                        let mut buf = Vec::new();
+                        // A number is formatted straight into the result: 5.0 interns its text
+                        // first, a string nothing else ever sees.
+                        let mut buf = std::mem::take(&mut self.concat_buf);
+                        buf.clear();
                         for i in (1..=n).rev() {
-                            if let V::Str(s) = self.stack[top - i].unpack() {
-                                buf.extend_from_slice(self.heap.str(s));
+                            match self.stack[top - i].unpack() {
+                                V::Str(s) => buf.extend_from_slice(self.heap.str(s)),
+                                V::Num(x) => crate::number::push_g14(x, &mut buf),
+                                _ => unreachable!("checked above"),
                             }
                         }
                         self.stack[top - n] = self.str(&buf);
+                        self.concat_buf = buf;
                     }
                 }
                 _ => match self.bin_tm(a, b, self.names.concat)? {
@@ -1148,6 +1158,7 @@ impl Vm {
                     proto: pp,
                     upvals: fup.cast::<u32>(),
                     env: fenv,
+                    env_gen: self.fenv_gen,
                     tailcalls: 0,
                     boundary: false,
                 });
@@ -1169,6 +1180,7 @@ impl Vm {
                     proto: std::ptr::null(),
                     upvals: std::ptr::null(),
                     env: self.globals,
+                    env_gen: self.fenv_gen,
                     tailcalls: 0,
                     boundary: false,
                 });
@@ -1509,34 +1521,22 @@ impl Vm {
     /// The register file is addressed through `regs`, a raw pointer to `stack[base]`, as C Lua
     /// keeps `base` in a register. Anything that can grow the stack (a call, a metamethod, an
     /// upvalue that touches the stack) is followed by `refresh!`, which recomputes it.
+    // `fr!` carries its own `unsafe`, nested in others at some uses.
+    #[allow(unused_unsafe)]
     fn execute(&mut self) -> Result<(), LuaError> {
         // The running frame's state, kept in locals as C Lua's `luaV_execute` keeps it. A Lua
         // call sets it straight from the callee; a return reloads it from the caller's frame.
-        let mut fi: usize;
-        let mut proto: *const Proto;
-        let mut base: usize;
-        let mut fref: FuncRef;
+        // Only the three values every instruction touches live in locals; the rest of the
+        // running frame is read from it (`fr!`), so they keep their registers.
         let mut ip: *const Op;
-        let mut upvals: *const u32;
-        let mut env: TableRef;
-        let mut env_gen: u64;
         let mut k: *const Value;
-        let mut maxstack: usize;
         let mut regs: *mut Value;
         'frame: loop {
             {
-                fi = self.frames.len() - 1;
                 let frame = self.frames.last().expect("a Lua frame");
-                proto = frame.proto;
-                base = frame.base();
-                fref = frame.func;
+                let base = frame.base();
                 ip = frame.ip;
-                upvals = frame.upvals;
-                env = frame.env;
-                // A `setfenv` since the call is caught on first use: start one generation behind.
-                env_gen = self.fenv_gen.wrapping_sub(1);
                 k = frame.consts;
-                maxstack = frame.maxstack as usize;
                 self.heap.cur_source = frame.source;
                 if self.hooked {
                     self.prof_switch();
@@ -1545,25 +1545,47 @@ impl Vm {
                 // shrinks.
                 regs = unsafe { self.stack.as_mut_ptr().add(base) };
             }
+            // The running frame, the last one. SAFETY: `execute` runs while its frame is on the
+            // list; the reference is used within one statement, before any push moves the list.
+            macro_rules! fr {
+                () => {
+                    unsafe { self.frames.last().unwrap_unchecked() }
+                };
+            }
+            macro_rules! fr_mut {
+                () => {
+                    unsafe { self.frames.last_mut().unwrap_unchecked() }
+                };
+            }
+            macro_rules! base {
+                () => {
+                    (fr!().base as usize)
+                };
+            }
+            macro_rules! maxstack {
+                () => {
+                    (fr!().maxstack as usize)
+                };
+            }
             // SAFETY: the upvalue list lives as the code does (`Frame::upvals`), and the
             // compiler indexes only the upvalues the function has.
             macro_rules! upval {
                 ($i:expr) => {
-                    unsafe { *upvals.add($i as usize) }
+                    unsafe { *fr!().upvals.add($i as usize) }
                 };
             }
             // SAFETY: the compiler only encodes constants this function has.
             macro_rules! kv {
                 ($i:expr) => {{
                     let i = $i as usize;
-                    debug_assert!(i < unsafe { (*proto).consts.len() });
+                    debug_assert!(i < unsafe { (*fr!().proto).consts.len() });
                     unsafe { *k.add(i) }
                 }};
             }
             macro_rules! refresh {
                 () => {
                     // SAFETY: as above.
-                    regs = unsafe { self.stack.as_mut_ptr().add(base) }
+                    regs = unsafe { self.stack.as_mut_ptr().add(base!()) }
                 };
             }
             // SAFETY for `r!`: `regs` is current (see above), and the compiler addresses no
@@ -1572,7 +1594,7 @@ impl Vm {
                 ($x:expr) => {
                     *{
                         let i = $x as usize;
-                        debug_assert!(i < maxstack && base + i < self.stack.len());
+                        debug_assert!(i < maxstack!() && base!() + i < self.stack.len());
                         unsafe { &mut *regs.add(i) }
                     }
                 };
@@ -1594,12 +1616,12 @@ impl Vm {
                     let x: Rk = $x;
                     if x >= RK_CONST {
                         let i = (x - RK_CONST) as usize;
-                        debug_assert!(i < unsafe { (*proto).consts.len() });
+                        debug_assert!(i < unsafe { (*fr!().proto).consts.len() });
                         // SAFETY: as `kv!`.
                         unsafe { &*k.add(i) }
                     } else {
                         let i = x as usize;
-                        debug_assert!(i < maxstack && base + i < self.stack.len());
+                        debug_assert!(i < maxstack!() && base!() + i < self.stack.len());
                         // SAFETY: as `r!`.
                         unsafe { &*regs.add(i) }
                     }
@@ -1617,19 +1639,21 @@ impl Vm {
             }
             macro_rules! env {
                 () => {{
-                    if env_gen != self.fenv_gen {
-                        env_gen = self.fenv_gen;
-                        env = match self.heap.func(fref) {
+                    let fenv_gen = self.fenv_gen;
+                    let f = fr_mut!();
+                    if f.env_gen != fenv_gen {
+                        f.env_gen = self.fenv_gen;
+                        f.env = match self.heap.func(f.func) {
                             FuncObj::Lua { env, .. } => *env,
                             _ => unreachable!(),
                         };
                     }
-                    env
+                    f.env
                 }};
             }
             macro_rules! save {
                 () => {
-                    self.frames[fi].ip = ip
+                    fr_mut!().ip = ip
                 };
             }
             /// A call that may run Lua: the pc saved first, the registers refreshed after.
@@ -1669,6 +1693,8 @@ impl Vm {
                 ($a:expr, $n:expr) => {{
                     let a = $a;
                     let n: usize = $n;
+                    let fi = self.frames.len() - 1;
+                    let base = base!();
                     let first = base + a as usize;
                     if !self.open.is_empty() {
                         self.close_upvals(base);
@@ -1737,7 +1763,7 @@ impl Vm {
                 }};
             }
             loop {
-                debug_assert!(unsafe { (*proto).code.as_ptr_range().contains(&ip) });
+                debug_assert!(unsafe { (*fr!().proto).code.as_ptr_range().contains(&ip) });
                 // SAFETY: every function ends in `Return`, and every jump lands inside it.
                 let op = unsafe { *ip };
                 ip = unsafe { ip.add(1) };
@@ -1757,7 +1783,7 @@ impl Vm {
                             UpvalObj::Open(i) => {
                                 debug_assert!((i as usize) < self.stack.len());
                                 // SAFETY: an open upvalue's slot is inside the stack.
-                                unsafe { *regs.sub(base).add(i as usize) }
+                                unsafe { *regs.sub(base!()).add(i as usize) }
                             }
                             UpvalObj::Closed(v) => v,
                         };
@@ -1765,7 +1791,8 @@ impl Vm {
                     }
                     Op::SetUpval(a, u) => {
                         let v = r!(a);
-                        self.upval_set(upval!(u), v);
+                        let uv = upval!(u);
+                        self.upval_set(uv, v);
                         refresh!();
                     }
                     Op::GetGlobal(a, kx) => {
@@ -1807,6 +1834,44 @@ impl Vm {
                         let v = slow!(self.index(t, key, Some(b as usize)))?;
                         r!(a) = v;
                     }
+                    Op::GetField(a, b, kx) => {
+                        let key = kv!(kx);
+                        if let Some(tr) = r!(b).as_table() {
+                            let tab = self.heap.table(tr);
+                            let v = tab.get_str(key);
+                            if !v.is_nil() || tab.meta.is_none() {
+                                r!(a) = v;
+                                continue;
+                            }
+                            if let Some(v) = self.index_meta_fast(tr, &key) {
+                                r!(a) = v;
+                                continue;
+                            }
+                        }
+                        let t = r!(b);
+                        let v = slow!(self.index(t, key, Some(b as usize)))?;
+                        r!(a) = v;
+                    }
+                    Op::SetField(a, kx, c) => {
+                        let key = kv!(kx);
+                        let v = rk!(c);
+                        if let Some(tr) = r!(a).as_table() {
+                            let tab = self.heap.table_mut(tr);
+                            if tab.meta.is_none() {
+                                if tab.set(key, v).is_ok() {
+                                    continue;
+                                }
+                            } else if let Some(s) = tab.find(key) {
+                                // As `SetTable`: an existing value is overwritten raw.
+                                if !tab.slot(s).is_nil() {
+                                    *tab.slot_mut(s) = v;
+                                    continue;
+                                }
+                            }
+                        }
+                        let t = r!(a);
+                        slow!(self.setindex(t, key, v, Some(a as usize)))?;
+                    }
                     Op::SetTable(a, b, c) => {
                         let key = rk!(b);
                         let v = rk!(c);
@@ -1832,7 +1897,7 @@ impl Vm {
                         let t = self.heap.new_table(b as usize, c);
                         r!(a) = Value::Table(t);
                         save!();
-                        self.top = base + maxstack;
+                        self.top = base!() + maxstack!();
                         self.check_gc();
                     }
                     Op::SelfOp(a, b, c) => {
@@ -1862,8 +1927,8 @@ impl Vm {
                     Op::SubK(a, b, kx) => arithk!(a, b, kx, -, Arith::Sub),
                     Op::MulK(a, b, kx) => arithk!(a, b, kx, *, Arith::Mul),
                     Op::DivK(a, b, kx) => arithk!(a, b, kx, /, Arith::Div),
-                    Op::JmpCmpK(cmp, cond, b, kx, off) => cmpk!(cmp, cond, r!(b), kv!(kx), off),
-                    Op::JmpCmpKR(cmp, cond, kx, c, off) => cmpk!(cmp, cond, kv!(kx), r!(c), off),
+                    Op::JmpCmpK(cj, b, kx, off) => cmpk!(cj.cmp(), cj.cond(), r!(b), kv!(kx), off),
+                    Op::JmpCmpKR(cj, kx, c, off) => cmpk!(cj.cmp(), cj.cond(), kv!(kx), r!(c), off),
                     Op::Pow(a, b, c) => {
                         // 5.0's `^` always goes through the global `__pow`.
                         let (x, y) = (rk!(b), rk!(c));
@@ -1891,19 +1956,21 @@ impl Vm {
                     }
                     Op::Not(a, b) => r!(a) = Value::Bool(!r!(b).truthy()),
                     Op::Concat(a, b, c) => {
-                        self.top = base + maxstack;
-                        slow!(self.concat(base + b as usize, base + c as usize))?;
+                        self.top = base!() + maxstack!();
+                        let b0 = base!();
+                        slow!(self.concat(b0 + b as usize, b0 + c as usize))?;
                         r!(a) = r!(b);
                         self.check_gc();
                     }
                     Op::Jmp(off) => jump!(off),
-                    Op::JmpCmp(cmp, cond, b, c, off) => {
-                        let res = match (cmp, rkref!(b).as_num(), rkref!(c).as_num()) {
+                    Op::JmpCmp(cj, b, c, off) => {
+                        let (cmp, cond) = (cj.cmp(), cj.cond());
+                        let res = match (cmp, r!(b).as_num(), r!(c).as_num()) {
                             (Cmp::Lt, Some(p), Some(q)) => p < q,
                             (Cmp::Le, Some(p), Some(q)) => p <= q,
                             (Cmp::Eq, Some(p), Some(q)) => p == q,
                             _ => {
-                                let (x, y) = (rk!(b), rk!(c));
+                                let (x, y) = (r!(b), r!(c));
                                 match cmp {
                                     Cmp::Eq => x.raw_eq(y) || slow!(self.equals(x, y))?,
                                     Cmp::Lt => slow!(self.less_than(x, y))?,
@@ -1921,7 +1988,7 @@ impl Vm {
                         }
                     }
                     Op::Call(a, b, c) => {
-                        let func_idx = base + a as usize;
+                        let func_idx = base!() + a as usize;
                         let nargs = if b == 0 {
                             self.top - func_idx - 1
                         } else {
@@ -1943,7 +2010,7 @@ impl Vm {
                             {
                                 // `fi + 1` frames are live: the depth without reading the
                                 // frame list.
-                                if !shape.vararg && fi + 1 < MAXCALLS {
+                                if !shape.vararg && self.frames.len() < MAXCALLS {
                                     let np = shape.nparams as usize;
                                     let consts = shape.consts;
                                     let nbase = func_idx + 1;
@@ -1959,6 +2026,7 @@ impl Vm {
                                         proto: Rc::as_ptr(p),
                                         upvals: fup.as_ptr(),
                                         env: *fenv,
+                                        env_gen: self.fenv_gen,
                                         tailcalls: 0,
                                         boundary: false,
                                     };
@@ -1972,16 +2040,8 @@ impl Vm {
                                     self.frames.push(frame);
                                     // Enter the callee from what is in hand, not from the
                                     // frame just written.
-                                    fi += 1;
-                                    proto = frame.proto;
-                                    base = nbase;
-                                    fref = f;
                                     ip = frame.ip;
-                                    upvals = frame.upvals;
-                                    env = frame.env;
-                                    env_gen = self.fenv_gen;
                                     k = consts;
-                                    maxstack = ftop - nbase;
                                     self.heap.cur_source = frame.source;
                                     if self.hooked {
                                         self.prof_switch();
@@ -1996,14 +2056,14 @@ impl Vm {
                             Called::Done => {
                                 refresh!();
                                 if c != 0 {
-                                    self.top = base + maxstack;
+                                    self.top = base!() + maxstack!();
                                 }
                                 self.check_gc();
                             }
                         }
                     }
                     Op::TailCall(a, b) => {
-                        let func_idx = base + a as usize;
+                        let func_idx = base!() + a as usize;
                         let nargs = if b == 0 {
                             self.top - func_idx - 1
                         } else {
@@ -2024,7 +2084,8 @@ impl Vm {
                                 }
                             }
                         }
-                        self.close_upvals(base);
+                        let b0 = base!();
+                        self.close_upvals(b0);
                         let me = self.frames.pop().unwrap();
                         let dest = me.func_idx();
                         self.stack.copy_within(func_idx..func_idx + nargs + 1, dest);
@@ -2045,7 +2106,7 @@ impl Vm {
                     }
                     Op::Return(a, b) => {
                         let n = if b == 0 {
-                            self.top - (base + a as usize)
+                            self.top - (base!() + a as usize)
                         } else {
                             b as usize - 1
                         };
@@ -2103,13 +2164,41 @@ impl Vm {
                     }
                     Op::TForLoop(a, nvar) => {
                         let nv = nvar as usize;
+                        // The built-in `next` over a table, stepped without a call: what the
+                        // call would do, minus the frame. An invalid key takes the call, which
+                        // raises from inside `next` as 5.0 does.
+                        if r!(a) == self.builtin_next && !self.builtin_next.is_nil() {
+                            if let V::Table(t) = (r!(a + 1)).unpack() {
+                                if let Ok(step) = self.heap.table(t).next(r!(a + 2)) {
+                                    let (k, v) = step.unwrap_or((Value::Nil, Value::Nil));
+                                    r!(a + 2) = k;
+                                    if nv >= 2 {
+                                        r!(a + 3) = v;
+                                        for i in 2..nv {
+                                            r!(a as usize + 2 + i) = Value::Nil;
+                                        }
+                                    }
+                                    if k.is_nil() {
+                                        ip = unsafe { ip.add(1) };
+                                    } else {
+                                        // SAFETY: a `TForLoop` is always followed by its `Jmp`.
+                                        let Op::Jmp(back) = (unsafe { *ip }) else {
+                                            unreachable!()
+                                        };
+                                        jump!(1 + back);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         let cb = a as usize + nv + 2;
                         r!(cb) = r!(a);
                         r!(cb + 1) = r!(a + 1);
                         r!(cb + 2) = r!(a + 2);
-                        self.top = base + cb + 3;
-                        slow!(self.call_at(base + cb, 2, nv as i32))?;
-                        self.top = base + maxstack;
+                        self.top = base!() + cb + 3;
+                        let b0 = base!();
+                        slow!(self.call_at(b0 + cb, 2, nv as i32))?;
+                        self.top = base!() + maxstack!();
                         for i in 0..nv {
                             r!(a as usize + 2 + i) = r!(cb + i);
                         }
@@ -2139,27 +2228,29 @@ impl Vm {
                         let V::Table(t) = (r!(a)).unpack() else {
                             unreachable!()
                         };
-                        let n = self.top - (base + a as usize) - 1;
+                        let n = self.top - (base!() + a as usize) - 1;
                         for i in (1..=n).rev() {
-                            let v = self.stack[base + a as usize + i];
+                            let v = self.stack[base!() + a as usize + i];
                             self.heap
                                 .table_mut(t)
                                 .set_int((first as usize + i) as i32, v);
                         }
-                        self.top = base + maxstack;
+                        self.top = base!() + maxstack!();
                     }
                     Op::Close(a) => {
-                        self.close_upvals(base + a as usize);
+                        let b0 = base!();
+                        self.close_upvals(b0 + a as usize);
                         refresh!();
                     }
                     Op::Closure(a, px) => {
                         // SAFETY: as `Frame::proto`.
-                        let p = unsafe { &*proto }.protos[px as usize].clone();
+                        let p = unsafe { &*fr!().proto }.protos[px as usize].clone();
                         let env = env!();
+                        let b0 = base!();
                         let mut ups = Vec::with_capacity(p.upvals.len());
                         for &(in_stack, idx) in &p.upvals {
                             ups.push(if in_stack {
-                                self.find_upval(base + idx as usize)
+                                self.find_upval(b0 + idx as usize)
                             } else {
                                 upval!(idx)
                             });
@@ -2173,7 +2264,7 @@ impl Vm {
                         });
                         r!(a) = Value::Func(f);
                         save!();
-                        self.top = base + maxstack;
+                        self.top = base!() + maxstack!();
                         self.check_gc();
                     }
                 }
@@ -2204,6 +2295,7 @@ fn objname_in(p: &Proto, heap: &Heap, pc: usize, reg: usize) -> Option<(&'static
         },
         Op::Move(a, b) if (b as usize) < (a as usize) => objname_in(p, heap, last, b as usize),
         Op::GetTable(_, _, c) => Some(("field", kname(c))),
+        Op::GetField(_, _, kx) => Some(("field", kname(kx + RK_CONST))),
         Op::SelfOp(_, _, c) => Some(("method", kname(c))),
         _ => None,
     }
@@ -2224,6 +2316,7 @@ fn symbexec(p: &Proto, lastpc: usize, reg: usize) -> Option<usize> {
             | Op::GetUpval(a, _)
             | Op::GetGlobal(a, _)
             | Op::GetTable(a, ..)
+            | Op::GetField(a, ..)
             | Op::NewTable(a, ..)
             | Op::Add(a, ..)
             | Op::Sub(a, ..)

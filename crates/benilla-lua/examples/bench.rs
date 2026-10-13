@@ -31,7 +31,11 @@ fn main() {
     // for a profiler.
     if let Some(only) = std::env::args().nth(1) {
         // `noop` measures the fixed cost: a fresh state and a trivial chunk.
-        let src = if only == "noop" {
+        // `-e <chunk>`: any chunk, five times.
+        let custom = std::env::args().nth(2).filter(|_| only == "-e");
+        let src = if let Some(c) = custom.as_deref() {
+            c
+        } else if only == "noop" {
             "return 0"
         } else {
             WORKLOADS
@@ -40,7 +44,9 @@ fn main() {
                 .expect("a workload name")
                 .1
         };
-        let fork = std::env::args().nth(2).is_some_and(|a| a == "fork");
+        let fork = std::env::args()
+            .nth(if custom.is_some() { 3 } else { 2 })
+            .is_some_and(|a| a == "fork");
         for _ in 0..5 {
             if fork {
                 let lua = mlua::Lua::new();

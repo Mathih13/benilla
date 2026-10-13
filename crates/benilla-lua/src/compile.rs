@@ -219,9 +219,9 @@ impl<'a> Fc<'a> {
             let off = target as i32 - (pos as i32 + 1);
             match &mut self.code[pos] {
                 Op::Jmp(o)
-                | Op::JmpCmp(_, _, _, _, o)
-                | Op::JmpCmpK(_, _, _, _, o)
-                | Op::JmpCmpKR(_, _, _, _, o)
+                | Op::JmpCmp(_, _, _, o)
+                | Op::JmpCmpK(_, _, _, o)
+                | Op::JmpCmpKR(_, _, _, o)
                 | Op::JmpIf(_, _, o)
                 | Op::ForLoop(_, o)
                 | Op::TForPrep(_, o) => *o = off,
@@ -532,7 +532,7 @@ impl<'a> Fc<'a> {
                         let r = self.reserve(1)?;
                         self.named_closure(func, r, name)?;
                         self.line = *line;
-                        self.emit(Op::SetTable(ro, rk, r as Rk));
+                        self.emit_set((ro, rk, r as Rk));
                     }
                     _ => unreachable!("funcname is a variable"),
                 }
@@ -622,7 +622,7 @@ impl<'a> Fc<'a> {
                     let rk = self.exp2rk(k)?;
                     let rv = self.exp2rk(e)?;
                     self.line = line;
-                    self.emit(Op::SetTable(ro, rk, rv));
+                    self.emit_set((ro, rk, rv));
                 }
                 _ => unreachable!("the parser checked the target"),
             }
@@ -681,7 +681,7 @@ impl<'a> Fc<'a> {
                     self.emit(Op::SetGlobal(r, k));
                 }
                 Target::Index(ro, rk) => {
-                    self.emit(Op::SetTable(ro, rk, r as Rk));
+                    self.emit_set((ro, rk, r as Rk));
                 }
             }
         }
@@ -777,6 +777,38 @@ impl<'a> Fc<'a> {
 
     // ── expressions ──────────────────────────────────────────────────────────────────────────
 
+    /// The constant `x` names, when it is a string: a field name.
+    fn str_const(&self, x: Rk) -> Option<u16> {
+        (x >= RK_CONST && self.consts[(x - RK_CONST) as usize].as_str().is_some())
+            .then_some(x - RK_CONST)
+    }
+
+    /// `R(dst) = R(t)[RK(key)]`, as `GetField` when the key is a field name.
+    fn emit_get(&mut self, (dst, t, key): (Reg, Reg, Rk)) -> usize {
+        match self.str_const(key) {
+            Some(k) => self.emit(Op::GetField(dst, t, k)),
+            None => self.emit(Op::GetTable(dst, t, key)),
+        }
+    }
+
+    /// `R(t)[RK(key)] = RK(v)`, as `SetField` when the key is a field name.
+    fn emit_set(&mut self, (t, key, v): (Reg, Rk, Rk)) -> usize {
+        match self.str_const(key) {
+            Some(k) => self.emit(Op::SetField(t, k, v)),
+            None => self.emit(Op::SetTable(t, key, v)),
+        }
+    }
+
+    /// `x` in a register: a constant is loaded into a fresh one.
+    fn rk2reg(&mut self, x: Rk) -> R<Reg> {
+        if x < RK_CONST {
+            return Ok(x as Reg);
+        }
+        let r = self.reserve(1)?;
+        self.emit(Op::LoadK(r, (x - RK_CONST) as u32));
+        Ok(r)
+    }
+
     fn exp2anyreg(&mut self, e: &Expr) -> R<u8> {
         match e {
             Expr::Local(id) => Ok(self.reg_of[*id as usize]),
@@ -834,7 +866,7 @@ impl<'a> Fc<'a> {
                 let ro = self.exp2anyreg(o)?;
                 let rk = self.exp2rk(k)?;
                 self.line = *line;
-                self.emit(Op::GetTable(dst, ro, rk));
+                self.emit_get((dst, ro, rk));
             }
             Expr::Call(..) | Expr::Method(..) => {
                 // The top temporary is the call's own base: no move.
@@ -976,11 +1008,18 @@ impl<'a> Fc<'a> {
                 };
                 let (b, c) = if swap { (rc, rb) } else { (rb, rc) };
                 self.line = *line;
-                let cond = jump_when != neg;
+                let cj = CmpJ::new(cmp, jump_when != neg);
+                let small = |x: Rk| x >= RK_CONST && x - RK_CONST < 256;
                 let op = match (b < RK_CONST, c < RK_CONST) {
-                    (true, false) => Op::JmpCmpK(cmp, cond, b as Reg, c - RK_CONST, 0),
-                    (false, true) => Op::JmpCmpKR(cmp, cond, b - RK_CONST, c as Reg, 0),
-                    _ => Op::JmpCmp(cmp, cond, b, c, 0),
+                    (true, false) if small(c) => Op::JmpCmpK(cj, b as Reg, (c - RK_CONST) as u8, 0),
+                    (false, true) if small(b) => {
+                        Op::JmpCmpKR(cj, (b - RK_CONST) as u8, c as Reg, 0)
+                    }
+                    _ => {
+                        let b = self.rk2reg(b)?;
+                        let c = self.rk2reg(c)?;
+                        Op::JmpCmp(cj, b, c, 0)
+                    }
                 };
                 let j = self.emit(op);
                 self.freereg = save;
@@ -1057,14 +1096,14 @@ impl<'a> Fc<'a> {
                         self.exp2anyreg(&Expr::Str(k.clone()))? as Rk
                     };
                     let rv = self.exp2rk(v)?;
-                    self.emit(Op::SetTable(dst, rk, rv));
+                    self.emit_set((dst, rk, rv));
                     self.freereg = save;
                 }
                 Field::Pair(k, v) => {
                     let save = self.freereg;
                     let rk = self.exp2rk(k)?;
                     let rv = self.exp2rk(v)?;
-                    self.emit(Op::SetTable(dst, rk, rv));
+                    self.emit_set((dst, rk, rv));
                     self.freereg = save;
                 }
             }

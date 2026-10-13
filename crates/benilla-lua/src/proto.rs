@@ -20,6 +20,37 @@ pub enum Cmp {
     Le,
 }
 
+/// A comparison and the result that jumps, in one byte, so a compare-and-jump fits in an
+/// eight-byte instruction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CmpJ(u8);
+
+impl CmpJ {
+    pub fn new(cmp: Cmp, cond: bool) -> CmpJ {
+        CmpJ((cmp as u8) << 1 | cond as u8)
+    }
+
+    #[inline(always)]
+    pub fn cmp(self) -> Cmp {
+        match self.0 >> 1 {
+            0 => Cmp::Eq,
+            1 => Cmp::Lt,
+            _ => Cmp::Le,
+        }
+    }
+
+    #[inline(always)]
+    pub fn cond(self) -> bool {
+        self.0 & 1 != 0
+    }
+}
+
+impl std::fmt::Debug for CmpJ {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}={}", self.cmp(), self.cond())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arith {
     Add,
@@ -42,6 +73,10 @@ pub enum Op {
     SetGlobal(Reg, u32),
     GetTable(Reg, Reg, Rk),
     SetTable(Reg, Rk, Rk),
+    /// `R(a) = R(b)[K(c)]` for a string constant key: `GetTable` without the key's type test.
+    GetField(Reg, Reg, u16),
+    /// `R(a)[K(b)] = RK(c)` for a string constant key.
+    SetField(Reg, u16, Rk),
     /// `R(a) = {}` with an array part and a hash part of `2^c` nodes.
     NewTable(Reg, u32, u8),
     /// `R(a+1) = R(b); R(a) = R(b)[RK(c)]`.
@@ -61,12 +96,13 @@ pub enum Op {
     /// `R(a) = R(b) .. ... .. R(c)`.
     Concat(Reg, Reg, Reg),
     Jmp(i32),
-    /// Jump when `cmp(RK(b), RK(c)) == cond`.
-    JmpCmp(Cmp, bool, Rk, Rk, i32),
-    /// `cmp(R(b), K(c))`: the common `n < 2`, `x == nil`.
-    JmpCmpK(Cmp, bool, Reg, u16, i32),
+    /// Jump when `cmp(R(b), R(c)) == cond`.
+    JmpCmp(CmpJ, Reg, Reg, i32),
+    /// `cmp(R(b), K(c))`: the common `n < 2`, `x == nil`. Constants past the first 256 are
+    /// loaded into a register and compared with `JmpCmp`.
+    JmpCmpK(CmpJ, Reg, u8, i32),
     /// `cmp(K(b), R(c))`: `n > 2`, swapped into `2 < n`.
-    JmpCmpKR(Cmp, bool, u16, Reg, i32),
+    JmpCmpKR(CmpJ, u8, Reg, i32),
     /// Jump when the truth of `R(a)` is `cond`.
     JmpIf(Reg, bool, i32),
     /// `b` is the argument count + 1 (0: up to the top), `c` the result count + 1 (0: all).
@@ -91,6 +127,9 @@ pub enum Op {
     Close(Reg),
     Closure(Reg, u32),
 }
+
+// Every instruction is eight bytes: the dispatch loads one word and decodes only its own fields.
+const _: () = assert!(std::mem::size_of::<Op>() == 8);
 
 /// A local's name and the registers' lifetime, for error messages.
 #[derive(Clone, Debug)]
