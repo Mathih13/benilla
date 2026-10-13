@@ -100,7 +100,12 @@ pub(super) fn set_spans(lua: &Lua, spans: Vec<(FrameHandle, Rect, String, String
             .link_buttons
             .retain(|owner, _| model.arena.frame(*owner).is_some());
         for (owner, list) in &by_owner {
-            if model.arena.frame(*owner).is_none() {
+            // Only the SMF (`0x788ce7`) and SimpleHTML (`0x78b052`) take one; ours draws no links.
+            if !model
+                .arena
+                .frame(*owner)
+                .is_some_and(|f| matches!(f.kind_state, KindState::ScrollingMessage(_)))
+            {
                 continue;
             }
             for (i, (rect, link, text)) in list.iter().enumerate() {
