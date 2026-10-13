@@ -79,7 +79,7 @@ enum Key {
     Own,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Entry {
     key: Key,
     /// The creation stamp, from 1; 0 while a file waits for its first draw.
@@ -89,7 +89,7 @@ struct Entry {
 }
 
 /// Every live texture, its stamp and its holders.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Texels {
     entries: Vec<Entry>,
     free: Vec<u32>,

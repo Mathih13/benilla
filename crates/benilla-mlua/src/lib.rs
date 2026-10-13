@@ -52,6 +52,27 @@ pub(crate) struct Inner {
     /// handed.
     cur: Cell<*mut Vm>,
     app: RefCell<HashMap<TypeId, Rc<dyn Any>>>,
+    /// Shared by a state and its forks: a host closure the fork copied still holds handles made
+    /// on the original, and while a callback of the family runs they resolve through its VM.
+    family: u64,
+}
+
+thread_local! {
+    /// The family and VM of the callback running now, if any.
+    static RUNNING: Cell<(u64, *mut Vm)> = const { Cell::new((0, std::ptr::null_mut())) };
+}
+
+static NEXT_FAMILY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Run `f` as a callback of `lua`'s family on `vm`: handles of the family reach `vm`.
+#[inline]
+fn in_callback<T>(lua: &Lua, vm: *mut Vm, f: impl FnOnce() -> T) -> T {
+    let prev = lua.0.cur.replace(vm);
+    let prev_running = RUNNING.replace((lua.0.family, vm));
+    let out = f();
+    RUNNING.set(prev_running);
+    lua.0.cur.set(prev);
+    out
 }
 
 /// A Lua state: a cheap handle, cloned freely, as mlua's is.
@@ -67,16 +88,20 @@ impl Default for Lua {
 impl Lua {
     /// A state with 1.12's libraries open.
     pub fn new() -> Lua {
-        Lua::over(Box::new(benilla_lua::new_state()))
+        Lua::over(
+            Box::new(benilla_lua::new_state()),
+            NEXT_FAMILY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// A state over `vm`, which learns its host here.
-    fn over(mut vm: Box<Vm>) -> Lua {
+    fn over(mut vm: Box<Vm>, family: u64) -> Lua {
         let ptr: *mut Vm = &mut *vm;
         let lua = Lua(Rc::new(Inner {
             _owned: UnsafeCell::new(vm),
             cur: Cell::new(ptr),
             app: RefCell::new(HashMap::new()),
+            family,
         }));
         let host: std::rc::Weak<dyn Any> = Rc::downgrade(&lua.0) as std::rc::Weak<dyn Any>;
         lua.vm().host = Some(host);
@@ -99,16 +124,22 @@ impl Lua {
     /// from, or a template to start many runs from.
     pub fn fork(&self) -> Lua {
         let vm: Vm = self.vm().clone();
-        Lua::over(Box::new(vm))
+        Lua::over(Box::new(vm), self.0.family)
     }
 
     /// The VM in effect. Every use is short and holds nothing across a call into Lua.
     #[allow(clippy::mut_from_ref)]
     #[inline]
     pub(crate) fn vm(&self) -> &mut Vm {
-        // SAFETY: `cur` is the owned VM or a callback's live `&mut Vm`; the facade never keeps
+        let (family, running) = RUNNING.get();
+        let vm = if family == self.0.family {
+            running
+        } else {
+            self.0.cur.get()
+        };
+        // SAFETY: `vm` is the owned VM or a callback's live `&mut Vm`; the facade never keeps
         // the reference past the operation it serves.
-        unsafe { &mut *self.0.cur.get() }
+        unsafe { &mut *vm }
     }
 
     /// The interpreter itself, for code that works below this API.
@@ -220,35 +251,35 @@ impl Lua {
     {
         let host: HostFn = Rc::new(move |vm: &mut Vm, nargs: usize| {
             let lua = Lua::of_vm(vm);
-            let prev = lua.0.cur.replace(vm as *mut Vm);
-            let res = (|| {
-                let args: MultiValue = lua
-                    .vm()
-                    .args(nargs)
-                    .to_vec()
-                    .into_iter()
-                    .map(|v| lua.wrap(v))
-                    .collect();
-                let a = A::from_lua_args(args, &lua)?;
-                func(&lua, a)?.into_lua_multi(&lua)
-            })();
-            let out = match res {
-                Ok(rets) => {
-                    let n = rets.len();
-                    for v in rets.iter() {
-                        let x = lua.unwrap(v);
-                        lua.vm().push(x);
+            in_callback(&lua, vm, || {
+                let res = (|| {
+                    let args: MultiValue = lua
+                        .vm()
+                        .args(nargs)
+                        .to_vec()
+                        .into_iter()
+                        .map(|v| lua.wrap(v))
+                        .collect();
+                    let a = A::from_lua_args(args, &lua)?;
+                    func(&lua, a)?.into_lua_multi(&lua)
+                })();
+                let out = match res {
+                    Ok(rets) => {
+                        let n = rets.len();
+                        for v in rets.iter() {
+                            let x = lua.unwrap(v);
+                            lua.vm().push(x);
+                        }
+                        Ok(n)
                     }
-                    Ok(n)
-                }
-                Err(e) => {
-                    let vm = lua.vm();
-                    let msg = vm.str(e.lua_message().as_bytes());
-                    Err(vm.throw(msg))
-                }
-            };
-            lua.0.cur.set(prev);
-            out
+                    Err(e) => {
+                        let vm = lua.vm();
+                        let msg = vm.str(e.lua_message().as_bytes());
+                        Err(vm.throw(msg))
+                    }
+                };
+                out
+            })
         });
         let f = self.vm().new_host("?", host);
         Ok(Function(self.make_ref(f)))
@@ -434,19 +465,19 @@ impl Lua {
             step,
             Rc::new(move |vm: &mut Vm| {
                 let lua = Lua::of_vm(vm);
-                let prev = lua.0.cur.replace(vm as *mut Vm);
-                let info = lua.vm().frame_info(0).unwrap_or_default();
-                let r = callback(&lua, &Debug { info });
-                let out = match r {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        let vm = lua.vm();
-                        let msg = vm.str(e.lua_message().as_bytes());
-                        Err(vm.throw(msg))
-                    }
-                };
-                lua.0.cur.set(prev);
-                out
+                in_callback(&lua, vm, || {
+                    let info = lua.vm().frame_info(0).unwrap_or_default();
+                    let r = callback(&lua, &Debug { info });
+                    let out = match r {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            let vm = lua.vm();
+                            let msg = vm.str(e.lua_message().as_bytes());
+                            Err(vm.throw(msg))
+                        }
+                    };
+                    out
+                })
             }),
         );
         Ok(())
