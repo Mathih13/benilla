@@ -602,6 +602,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "benilla-lua"
+version = "0.2.0"
+dependencies = [
+ "benilla-formats",
+ "mlua",
+ "roxmltree",
+]
+
+[[package]]
 name = "benilla-m2"
 version = "0.2.0"
 dependencies = [
