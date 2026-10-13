@@ -474,7 +474,8 @@ impl Heap {
         let mut gray_upvals: Vec<u32> = extra_upvals.to_vec();
         let mut weak_tables: Vec<u32> = Vec::new();
         // Constants of every reached prototype, once each.
-        let mut seen_protos: std::collections::HashSet<*const Proto> = Default::default();
+        // A number no other collection, in any VM, has used: prototypes are shared by forks.
+        let epoch = GC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         loop {
             if let Some(u) = gray_upvals.pop() {
                 if !self.upvals.marks[u as usize] {
@@ -540,7 +541,7 @@ impl Heap {
                         } => {
                             gray.push(Value::Table(*env));
                             gray_upvals.extend_from_slice(upvals);
-                            mark_proto(proto, &mut gray, &mut seen_protos);
+                            mark_proto(proto, &mut gray, epoch);
                         }
                         FuncObj::Native { upvals, env, .. } => {
                             gray.push(Value::Table(*env));
@@ -661,17 +662,18 @@ fn is_collectable(v: Value) -> bool {
     )
 }
 
-fn mark_proto(
-    p: &Rc<Proto>,
-    gray: &mut Vec<Value>,
-    seen: &mut std::collections::HashSet<*const Proto>,
-) {
-    if !seen.insert(Rc::as_ptr(p)) {
+/// Hands out collection numbers for `Proto::gc_mark`.
+static GC_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Constants of `p` and its nested prototypes, once per collection.
+fn mark_proto(p: &Rc<Proto>, gray: &mut Vec<Value>, epoch: u32) {
+    if p.gc_mark.get() == epoch {
         return;
     }
+    p.gc_mark.set(epoch);
     gray.extend(p.consts.iter().copied().filter(|v| is_collectable(*v)));
     for q in &p.protos {
-        mark_proto(q, gray, seen);
+        mark_proto(q, gray, epoch);
     }
 }
 

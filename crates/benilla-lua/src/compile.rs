@@ -201,6 +201,7 @@ impl<'a> Fc<'a> {
             locvars: self.locvars,
             key: self.key,
             source_id: self.heap.source_id(&f.source),
+            gc_mark: Default::default(),
         }))
     }
 

@@ -173,6 +173,8 @@ pub struct Proto {
     pub key: Bytes,
     /// `source`'s id in the heap's chunk list, for profiles and memory censuses.
     pub source_id: u32,
+    /// The collection that last marked this prototype's constants (`Heap::collect`).
+    pub(crate) gc_mark: std::cell::Cell<u32>,
 }
 
 impl Proto {

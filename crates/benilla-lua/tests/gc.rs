@@ -72,3 +72,22 @@ fn a_freed_string_slot_is_safe_to_reuse_as_a_key() {
     );
     let _ = Value::Nil;
 }
+
+/// Forks share their prototypes: a collection in one must not stop the other marking the
+/// constants of the code they share.
+#[test]
+fn forks_sharing_code_each_keep_its_constants() {
+    let mut a = benilla_lua::new_state();
+    run(&mut a, "function f() return 'a constant string, longer than inline' .. 1 end");
+    let mut b = a.clone();
+    for _ in 0..4 {
+        a.full_gc();
+        b.full_gc();
+        // Churn, so a freed constant's slot is reused.
+        run(&mut a, "for i = 1, 2000 do local s = 'x' .. i end");
+        run(&mut b, "for i = 1, 2000 do local s = 'y' .. i end");
+    }
+    let want = "a constant string, longer than inline1";
+    assert_eq!(run(&mut a, "return f()"), want);
+    assert_eq!(run(&mut b, "return f()"), want);
+}
