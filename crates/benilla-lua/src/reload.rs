@@ -1,0 +1,108 @@
+//! Hot reload: new code for a chunk's functions, swapped into the closures that already exist.
+//! Nothing reruns, so every table, upvalue and registration the chunk made stays; a handler a
+//! frame holds, a hook in another addon's table, a callback in a list all run the new code from
+//! their next call. A frame already executing finishes on the old code.
+
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use crate::ast::Bytes;
+use crate::heap::FuncObj;
+use crate::proto::Proto;
+use crate::vm::Vm;
+use crate::SyntaxError;
+
+/// What a reload did, by function key.
+#[derive(Debug, Default)]
+pub struct Report {
+    /// Live closures now running new code.
+    pub closures: usize,
+    /// Functions whose live closures were swapped.
+    pub swapped: Vec<String>,
+    /// Functions whose captured variables changed, left on the old code: a full reload's work.
+    pub reshaped: Vec<String>,
+    /// Functions only the new source has; they exist once their definition runs again.
+    pub added: Vec<String>,
+    /// Functions only the old source had, with live closures still on the old code.
+    pub removed: Vec<String>,
+}
+
+fn walk(p: &Rc<Proto>, out: &mut HashMap<Bytes, Rc<Proto>>) {
+    out.insert(p.key.clone(), p.clone());
+    for q in &p.protos {
+        walk(q, out);
+    }
+}
+
+fn show(k: &[u8]) -> String {
+    String::from_utf8_lossy(k).into_owned()
+}
+
+impl Vm {
+    /// Compile `src` as the chunk `chunkname` and swap each of its functions into the live
+    /// closures of the same function. A syntax error leaves everything as it was.
+    pub fn hot_reload(&mut self, chunkname: &[u8], src: &[u8]) -> Result<Report, SyntaxError> {
+        let ast = crate::parse::parse(src, chunkname)?;
+        let root = crate::compile::compile(&ast, &mut self.heap)?;
+        let mut fresh = HashMap::new();
+        walk(&root, &mut fresh);
+        let mut report = Report::default();
+        let mut seen: HashMap<Bytes, bool> = HashMap::new();
+        for f in self.heap.funcs_mut() {
+            let FuncObj::Lua { proto, upvals, .. } = f else {
+                continue;
+            };
+            // The main function ran once; it is not swapped.
+            if &*proto.source != chunkname || proto.key.is_empty() {
+                continue;
+            }
+            let key = proto.key.clone();
+            let Some(new) = fresh.get(&key) else {
+                seen.entry(key).or_insert(false);
+                continue;
+            };
+            // The new function's upvalues, by name, from the closure's existing ones.
+            let remap: Option<Vec<u32>> = new
+                .upval_names
+                .iter()
+                .map(|n| {
+                    proto
+                        .upval_names
+                        .iter()
+                        .position(|o| o == n)
+                        .map(|i| upvals[i])
+                })
+                .collect();
+            match remap {
+                Some(ups) => {
+                    *proto = new.clone();
+                    *upvals = ups.into_boxed_slice();
+                    report.closures += 1;
+                    seen.insert(key, true);
+                }
+                None => {
+                    report.reshaped.push(show(&key));
+                    seen.entry(key).or_insert(false);
+                }
+            }
+        }
+        for (k, swapped) in &seen {
+            if *swapped {
+                report.swapped.push(show(k));
+            } else if !fresh.contains_key(k) {
+                report.removed.push(show(k));
+            }
+        }
+        for k in fresh.keys() {
+            if !k.is_empty() && !seen.contains_key(k) {
+                report.added.push(show(k));
+            }
+        }
+        report.swapped.sort();
+        report.reshaped.sort();
+        report.reshaped.dedup();
+        report.added.sort();
+        report.removed.sort();
+        Ok(report)
+    }
+}

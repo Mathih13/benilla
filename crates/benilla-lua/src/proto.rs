@@ -104,6 +104,9 @@ pub struct Proto {
     pub source: Bytes,
     pub line_defined: u32,
     pub locvars: Vec<LocVar>,
+    /// The function's identity within its chunk, stable across edits that leave its name and
+    /// nesting alone: `Frame:OnEvent`, `local helper`, `Init/anon#2`. Hot reload matches on it.
+    pub key: Bytes,
 }
 
 impl Proto {

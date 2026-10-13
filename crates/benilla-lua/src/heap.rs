@@ -220,6 +220,11 @@ impl Heap {
         self.funcs.get_mut(f.0)
     }
 
+    /// Every live function, for a hot reload's walk.
+    pub fn funcs_mut(&mut self) -> impl Iterator<Item = &mut FuncObj> {
+        self.funcs.items.iter_mut().flatten()
+    }
+
     pub fn new_upval(&mut self, u: UpvalObj) -> u32 {
         self.bytes += 24;
         self.upvals.alloc(u)

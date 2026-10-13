@@ -15,6 +15,7 @@ pub mod lib_table;
 pub mod number;
 pub mod parse;
 pub mod proto;
+pub mod reload;
 pub mod table;
 pub mod value;
 pub mod vm;

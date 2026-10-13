@@ -17,8 +17,23 @@ type R<T> = Result<T, SyntaxError>;
 
 /// Compile a parsed main function.
 pub fn compile(f: &Func, heap: &mut Heap) -> R<Rc<Proto>> {
-    let fc = Fc::new(f, heap, &[]);
+    let fc = Fc::new(f, heap, &[], Rc::from(&b""[..]));
     fc.run()
+}
+
+/// A function's name as its definition gives it: `a.b.c`, or none.
+fn def_name(target: &Expr) -> Option<Vec<u8>> {
+    match target {
+        Expr::Global(n) => Some(n.to_vec()),
+        Expr::Index(o, k, _) => {
+            let mut out = def_name(o)?;
+            let Expr::Str(k) = &**k else { return None };
+            out.push(b'.');
+            out.extend_from_slice(k);
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,6 +69,9 @@ struct Fc<'a> {
     /// `locvars` index of each active local, innermost last.
     active_vars: Vec<usize>,
     upvals: Vec<(bool, u16)>,
+    /// This function's [`Proto::key`], and how often each child name was used.
+    key: Bytes,
+    child_names: HashMap<Vec<u8>, u32>,
 }
 
 /// `luaO_int2fb`: 5.0's "floating point byte" for a constructor's array hint.
@@ -96,7 +114,7 @@ enum Target {
 }
 
 impl<'a> Fc<'a> {
-    fn new(f: &'a Func, heap: &'a mut Heap, parent_regs: &[u8]) -> Fc<'a> {
+    fn new(f: &'a Func, heap: &'a mut Heap, parent_regs: &[u8], key: Bytes) -> Fc<'a> {
         let upvals = f
             .upvals
             .iter()
@@ -125,7 +143,25 @@ impl<'a> Fc<'a> {
             locvars: Vec::new(),
             active_vars: Vec::new(),
             upvals,
+            key,
+            child_names: HashMap::new(),
         }
+    }
+
+    /// A child's key: this one's, then the child's name, numbered when it repeats.
+    fn child_key(&mut self, name: Option<Vec<u8>>) -> Bytes {
+        let base = name.unwrap_or_else(|| b"anon".to_vec());
+        let n = self.child_names.entry(base.clone()).or_insert(0);
+        *n += 1;
+        let mut k = self.key.to_vec();
+        if !k.is_empty() {
+            k.push(b'/');
+        }
+        k.extend_from_slice(&base);
+        if *n > 1 {
+            k.extend_from_slice(format!("#{n}").as_bytes());
+        }
+        Rc::from(k)
     }
 
     fn run(mut self) -> R<Rc<Proto>> {
@@ -156,6 +192,7 @@ impl<'a> Fc<'a> {
             source: f.source.clone(),
             line_defined: f.line_defined,
             locvars: self.locvars,
+            key: self.key,
         }))
     }
 
@@ -342,7 +379,9 @@ impl<'a> Fc<'a> {
             Stat::LocalFunction { var, func } => {
                 self.activate(*var)?;
                 let reg = self.reg_of[*var as usize];
-                self.closure(func, reg)?;
+                let mut name = b"local ".to_vec();
+                name.extend_from_slice(&self.f.locals[*var as usize].name);
+                self.named_closure(func, reg, Some(name))?;
             }
             Stat::Assign {
                 targets,
@@ -463,19 +502,24 @@ impl<'a> Fc<'a> {
             }
             Stat::Function { target, func, line } => {
                 self.line = *line;
+                let name = match target {
+                    Expr::Local(id) => Some(self.f.locals[*id as usize].name.to_vec()),
+                    Expr::Upval(i) => Some(self.f.upvals[*i as usize].name.to_vec()),
+                    _ => def_name(target),
+                };
                 match target {
                     Expr::Local(id) => {
                         let reg = self.reg_of[*id as usize];
-                        self.closure(func, reg)?;
+                        self.named_closure(func, reg, name)?;
                     }
                     Expr::Upval(i) => {
                         let r = self.reserve(1)?;
-                        self.closure(func, r)?;
+                        self.named_closure(func, r, name)?;
                         self.emit(Op::SetUpval(r, *i));
                     }
                     Expr::Global(n) => {
                         let r = self.reserve(1)?;
-                        self.closure(func, r)?;
+                        self.named_closure(func, r, name)?;
                         let k = self.kstr(n);
                         self.emit(Op::SetGlobal(r, k));
                     }
@@ -483,7 +527,7 @@ impl<'a> Fc<'a> {
                         let ro = self.exp2anyreg(o)?;
                         let rk = self.exp2rk(k)?;
                         let r = self.reserve(1)?;
-                        self.closure(func, r)?;
+                        self.named_closure(func, r, name)?;
                         self.line = *line;
                         self.emit(Op::SetTable(ro, rk, r as Rk));
                     }
@@ -932,7 +976,12 @@ impl<'a> Fc<'a> {
     }
 
     fn closure(&mut self, f: &Func, dst: u8) -> R<()> {
-        let proto = Fc::new(f, self.heap, &self.reg_of).run()?;
+        self.named_closure(f, dst, None)
+    }
+
+    fn named_closure(&mut self, f: &Func, dst: u8, name: Option<Vec<u8>>) -> R<()> {
+        let key = self.child_key(name);
+        let proto = Fc::new(f, self.heap, &self.reg_of, key).run()?;
         self.protos.push(proto);
         self.emit(Op::Closure(dst, (self.protos.len() - 1) as u32));
         Ok(())
