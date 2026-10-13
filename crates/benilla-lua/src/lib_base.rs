@@ -5,7 +5,7 @@
 use crate::api::{c_int, R};
 use crate::heap::FuncObj;
 use crate::number::fmt_g14;
-use crate::value::Value;
+use crate::value::{Value, V};
 use crate::vm::Vm;
 
 pub fn open(vm: &mut Vm) {
@@ -64,9 +64,9 @@ fn getmetatable(vm: &mut Vm, nargs: usize) -> R<usize> {
 fn setmetatable(vm: &mut Vm, nargs: usize) -> R<usize> {
     let mt = vm.arg(nargs, 1);
     let t = vm.check_table(nargs, 1)?;
-    let mt = match mt {
-        Value::Nil => None,
-        Value::Table(m) if nargs >= 2 => Some(m),
+    let mt = match mt.unpack() {
+        V::Nil => None,
+        V::Table(m) if nargs >= 2 => Some(m),
         _ => return Err(vm.arg_error(2, "nil or table expected")),
     };
     if !vm.metafield(Value::Table(t), b"__metatable").is_nil() {
@@ -79,7 +79,7 @@ fn setmetatable(vm: &mut Vm, nargs: usize) -> R<usize> {
 /// `getfunc`: argument 1 as a function, or the function at that stack level.
 fn getfunc(vm: &mut Vm, nargs: usize) -> R<Value> {
     let a = vm.arg(nargs, 0);
-    if let Value::Func(_) = a {
+    if let V::Func(_) = a.unpack() {
         return Ok(a);
     }
     let level = vm.opt_int(nargs, 1, 1)?;
@@ -97,8 +97,8 @@ fn getfunc(vm: &mut Vm, nargs: usize) -> R<Value> {
 }
 
 fn fenv(vm: &Vm, f: Value) -> Value {
-    match f {
-        Value::Func(f) => match vm.heap.func(f) {
+    match f.unpack() {
+        V::Func(f) => match vm.heap.func(f) {
             FuncObj::Lua { env, .. } | FuncObj::Native { env, .. } => Value::Table(*env),
         },
         _ => Value::Table(vm.globals),
@@ -110,8 +110,8 @@ fn getfenv(vm: &mut Vm, nargs: usize) -> R<usize> {
     let env = fenv(vm, f);
     // `aux_getfenv`: a `__fenv` field answers in the environment's place.
     let k = vm.str(b"__fenv");
-    let fe = match env {
-        Value::Table(t) => vm.heap.table(t).get(k),
+    let fe = match env.unpack() {
+        V::Table(t) => vm.heap.table(t).get(k),
         _ => Value::Nil,
     };
     Ok(vm.ret1(if fe.is_nil() { env } else { fe }))
@@ -128,13 +128,13 @@ fn setfenv(vm: &mut Vm, nargs: usize) -> R<usize> {
     let f = getfunc(vm, nargs)?;
     let env = fenv(vm, f);
     let k = vm.str(b"__fenv");
-    if let Value::Table(e) = env {
+    if let V::Table(e) = env.unpack() {
         if !vm.heap.table(e).get(k).is_nil() {
             return Err(vm.error_at(1, "`setfenv' cannot change a protected environment"));
         }
     }
-    match f {
-        Value::Func(fr) => match vm.heap.func_mut(fr) {
+    match f.unpack() {
+        V::Func(fr) => match vm.heap.func_mut(fr) {
             FuncObj::Lua { env, .. } => {
                 *env = t;
                 vm.fenv_gen += 1;
@@ -262,11 +262,11 @@ fn strtoul(s: &[u8], base: u32) -> Option<u32> {
 
 /// A synthetic address for `tostring`: stable per object, in MSVC's `%p` shape.
 fn address(v: Value) -> u32 {
-    let (kind, id) = match v {
-        Value::Table(r) => (1u32, r.0),
-        Value::Func(r) => (2, r.0),
-        Value::User(r) => (3, r.0),
-        Value::Light(p) => return p as u32,
+    let (kind, id) = match v.unpack() {
+        V::Table(r) => (1u32, r.0),
+        V::Func(r) => (2, r.0),
+        V::User(r) => (3, r.0),
+        V::Light(p) => return p as u32,
         _ => (0, 0),
     };
     0x1000_0000u32
@@ -280,11 +280,11 @@ pub fn tostring_value(vm: &mut Vm, v: Value) -> R<Value> {
         let r = vm.call_value(tm, &[v], 1)?;
         return Ok(r[0]);
     }
-    Ok(match v {
-        Value::Num(n) => vm.str(fmt_g14(n).as_bytes()),
-        Value::Str(_) => v,
-        Value::Bool(b) => vm.str(if b { b"true" } else { b"false" }),
-        Value::Nil => vm.str(b"nil"),
+    Ok(match v.unpack() {
+        V::Num(n) => vm.str(fmt_g14(n).as_bytes()),
+        V::Str(_) => v,
+        V::Bool(b) => vm.str(if b { b"true" } else { b"false" }),
+        V::Nil => vm.str(b"nil"),
         _ => {
             let s = format!("{}: {:08X}", v.type_name(), address(v));
             vm.str(s.as_bytes())
@@ -317,7 +317,7 @@ fn assert(vm: &mut Vm, nargs: usize) -> R<usize> {
 /// `luaL_getn`: `t.n` if numeric, else the size `setn` remembered, else a count to the first nil.
 pub fn getn(vm: &mut Vm, t: crate::value::TableRef) -> usize {
     let n = vm.heap.table(t).get(Value::Str(vm.names.n));
-    if let Value::Num(x) = n {
+    if let V::Num(x) = n.unpack() {
         let i = c_int(x);
         if i >= 0 {
             return i as usize;
@@ -332,7 +332,7 @@ pub fn getn(vm: &mut Vm, t: crate::value::TableRef) -> usize {
 /// `luaL_setn`: into `t.n` when the table has a numeric one, else the remembered size.
 pub fn setn(vm: &mut Vm, t: crate::value::TableRef, n: usize) {
     let key = Value::Str(vm.names.n);
-    let has_n = matches!(vm.heap.table(t).get(key), Value::Num(x) if c_int(x) >= 0);
+    let has_n = matches!((vm.heap.table(t).get(key)).unpack(), V::Num(x) if c_int(x) >= 0);
     if has_n {
         vm.heap.table_mut(t).set(key, Value::Num(n as f64)).unwrap();
     } else {

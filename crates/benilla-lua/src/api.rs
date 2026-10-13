@@ -1,7 +1,7 @@
 //! What a native function sees: 5.0's `lauxlib` checks and results, over [`Vm`].
 
 use crate::heap::{FuncObj, NativeFn};
-use crate::value::{StrRef, TableRef, Value};
+use crate::value::{StrRef, TableRef, Value, V};
 use crate::vm::{LuaError, Vm};
 
 pub type R<T> = Result<T, LuaError>;
@@ -23,16 +23,17 @@ impl Vm {
 
     /// `luaL_checktype(L, n, LUA_TTABLE)`.
     pub fn check_table(&mut self, nargs: usize, n: usize) -> R<TableRef> {
-        match self.arg(nargs, n - 1) {
-            Value::Table(t) if n <= nargs => Ok(t),
+        match self.arg(nargs, n - 1).as_table() {
+            Some(t) if n <= nargs => Ok(t),
             _ => Err(self.type_arg_error(nargs, n, "table")),
         }
     }
 
     /// `luaL_checktype(L, n, LUA_TFUNCTION)`.
     pub fn check_function(&mut self, nargs: usize, n: usize) -> R<Value> {
-        match self.arg(nargs, n - 1) {
-            v @ Value::Func(_) if n <= nargs => Ok(v),
+        let v = self.arg(nargs, n - 1);
+        match v.as_func() {
+            Some(_) if n <= nargs => Ok(v),
             _ => Err(self.type_arg_error(nargs, n, "function")),
         }
     }
@@ -145,6 +146,6 @@ impl Vm {
 
     /// `lua_isstring`: a string or a number.
     pub fn is_string(&self, v: Value) -> bool {
-        matches!(v, Value::Str(_) | Value::Num(_))
+        matches!(v.unpack(), V::Str(_) | V::Num(_))
     }
 }

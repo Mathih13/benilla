@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::proto::Proto;
 use crate::table::Table;
-use crate::value::{FuncRef, StrRef, TableRef, UserRef, Value};
+use crate::value::{FuncRef, StrRef, TableRef, UserRef, Value, STR_HASH_MASK, STR_ID_BITS, V};
 
 /// A native function. Its arguments are the `nargs` values below the top of the stack; it pushes
 /// its results and answers how many.
@@ -80,12 +80,34 @@ impl<T> Arena<T> {
 
     #[inline]
     fn get(&self, i: u32) -> &T {
-        self.items[i as usize].as_ref().expect("a live handle")
+        debug_assert!(
+            self.items.get(i as usize).is_some_and(Option::is_some),
+            "a live handle"
+        );
+        // SAFETY: a handle the VM dereferences is reachable, and the collector frees nothing
+        // reachable; a stale handle (an uncleared register) is only ever read by the
+        // collector, which checks it first (`Heap::is_live`).
+        unsafe {
+            self.items
+                .get_unchecked(i as usize)
+                .as_ref()
+                .unwrap_unchecked()
+        }
     }
 
     #[inline]
     fn get_mut(&mut self, i: u32) -> &mut T {
-        self.items[i as usize].as_mut().expect("a live handle")
+        debug_assert!(
+            self.items.get(i as usize).is_some_and(Option::is_some),
+            "a live handle"
+        );
+        // SAFETY: as `get`.
+        unsafe {
+            self.items
+                .get_unchecked_mut(i as usize)
+                .as_mut()
+                .unwrap_unchecked()
+        }
     }
 
     fn live(&self) -> usize {
@@ -147,7 +169,10 @@ impl Heap {
         while i != u32::MAX {
             let o = self.strs.get(i);
             if o.hash == hash && &*o.bytes == s {
-                return StrRef { id: i, hash };
+                return StrRef {
+                    id: i,
+                    hash: hash & STR_HASH_MASK,
+                };
             }
             i = o.next;
         }
@@ -158,10 +183,18 @@ impl Heap {
             next: self.strt[b],
         });
         self.strt[b] = id;
+        // A string value holds its id in `STR_ID_BITS`: sixteen million live strings.
+        assert!(
+            id < 1 << STR_ID_BITS,
+            "more live strings than a value can name"
+        );
         if self.strs.live() > self.strt.len() {
             self.resize_strt(self.strt.len() * 2);
         }
-        StrRef { id, hash }
+        StrRef {
+            id,
+            hash: hash & STR_HASH_MASK,
+        }
     }
 
     fn resize_strt(&mut self, size: usize) {
@@ -255,9 +288,9 @@ impl Heap {
 
     /// The metatable of a value: tables and userdata carry one; 1.12 has none for any other type.
     pub fn metatable(&self, v: Value) -> Option<TableRef> {
-        match v {
-            Value::Table(t) => self.table(t).meta,
-            Value::User(u) => self.user(u).meta,
+        match v.unpack() {
+            V::Table(t) => self.table(t).meta,
+            V::User(u) => self.user(u).meta,
             _ => None,
         }
     }
@@ -301,9 +334,9 @@ impl Heap {
             if !self.is_live(v) {
                 continue;
             }
-            match v {
-                Value::Str(s) => self.strs.marks[s.id as usize] = true,
-                Value::Table(t) => {
+            match v.unpack() {
+                V::Str(s) => self.strs.marks[s.id as usize] = true,
+                V::Table(t) => {
                     if self.tables.marks[t.0 as usize] {
                         continue;
                     }
@@ -321,27 +354,24 @@ impl Heap {
                         weak_tables.push(t.0);
                     }
                     // Strings are values, never cleared from a weak table: always marked.
-                    gray.extend(
-                        tab.array
-                            .iter()
-                            .copied()
-                            .filter(|v| is_collectable(*v) && (!wv || matches!(v, Value::Str(_)))),
-                    );
+                    gray.extend(tab.array.iter().copied().filter(|v| {
+                        is_collectable(*v) && (!wv || matches!(v.unpack(), V::Str(_)))
+                    }));
                     for n in &tab.node {
                         if n.val.is_nil() {
                             continue;
                         }
                         // A weak entry's strings stay: strings are values, never cleared.
-                        if !wk || matches!(n.key, Value::Str(_)) {
+                        if !wk || matches!(n.key.unpack(), V::Str(_)) {
                             gray.push(n.key);
                         }
-                        if !wv || matches!(n.val, Value::Str(_)) {
+                        if !wv || matches!(n.val.unpack(), V::Str(_)) {
                             gray.push(n.val);
                         }
                     }
                     self.tables.get_mut(t.0).weak = weak;
                 }
-                Value::Func(f) => {
+                V::Func(f) => {
                     if self.funcs.marks[f.0 as usize] {
                         continue;
                     }
@@ -358,7 +388,7 @@ impl Heap {
                         }
                     }
                 }
-                Value::User(u) => {
+                V::User(u) => {
                     if self.users.marks[u.0 as usize] {
                         continue;
                     }
@@ -378,10 +408,10 @@ impl Heap {
                 &self.funcs.marks,
                 &self.users.marks,
             );
-            let alive = |v: Value| match v {
-                Value::Table(r) => marks.1[r.0 as usize],
-                Value::Func(r) => marks.2[r.0 as usize],
-                Value::User(r) => marks.3[r.0 as usize],
+            let alive = |v: Value| match v.unpack() {
+                V::Table(r) => marks.1[r.0 as usize],
+                V::Func(r) => marks.2[r.0 as usize],
+                V::User(r) => marks.3[r.0 as usize],
                 _ => true,
             };
             let tab = self.tables.items[t as usize].as_mut().unwrap();
@@ -427,23 +457,23 @@ impl Heap {
 
     /// Whether a value's object still exists; anything not collectable does.
     fn is_live(&self, v: Value) -> bool {
-        match v {
-            Value::Str(s) => self
+        match v.unpack() {
+            V::Str(s) => self
                 .strs
                 .items
                 .get(s.id as usize)
                 .is_some_and(Option::is_some),
-            Value::Table(t) => self
+            V::Table(t) => self
                 .tables
                 .items
                 .get(t.0 as usize)
                 .is_some_and(Option::is_some),
-            Value::Func(f) => self
+            V::Func(f) => self
                 .funcs
                 .items
                 .get(f.0 as usize)
                 .is_some_and(Option::is_some),
-            Value::User(u) => self
+            V::User(u) => self
                 .users
                 .items
                 .get(u.0 as usize)
@@ -454,8 +484,8 @@ impl Heap {
 
     /// `__mode` of a metatable: bit 0 weak keys, bit 1 weak values.
     fn weak_mode(&self, meta: TableRef, mode_key: StrRef) -> u8 {
-        match self.table(meta).get(Value::Str(mode_key)) {
-            Value::Str(s) => {
+        match (self.table(meta).get(Value::Str(mode_key))).unpack() {
+            V::Str(s) => {
                 let m = self.str(s);
                 (m.contains(&b'k') as u8) | ((m.contains(&b'v') as u8) << 1)
             }
@@ -466,8 +496,8 @@ impl Heap {
 
 fn is_collectable(v: Value) -> bool {
     matches!(
-        v,
-        Value::Str(_) | Value::Table(_) | Value::Func(_) | Value::User(_)
+        v.unpack(),
+        V::Str(_) | V::Table(_) | V::Func(_) | V::User(_)
     )
 }
 

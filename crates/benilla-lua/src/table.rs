@@ -3,7 +3,7 @@
 //! `next` walks keys in the order the client does (keys hashed by address excepted: a table,
 //! function or userdata key is hashed by its handle here).
 
-use crate::value::{TableRef, Value};
+use crate::value::{TableRef, Value, V};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Node {
@@ -69,7 +69,7 @@ fn log2(x: u32) -> i32 {
 
 /// 5.0's `arrayindex`: a key that may live in the array part, or `None`.
 fn arrayindex(key: Value) -> Option<usize> {
-    if let Value::Num(n) = key {
+    if let V::Num(n) = key.unpack() {
         if let Some(k) = num_to_int(n) {
             if k >= 1 && (k as u32) <= (1 << MAXBITS) {
                 return Some(k as usize);
@@ -128,39 +128,38 @@ impl Table {
     /// `luaH_mainposition`.
     fn mainposition(&self, key: Value) -> usize {
         let mask = self.sizenode() - 1;
-        match key {
-            Value::Num(n) => {
+        match key.unpack() {
+            V::Num(n) => {
                 // `hashnum`: `n + 1` (so -0 and 0 agree), its two 32-bit words summed.
                 let bits = (n + 1.0).to_bits();
                 let h = (bits as u32).wrapping_add((bits >> 32) as u32);
                 self.hashmod(h)
             }
-            Value::Str(s) => s.hash as usize & mask,
-            Value::Bool(b) => b as usize & mask,
-            Value::Table(r) => self.hashmod(r.0),
-            Value::Func(r) => self.hashmod(r.0),
-            Value::User(r) => self.hashmod(r.0),
-            Value::Light(p) => self.hashmod(p as u32),
-            Value::Nil => 0,
+            V::Str(s) => s.hash as usize & mask,
+            V::Bool(b) => b as usize & mask,
+            V::Table(r) => self.hashmod(r.0),
+            V::Func(r) => self.hashmod(r.0),
+            V::User(r) => self.hashmod(r.0),
+            V::Light(p) => self.hashmod(p as u32),
+            V::Nil => 0,
         }
     }
 
     /// `luaH_get`: the slot holding `key`, which may hold `nil`.
     pub fn find(&self, key: Value) -> Option<Slot> {
-        match key {
-            Value::Nil => None,
-            Value::Num(n) => match num_to_int(n) {
+        match key.unpack() {
+            V::Nil => None,
+            V::Num(n) => match num_to_int(n) {
                 Some(k) => self.find_int(k),
                 None => self.find_chain(key),
             },
-            Value::Str(s) => {
+            V::Str(s) => {
                 let mut i = s.hash as usize & (self.sizenode() - 1);
                 loop {
                     let n = &self.node[i];
-                    if let Value::Str(k) = n.key {
-                        if k.id == s.id {
-                            return Some(Slot::Node(i));
-                        }
+                    // One string, one bit pattern: id and hash bits alike.
+                    if n.key == key {
+                        return Some(Slot::Node(i));
                     }
                     if n.next < 0 {
                         return None;
@@ -181,10 +180,8 @@ impl Table {
         let mut i = self.mainposition(Value::Num(nk));
         loop {
             let n = &self.node[i];
-            if let Value::Num(x) = n.key {
-                if x == nk {
-                    return Some(Slot::Node(i));
-                }
+            if n.key.as_num() == Some(nk) {
+                return Some(Slot::Node(i));
             }
             if n.next < 0 {
                 return None;
@@ -233,22 +230,20 @@ impl Table {
     /// [`Table::get`] with the key read in place.
     #[inline(always)]
     pub fn get_ref(&self, key: &Value) -> Value {
-        match *key {
-            Value::Num(n) => {
+        match (*key).unpack() {
+            V::Num(n) => {
                 let k = n as i32;
                 let i = (k as usize).wrapping_sub(1);
                 if k as f64 == n && i < self.array.len() {
                     return self.array[i];
                 }
             }
-            Value::Str(s) => {
+            V::Str(s) => {
                 let mut i = s.hash as usize & (self.node.len() - 1);
                 loop {
                     let n = &self.node[i];
-                    if let Value::Str(k) = n.key {
-                        if k.id == s.id {
-                            return n.val;
-                        }
+                    if n.key == *key {
+                        return n.val;
                     }
                     if n.next < 0 {
                         return Value::Nil;
@@ -264,7 +259,7 @@ impl Table {
     /// The array slot an integer key lands in, if the array part holds it.
     #[inline]
     fn array_index(&self, key: Value) -> Option<usize> {
-        if let Value::Num(n) = key {
+        if let V::Num(n) = key.unpack() {
             let k = n as i32;
             let i = (k as usize).wrapping_sub(1);
             if k as f64 == n && i < self.array.len() {
@@ -310,9 +305,9 @@ impl Table {
             }
             return Ok(s);
         }
-        match key {
-            Value::Nil => Err(KeyError::Nil),
-            Value::Num(n) if n.is_nan() => Err(KeyError::NaN),
+        match key.unpack() {
+            V::Nil => Err(KeyError::Nil),
+            V::Num(n) if n.is_nan() => Err(KeyError::NaN),
             _ => Ok(self.newkey(key)),
         }
     }
@@ -518,7 +513,7 @@ mod tests {
             let k = if i % 3 == 0 {
                 Value::Str(StrRef {
                     id: i,
-                    hash: i.wrapping_mul(2654435761),
+                    hash: i.wrapping_mul(2654435761) & crate::value::STR_HASH_MASK,
                 })
             } else {
                 n(i as f64 * 0.5)

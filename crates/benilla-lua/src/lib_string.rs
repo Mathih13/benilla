@@ -4,7 +4,7 @@
 
 use crate::api::R;
 use crate::cfmt::{self, Spec};
-use crate::value::Value;
+use crate::value::{Value, V};
 use crate::vm::{LuaError, Vm};
 
 pub fn open(vm: &mut Vm) {
@@ -660,7 +660,7 @@ fn gfind(vm: &mut Vm, nargs: usize) -> R<usize> {
 }
 
 fn gfind_aux(vm: &mut Vm, _nargs: usize) -> R<usize> {
-    let (Value::Str(s), Value::Str(p)) = (vm.upvalue(0), vm.upvalue(1)) else {
+    let (V::Str(s), V::Str(p)) = ((vm.upvalue(0)).unpack(), (vm.upvalue(1)).unpack()) else {
         return Ok(0);
     };
     let pos = vm.tonumber(vm.upvalue(2)).unwrap_or(0.0) as usize;
@@ -698,11 +698,11 @@ fn gsub(vm: &mut Vm, nargs: usize) -> R<usize> {
     let srcl = vm.heap.str(s).len();
     let max_s = vm.opt_int(nargs, 4, srcl as i32 + 1)?;
     let repl = vm.arg(nargs, 2);
-    if nargs < 3 || !(vm.is_string(repl) || matches!(repl, Value::Func(_))) {
+    if nargs < 3 || !(vm.is_string(repl) || matches!(repl.unpack(), V::Func(_))) {
         return Err(vm.arg_error(3, "string or function expected"));
     }
-    let repl_bytes = match repl {
-        Value::Func(_) => None,
+    let repl_bytes = match repl.unpack() {
+        V::Func(_) => None,
         _ => {
             let r = vm.tostr(repl).unwrap();
             Some(vm.heap.str(r).to_vec())
@@ -759,8 +759,8 @@ fn gsub(vm: &mut Vm, nargs: usize) -> R<usize> {
                         Err(e) => return Err(pat_err(vm, e)),
                     };
                     let r = vm.call_value(repl, &caps, 1)?;
-                    if let Some(sv) = match r[0] {
-                        v @ (Value::Str(_) | Value::Num(_)) => vm.tostr(v),
+                    if let Some(sv) = match r[0].unpack() {
+                        V::Str(_) | V::Num(_) => vm.tostr(r[0]),
                         _ => None,
                     } {
                         out.extend_from_slice(vm.heap.str(sv));

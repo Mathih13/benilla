@@ -30,16 +30,22 @@ fn main() {
     // `bench <name> [fork]`: that workload alone, five times, in this interpreter or the fork,
     // for a profiler.
     if let Some(only) = std::env::args().nth(1) {
-        let (_, src) = WORKLOADS
-            .iter()
-            .find(|(n, _)| n.contains(&only))
-            .expect("a workload name");
+        // `noop` measures the fixed cost: a fresh state and a trivial chunk.
+        let src = if only == "noop" {
+            "return 0"
+        } else {
+            WORKLOADS
+                .iter()
+                .find(|(n, _)| n.contains(&only))
+                .expect("a workload name")
+                .1
+        };
         let fork = std::env::args().nth(2).is_some_and(|a| a == "fork");
         for _ in 0..5 {
             if fork {
                 let lua = mlua::Lua::new();
                 lua.load("math.mod = math.fmod").exec().unwrap();
-                let _: mlua::Value = lua.load(*src).eval().expect("runs");
+                let _: mlua::Value = lua.load(src).eval().expect("runs");
             } else {
                 let mut vm = benilla_lua::new_state();
                 vm.exec(src.as_bytes(), b"=bench").expect("runs");

@@ -7,7 +7,7 @@ use crate::heap::{FuncObj, Heap, NativeFn, UpvalObj, UserObj};
 use crate::number::{fmt_g14, str2d};
 use crate::proto::{Arith, Cmp, Op, Proto, Reg, Rk, RK_CONST};
 use crate::table::KeyError;
-use crate::value::{FuncRef, StrRef, TableRef, Value};
+use crate::value::{FuncRef, StrRef, TableRef, Value, V};
 
 /// An error in flight: the error object, which `pcall` answers.
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +37,11 @@ struct Frame {
     /// a collector root, and a hot reload retires the code it replaces instead of dropping it
     /// (`Vm::retired`).
     proto: *const Proto,
+    /// The closure's upvalue list and environment as the call found them, so entering the
+    /// frame reads no closure. The list is valid as `proto` is; the environment is reread
+    /// when `Vm::fenv_gen` moves.
+    upvals: *const [u32],
+    env: TableRef,
     /// Tail calls this frame replaced, which 5.0 counts as stack levels.
     tailcalls: u32,
     /// Returning from this frame ends the `execute` that entered it.
@@ -160,26 +165,26 @@ impl Vm {
     }
 
     pub fn bytes(&self, v: Value) -> Option<&[u8]> {
-        match v {
-            Value::Str(s) => Some(self.heap.str(s)),
+        match v.unpack() {
+            V::Str(s) => Some(self.heap.str(s)),
             _ => None,
         }
     }
 
     /// `luaV_tonumber`: a number, or a string `str2d` reads.
     pub fn tonumber(&self, v: Value) -> Option<f64> {
-        match v {
-            Value::Num(n) => Some(n),
-            Value::Str(s) => str2d(self.heap.str(s)),
+        match v.unpack() {
+            V::Num(n) => Some(n),
+            V::Str(s) => str2d(self.heap.str(s)),
             _ => None,
         }
     }
 
     /// `luaV_tostring`'s conversion: a string, or a number as `%.14g`.
     pub fn tostr(&mut self, v: Value) -> Option<StrRef> {
-        match v {
-            Value::Str(s) => Some(s),
-            Value::Num(n) => Some(self.heap.intern(fmt_g14(n).as_bytes())),
+        match v.unpack() {
+            V::Str(s) => Some(s),
+            V::Num(n) => Some(self.heap.intern(fmt_g14(n).as_bytes())),
             _ => None,
         }
     }
@@ -264,10 +269,10 @@ impl Vm {
     pub fn display(&mut self, v: Value) -> String {
         match self.tostr(v) {
             Some(s) => String::from_utf8_lossy(self.heap.str(s)).into_owned(),
-            None => match v {
-                Value::Nil => "nil".into(),
-                Value::Bool(b) => b.to_string(),
-                other => other.type_name().into(),
+            None => match v.unpack() {
+                V::Nil => "nil".into(),
+                V::Bool(b) => b.to_string(),
+                _ => v.type_name().into(),
             },
         }
     }
@@ -501,10 +506,34 @@ impl Vm {
         if tm.is_nil() {
             tm = self.tm(b, name);
         }
-        if !matches!(tm, Value::Func(_)) {
+        if !matches!(tm.unpack(), V::Func(_)) {
             return Ok(None);
         }
         Ok(Some(self.call_tm_res(tm, a, b)?))
+    }
+
+    /// `luaV_gettable`'s common miss, without calls: `t[key]` was nil and `t` has a metatable;
+    /// follow `__index` while it is a table. `None` when a function, a non-table or a long
+    /// chain needs the full path.
+    #[inline]
+    fn index_meta_fast(&self, mut tr: TableRef, key: &Value) -> Option<Value> {
+        for _ in 0..4 {
+            let Some(m) = self.heap.table(tr).meta else {
+                return Some(Value::Nil);
+            };
+            match (self.heap.table(m).get_ref(&Value::Str(self.names.index))).unpack() {
+                V::Nil => return Some(Value::Nil),
+                V::Table(next) => {
+                    let v = self.heap.table(next).get_ref(key);
+                    if !v.is_nil() {
+                        return Some(v);
+                    }
+                    tr = next;
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// `luaV_gettable`. `reg` names the indexed value for an error.
@@ -512,8 +541,8 @@ impl Vm {
         let mut t = t;
         let mut reg = reg;
         for _ in 0..=MAXTAGLOOP {
-            let tm = match t {
-                Value::Table(tr) => {
+            let tm = match t.unpack() {
+                V::Table(tr) => {
                     let tab = self.heap.table(tr);
                     let v = tab.get(key);
                     if !v.is_nil() {
@@ -536,7 +565,7 @@ impl Vm {
                     tm
                 }
             };
-            if let Value::Func(_) = tm {
+            if let V::Func(_) = tm.unpack() {
                 return self.call_tm_res(tm, t, key);
             }
             t = tm;
@@ -556,8 +585,8 @@ impl Vm {
         let mut t = t;
         let mut reg = reg;
         for _ in 0..=MAXTAGLOOP {
-            let tm = match t {
-                Value::Table(tr) => {
+            let tm = match t.unpack() {
+                V::Table(tr) => {
                     let slot = match self.heap.table_mut(tr).slot_for(key) {
                         Ok(s) => s,
                         Err(KeyError::Nil) => return Err(self.rt_error("table index is nil")),
@@ -586,7 +615,7 @@ impl Vm {
                     tm
                 }
             };
-            if let Value::Func(_) = tm {
+            if let V::Func(_) = tm.unpack() {
                 self.call_value(tm, &[t, key, val], 0)?;
                 return Ok(());
             }
@@ -616,7 +645,7 @@ impl Vm {
                         .heap
                         .table(self.globals)
                         .get(Value::Str(self.names.gpow));
-                    if !matches!(f, Value::Func(_)) {
+                    if !matches!(f.unpack(), V::Func(_)) {
                         return Err(self.rt_error("`__pow' (`^' operator) is not a function"));
                     }
                     return self.call_tm_res(f, Value::Num(x), Value::Num(y));
@@ -646,9 +675,9 @@ impl Vm {
 
     /// `luaV_equalObj`: tables and userdata consult a shared `__eq`.
     pub fn equals(&mut self, a: Value, b: Value) -> Result<bool, LuaError> {
-        match (a, b) {
-            (Value::Table(x), Value::Table(y)) if x != y => {}
-            (Value::User(x), Value::User(y)) if x != y => {}
+        match (a.unpack(), b.unpack()) {
+            (V::Table(x), V::Table(y)) if x != y => {}
+            (V::User(x), V::User(y)) if x != y => {}
             _ => return Ok(a.raw_eq(b)),
         }
         let tm = self.comp_tm(a, b, self.names.eq);
@@ -696,9 +725,9 @@ impl Vm {
     }
 
     pub fn less_than(&mut self, a: Value, b: Value) -> Result<bool, LuaError> {
-        match (a, b) {
-            (Value::Num(x), Value::Num(y)) => Ok(x < y),
-            (Value::Str(x), Value::Str(y)) => Ok(self.str_lt(x, y).is_lt()),
+        match (a.unpack(), b.unpack()) {
+            (V::Num(x), V::Num(y)) => Ok(x < y),
+            (V::Str(x), V::Str(y)) => Ok(self.str_lt(x, y).is_lt()),
             _ if a.type_name() == b.type_name() => match self.order_tm(a, b, self.names.lt)? {
                 Some(r) => Ok(r),
                 None => Err(self.order_error(a, b)),
@@ -708,9 +737,9 @@ impl Vm {
     }
 
     fn less_equal(&mut self, a: Value, b: Value) -> Result<bool, LuaError> {
-        match (a, b) {
-            (Value::Num(x), Value::Num(y)) => Ok(x <= y),
-            (Value::Str(x), Value::Str(y)) => Ok(self.str_lt(x, y).is_le()),
+        match (a.unpack(), b.unpack()) {
+            (V::Num(x), V::Num(y)) => Ok(x <= y),
+            (V::Str(x), V::Str(y)) => Ok(self.str_lt(x, y).is_le()),
             _ if a.type_name() == b.type_name() => {
                 if let Some(r) = self.order_tm(a, b, self.names.le)? {
                     return Ok(r);
@@ -753,7 +782,7 @@ impl Vm {
                         }
                         let mut buf = Vec::new();
                         for i in (1..=n).rev() {
-                            if let Value::Str(s) = self.stack[top - i] {
+                            if let V::Str(s) = self.stack[top - i].unpack() {
                                 buf.extend_from_slice(self.heap.str(s));
                             }
                         }
@@ -764,7 +793,7 @@ impl Vm {
                     Some(v) => self.stack[top - 2] = v,
                     None => {
                         // `luaG_concaterror`: blame the first operand unless it is a string.
-                        let (bad, reg) = if matches!(a, Value::Str(_) | Value::Num(_)) {
+                        let (bad, reg) = if matches!(a.unpack(), V::Str(_) | V::Num(_)) {
                             (b, top - 1)
                         } else {
                             (a, top - 2)
@@ -849,12 +878,13 @@ impl Vm {
     fn precall(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<Called, LuaError> {
         let mut nargs = nargs;
         let fref = loop {
-            match self.stack[func_idx] {
-                Value::Func(f) => break f,
-                other => {
+            let other = self.stack[func_idx];
+            match other.unpack() {
+                V::Func(f) => break f,
+                _ => {
                     // `tryfuncTM`: `__call` goes below the arguments.
                     let tm = self.tm(other, self.names.call);
-                    if !matches!(tm, Value::Func(_)) {
+                    if !matches!(tm.unpack(), V::Func(_)) {
                         let reg = self
                             .frames
                             .last()
@@ -875,8 +905,9 @@ impl Vm {
             return Err(self.rt_error("stack overflow"));
         }
         match self.heap.func(fref) {
-            FuncObj::Lua { proto, .. } => {
+            FuncObj::Lua { proto, upvals, env } => {
                 let pp = Rc::as_ptr(proto);
+                let (fup, fenv): (*const [u32], TableRef) = (&**upvals, *env);
                 // SAFETY: the closure being called holds this code, and the closure sits in the
                 // stack slot `func_idx` for the whole call.
                 let proto = unsafe { &*pp };
@@ -923,6 +954,8 @@ impl Vm {
                     pc: 0,
                     nresults: nres,
                     proto: pp,
+                    upvals: fup,
+                    env: fenv,
                     tailcalls: 0,
                     boundary: false,
                 });
@@ -939,6 +972,8 @@ impl Vm {
                     pc: 0,
                     nresults: nres,
                     proto: std::ptr::null(),
+                    upvals: &[],
+                    env: self.globals,
                     tailcalls: 0,
                     boundary: false,
                 });
@@ -1112,20 +1147,15 @@ impl Vm {
     fn execute(&mut self) -> Result<(), LuaError> {
         'frame: loop {
             let fi = self.frames.len() - 1;
+            let frame = self.frames.last().expect("a Lua frame");
             // SAFETY: the top frame is a Lua frame, and its code outlives it (`Frame::proto`).
-            let proto: &Proto = unsafe { &*self.frames[fi].proto };
-            let base = self.frames[fi].base;
-            let mut pc = self.frames[fi].pc;
-            let fref = self.frames[fi].func;
-            // The closure's upvalue list and environment, read once per entry. The list lives in
-            // its own allocation, which a hot reload retires rather than frees.
-            let (upvals, mut env): (*const [u32], TableRef) = match self.heap.func(fref) {
-                FuncObj::Lua { upvals, env, .. } => (&**upvals, *env),
-                _ => unreachable!("a Lua frame"),
-            };
-            // SAFETY: as above.
-            let upvals: &[u32] = unsafe { &*upvals };
-            let mut env_gen = self.fenv_gen;
+            let proto: &Proto = unsafe { &*frame.proto };
+            let (base, mut pc, fref) = (frame.base, frame.pc, frame.func);
+            // SAFETY: the upvalue list lives as the code does (`Frame::upvals`).
+            let upvals: &[u32] = unsafe { &*frame.upvals };
+            let mut env = frame.env;
+            // A `setfenv` since the call is caught on first use: start one generation behind.
+            let mut env_gen = self.fenv_gen.wrapping_sub(1);
             let code = &proto.code[..];
             let k = &proto.consts[..];
             let maxstack = proto.maxstack as usize;
@@ -1218,8 +1248,9 @@ impl Vm {
             }
             macro_rules! arith {
                 ($a:expr, $b:expr, $c:expr, $op:tt, $kind:expr) => {{
-                    if let (&Value::Num(x), &Value::Num(y)) = (rkref!($b), rkref!($c)) {
-                        r!($a) = Value::Num(x $op y);
+                    if let (Some(x), Some(y)) = (rkref!($b).as_num(), rkref!($c).as_num()) {
+                        // Canonical numbers in, a canonical number out.
+                        r!($a) = Value::num_raw(x $op y);
                     } else {
                         let (x, y) = (rk!($b), rk!($c));
                         let v = slow!(self.arith($kind, x, y, (rkreg!($b), rkreg!($c))))?;
@@ -1278,10 +1309,14 @@ impl Vm {
                         slow!(self.setindex(Value::Table(env), key, v, None))?;
                     }
                     Op::GetTable(a, b, c) => {
-                        if let &Value::Table(tr) = &r!(b) {
+                        if let Some(tr) = r!(b).as_table() {
                             let tab = self.heap.table(tr);
                             let v = tab.get_ref(rkref!(c));
                             if !v.is_nil() || tab.meta.is_none() {
+                                r!(a) = v;
+                                continue;
+                            }
+                            if let Some(v) = self.index_meta_fast(tr, rkref!(c)) {
                                 r!(a) = v;
                                 continue;
                             }
@@ -1293,7 +1328,7 @@ impl Vm {
                     Op::SetTable(a, b, c) => {
                         let key = rk!(b);
                         let v = rk!(c);
-                        if let &Value::Table(tr) = &r!(a) {
+                        if let Some(tr) = r!(a).as_table() {
                             let tab = self.heap.table_mut(tr);
                             if tab.meta.is_none() {
                                 if tab.set(key, v).is_ok() {
@@ -1321,10 +1356,14 @@ impl Vm {
                     Op::SelfOp(a, b, c) => {
                         let obj = r!(b);
                         r!(a + 1) = obj;
-                        if let &Value::Table(tr) = &r!(b) {
+                        if let Some(tr) = r!(b).as_table() {
                             let tab = self.heap.table(tr);
                             let v = tab.get_ref(rkref!(c));
                             if !v.is_nil() || tab.meta.is_none() {
+                                r!(a) = v;
+                                continue;
+                            }
+                            if let Some(v) = self.index_meta_fast(tr, rkref!(c)) {
                                 r!(a) = v;
                                 continue;
                             }
@@ -1362,7 +1401,7 @@ impl Vm {
                             }
                         }
                     }
-                    Op::Not(a, b) => r!(a) = Value::Bool(!r!(b).truthy_ref()),
+                    Op::Not(a, b) => r!(a) = Value::Bool(!r!(b).truthy()),
                     Op::Concat(a, b, c) => {
                         self.top = base + maxstack;
                         slow!(self.concat(base + b as usize, base + c as usize))?;
@@ -1371,10 +1410,10 @@ impl Vm {
                     }
                     Op::Jmp(off) => jump!(off),
                     Op::JmpCmp(cmp, cond, b, c, off) => {
-                        let res = match (cmp, rkref!(b), rkref!(c)) {
-                            (Cmp::Lt, &Value::Num(p), &Value::Num(q)) => p < q,
-                            (Cmp::Le, &Value::Num(p), &Value::Num(q)) => p <= q,
-                            (Cmp::Eq, &Value::Num(p), &Value::Num(q)) => p == q,
+                        let res = match (cmp, rkref!(b).as_num(), rkref!(c).as_num()) {
+                            (Cmp::Lt, Some(p), Some(q)) => p < q,
+                            (Cmp::Le, Some(p), Some(q)) => p <= q,
+                            (Cmp::Eq, Some(p), Some(q)) => p == q,
                             _ => {
                                 let (x, y) = (rk!(b), rk!(c));
                                 match cmp {
@@ -1389,7 +1428,7 @@ impl Vm {
                         }
                     }
                     Op::JmpIf(a, cond, off) => {
-                        if r!(a).truthy_ref() == cond {
+                        if r!(a).truthy() == cond {
                             jump!(off);
                         }
                     }
@@ -1401,6 +1440,43 @@ impl Vm {
                             b as usize - 1
                         };
                         save!();
+                        // A Lua function without `...`: the frame is pushed here, as C Lua's
+                        // `luaD_precall` does for it, without the general path.
+                        if let Some(f) = r!(a).as_func() {
+                            if let FuncObj::Lua {
+                                proto: p,
+                                upvals: fup,
+                                env: fenv,
+                            } = self.heap.func(f)
+                            {
+                                if !p.vararg && self.frames.len() < MAXCALLS {
+                                    let np = p.nparams as usize;
+                                    let nbase = func_idx + 1;
+                                    let ftop = nbase + p.maxstack as usize;
+                                    let frame = Frame {
+                                        func: f,
+                                        func_idx,
+                                        base: nbase,
+                                        pc: 0,
+                                        nresults: c as i32 - 1,
+                                        proto: Rc::as_ptr(p),
+                                        upvals: &**fup,
+                                        env: *fenv,
+                                        tailcalls: 0,
+                                        boundary: false,
+                                    };
+                                    self.ensure(ftop + 1);
+                                    if nargs < np {
+                                        for v in &mut self.stack[nbase + nargs..nbase + np] {
+                                            *v = Value::Nil;
+                                        }
+                                    }
+                                    self.top = ftop;
+                                    self.frames.push(frame);
+                                    continue 'frame;
+                                }
+                            }
+                        }
                         match self.precall(func_idx, nargs, c as i32 - 1)? {
                             Called::Lua => continue 'frame,
                             Called::Done => {
@@ -1422,9 +1498,8 @@ impl Vm {
                         save!();
                         // A Lua callee replaces this frame; a native runs and its results
                         // return through the `Return` that follows.
-                        let is_lua = matches!(
-                            r!(a),
-                            Value::Func(f) if matches!(self.heap.func(f), FuncObj::Lua { .. })
+                        let is_lua = matches!((r!(a)).unpack(),
+                            V::Func(f) if matches!(self.heap.func(f), FuncObj::Lua { .. })
                         );
                         if !is_lua {
                             match self.precall(func_idx, nargs, -1)? {
@@ -1480,8 +1555,8 @@ impl Vm {
                     }
                     Op::ForLoop(a, off) => {
                         // Three numbers already: the step alone, nothing to convert back.
-                        if let (&Value::Num(idx), &Value::Num(limit), &Value::Num(step)) =
-                            (&r!(a), &r!(a + 1), &r!(a + 2))
+                        if let (Some(idx), Some(limit), Some(step)) =
+                            (r!(a).as_num(), r!(a + 1).as_num(), r!(a + 2).as_num())
                         {
                             let idx = idx + step;
                             if if step > 0.0 {
@@ -1490,12 +1565,12 @@ impl Vm {
                                 idx >= limit
                             } {
                                 jump!(off);
-                                r!(a) = Value::Num(idx);
+                                r!(a) = Value::num_raw(idx);
                             }
                             continue;
                         }
                         save!();
-                        if !matches!(r!(a), Value::Num(_)) {
+                        if !matches!((r!(a)).unpack(), V::Num(_)) {
                             return Err(self.rt_error("`for' initial value must be a number"));
                         }
                         let Some(limit) = self.tonumber(r!(a + 1)) else {
@@ -1506,7 +1581,7 @@ impl Vm {
                         };
                         r!(a + 1) = Value::Num(limit);
                         r!(a + 2) = Value::Num(step);
-                        let Value::Num(idx) = r!(a) else {
+                        let V::Num(idx) = (r!(a)).unpack() else {
                             unreachable!()
                         };
                         let idx = idx + step;
@@ -1516,11 +1591,11 @@ impl Vm {
                             idx >= limit
                         } {
                             jump!(off);
-                            r!(a) = Value::Num(idx);
+                            r!(a) = Value::num_raw(idx);
                         }
                     }
                     Op::TForPrep(a, off) => {
-                        if let Value::Table(_) = r!(a) {
+                        if let V::Table(_) = (r!(a)).unpack() {
                             r!(a + 1) = r!(a);
                             let g = self.globals;
                             r!(a) = self.heap.table(g).get(Value::Str(self.names.next));
@@ -1549,7 +1624,7 @@ impl Vm {
                         }
                     }
                     Op::SetList(a, first, n) => {
-                        let Value::Table(t) = r!(a) else {
+                        let V::Table(t) = (r!(a)).unpack() else {
                             unreachable!()
                         };
                         // 5.0 stores the batch from its last item down.
@@ -1561,7 +1636,7 @@ impl Vm {
                         }
                     }
                     Op::SetListTop(a, first) => {
-                        let Value::Table(t) = r!(a) else {
+                        let V::Table(t) = (r!(a)).unpack() else {
                             unreachable!()
                         };
                         let n = self.top - (base + a as usize) - 1;
@@ -1613,15 +1688,15 @@ fn objname_in(p: &Proto, heap: &Heap, pc: usize, reg: usize) -> Option<(&'static
     let last = symbexec(p, pc, reg)?;
     let kname = |c: Rk| -> Vec<u8> {
         if c >= RK_CONST {
-            if let Value::Str(s) = p.consts[(c - RK_CONST) as usize] {
+            if let V::Str(s) = p.consts[(c - RK_CONST) as usize].unpack() {
                 return heap.str(s).to_vec();
             }
         }
         b"?".to_vec()
     };
     match p.code[last] {
-        Op::GetGlobal(_, kx) => match p.consts[kx as usize] {
-            Value::Str(s) => Some(("global", heap.str(s).to_vec())),
+        Op::GetGlobal(_, kx) => match p.consts[kx as usize].unpack() {
+            V::Str(s) => Some(("global", heap.str(s).to_vec())),
             _ => None,
         },
         Op::Move(a, b) if (b as usize) < (a as usize) => objname_in(p, heap, last, b as usize),

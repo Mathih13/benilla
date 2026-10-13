@@ -3,7 +3,7 @@
 
 use crate::api::R;
 use crate::lib_base::{getn, setn};
-use crate::value::{TableRef, Value};
+use crate::value::{TableRef, Value, V};
 use crate::vm::Vm;
 
 pub fn open(vm: &mut Vm) {
@@ -137,8 +137,8 @@ fn concat(vm: &mut Vm, nargs: usize) -> R<usize> {
     let mut out = Vec::new();
     while i <= n {
         let v = rawgeti(vm, t, i);
-        let Some(s) = (match v {
-            Value::Str(_) | Value::Num(_) => vm.tostr(v),
+        let Some(s) = (match v.unpack() {
+            V::Str(_) | V::Num(_) => vm.tostr(v),
             _ => None,
         }) else {
             return Err(vm.arg_error(1, "table contains non-strings"));
