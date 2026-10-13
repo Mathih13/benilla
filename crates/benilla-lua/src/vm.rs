@@ -121,6 +121,37 @@ pub struct Vm {
     /// Bumped by every `setfenv` of a Lua function, so a running frame's cached environment
     /// knows to reread.
     pub(crate) fenv_gen: u64,
+    /// Values a host holds outside the VM (a handle to a table or function), each a collector
+    /// root while its count is above zero: mlua's registry references.
+    roots: Vec<(Value, u32)>,
+    root_free: Vec<u32>,
+    /// The instruction-budget hook, and whether one is set (read where loops and calls pass).
+    hook: Option<Hook>,
+    hooked: bool,
+}
+
+/// A host hook run about every `step` instructions. It is checked where a loop jumps back and
+/// where a call starts, the places a non-terminating script must pass, counting a loop's body
+/// length per iteration; so the dispatch loop pays nothing for it until one is set.
+#[derive(Clone)]
+pub struct Hook {
+    pub step: u64,
+    pub f: Rc<dyn Fn(&mut Vm) -> Result<(), LuaError>>,
+    counted: u64,
+}
+
+/// One stack level, as `lua_getinfo` describes it with `"Snl"`.
+#[derive(Clone, Debug, Default)]
+pub struct FrameInfo {
+    /// The chunk name, for a Lua function.
+    pub source: Option<Vec<u8>>,
+    /// `"Lua"`, `"main"`, `"C"` or `"tail"`.
+    pub what: &'static str,
+    pub current_line: Option<u32>,
+    pub line_defined: u32,
+    /// How the calling instruction named it: `("global", "foo")`.
+    pub name: Option<Vec<u8>>,
+    pub namewhat: &'static str,
 }
 
 /// What a call produced, for the dispatch loop.
@@ -179,6 +210,10 @@ impl Vm {
             gc_stress: false,
             retired: Vec::new(),
             fenv_gen: 0,
+            roots: Vec::new(),
+            root_free: Vec::new(),
+            hook: None,
+            hooked: false,
         };
         vm.heap.threshold = 2 * vm.heap.bytes.max(32 * 1024);
         vm
@@ -230,6 +265,22 @@ impl Vm {
         let env = self.globals;
         Value::Func(self.heap.new_func(FuncObj::Native {
             f,
+            host: None,
+            name,
+            upvals: Box::new([]),
+            env,
+        }))
+    }
+
+    /// A native function over a host closure.
+    pub fn new_host(&mut self, name: &'static str, f: crate::heap::HostFn) -> Value {
+        fn unreachable_native(_: &mut Vm, _: usize) -> Result<usize, LuaError> {
+            unreachable!("a host function calls its closure")
+        }
+        let env = self.globals;
+        Value::Func(self.heap.new_func(FuncObj::Native {
+            f: unreachable_native,
+            host: Some(f),
             name,
             upvals: Box::new([]),
             env,
@@ -1016,8 +1067,9 @@ impl Vm {
                 });
                 Ok(Called::Lua)
             }
-            FuncObj::Native { f, .. } => {
+            FuncObj::Native { f, host, .. } => {
                 let f = *f;
+                let host = host.clone();
                 let base = func_idx + 1;
                 self.top = base + nargs;
                 self.frames.push(Frame {
@@ -1033,7 +1085,10 @@ impl Vm {
                     tailcalls: 0,
                     boundary: false,
                 });
-                let n = f(self, nargs)?;
+                let n = match host {
+                    Some(h) => h(self, nargs)?,
+                    None => f(self, nargs)?,
+                };
                 self.frames.pop();
                 let first = self.top - n;
                 self.poscall(func_idx, first, n, nres);
@@ -1089,6 +1144,144 @@ impl Vm {
         let f = self.frames.last().unwrap().func;
         match self.heap.func(f) {
             FuncObj::Lua { env, .. } | FuncObj::Native { env, .. } => *env,
+        }
+    }
+
+    // ── host roots ───────────────────────────────────────────────────────────────────────────
+
+    /// Hold `v` for the host: a collector root until [`Vm::unroot`] brings its count to zero.
+    pub fn root(&mut self, v: Value) -> u32 {
+        match self.root_free.pop() {
+            Some(i) => {
+                self.roots[i as usize] = (v, 1);
+                i
+            }
+            None => {
+                self.roots.push((v, 1));
+                (self.roots.len() - 1) as u32
+            }
+        }
+    }
+
+    /// Another holder of root `i`.
+    pub fn retain(&mut self, i: u32) {
+        self.roots[i as usize].1 += 1;
+    }
+
+    /// One holder of root `i` lets go.
+    pub fn unroot(&mut self, i: u32) {
+        let r = &mut self.roots[i as usize];
+        r.1 -= 1;
+        if r.1 == 0 {
+            r.0 = Value::Nil;
+            self.root_free.push(i);
+        }
+    }
+
+    pub fn rooted(&self, i: u32) -> Value {
+        self.roots[i as usize].0
+    }
+
+    // ── the hook ─────────────────────────────────────────────────────────────────────────────
+
+    pub fn set_hook(&mut self, step: u64, f: Rc<dyn Fn(&mut Vm) -> Result<(), LuaError>>) {
+        self.hook = Some(Hook {
+            step: step.max(1),
+            f,
+            counted: 0,
+        });
+        self.hooked = true;
+    }
+
+    pub fn remove_hook(&mut self) {
+        self.hook = None;
+        self.hooked = false;
+    }
+
+    /// `n` more instructions ran; past the step, the hook runs.
+    #[cold]
+    #[inline(never)]
+    fn hook_count(&mut self, n: u64) -> Result<(), LuaError> {
+        let Some(h) = self.hook.as_mut() else {
+            return Ok(());
+        };
+        h.counted += n;
+        if h.counted < h.step {
+            return Ok(());
+        }
+        h.counted -= h.step;
+        let f = h.f.clone();
+        f(self)
+    }
+
+    // ── stack inspection ─────────────────────────────────────────────────────────────────────
+
+    /// The stack level `level` up, as `lua_getstack` and `lua_getinfo(L, "Snl")` see it; a
+    /// level a tail call replaced is a `"tail"` frame.
+    pub fn frame_info(&self, level: usize) -> Option<FrameInfo> {
+        let mut lv = level as i64;
+        let mut i = self.frames.len();
+        while i > 0 {
+            i -= 1;
+            if lv == 0 {
+                return Some(self.describe(i));
+            }
+            lv -= 1;
+            if !self.frames[i].proto.is_null() {
+                lv -= self.frames[i].tailcalls as i64;
+            }
+            if lv < 0 {
+                return Some(FrameInfo {
+                    what: "tail",
+                    ..Default::default()
+                });
+            }
+        }
+        None
+    }
+
+    fn describe(&self, i: usize) -> FrameInfo {
+        let f = &self.frames[i];
+        let (name, namewhat) = match self.name_of(i) {
+            Some((kind, n)) => (Some(n), kind),
+            None => (None, ""),
+        };
+        // SAFETY: a live frame's code is alive (see `Frame::proto`).
+        match unsafe { f.proto.as_ref() } {
+            Some(p) => {
+                let pc = f.pc().saturating_sub(1);
+                FrameInfo {
+                    source: Some(p.source.to_vec()),
+                    what: if p.line_defined == 0 { "main" } else { "Lua" },
+                    current_line: p.lines.get(pc).copied(),
+                    line_defined: p.line_defined,
+                    name,
+                    namewhat,
+                }
+            }
+            None => FrameInfo {
+                source: None,
+                what: "C",
+                current_line: None,
+                line_defined: 0,
+                name,
+                namewhat,
+            },
+        }
+    }
+
+    /// 5.0's `getfuncname` for frame `i`: what the caller's calling instruction named it.
+    fn name_of(&self, i: usize) -> Option<(&'static str, Vec<u8>)> {
+        if i == 0 || self.frames[i].tailcalls > 0 {
+            return None;
+        }
+        let caller = &self.frames[i - 1];
+        // SAFETY: a live frame's code is alive (see `Frame::proto`).
+        let p = unsafe { caller.proto.as_ref() }?;
+        let pc = caller.pc().checked_sub(1)?;
+        match p.code.get(pc)? {
+            Op::Call(a, ..) | Op::TailCall(a, ..) => objname_in(p, &self.heap, pc, *a as usize),
+            _ => None,
         }
     }
 
@@ -1167,6 +1360,7 @@ impl Vm {
             roots.push(Value::Func(f.func));
         }
         roots.extend(self.handlers.iter().flatten().copied());
+        roots.extend(self.roots.iter().filter(|r| r.1 > 0).map(|r| r.0));
         let open: Vec<u32> = self.open.iter().map(|&(_, u)| u).collect();
         // Names live forever.
         let n = &self.names;
@@ -1345,10 +1539,15 @@ impl Vm {
                 }};
             }
             macro_rules! jump {
-                ($off:expr) => {
+                ($off:expr) => {{
+                    let off = $off as isize;
                     // SAFETY: the compiler's jumps land inside the function.
-                    ip = unsafe { ip.offset($off as isize) }
-                };
+                    ip = unsafe { ip.offset(off) };
+                    // A loop's back edge: the place the budget hook is counted.
+                    if off < 0 && self.hooked {
+                        slow!(self.hook_count((-off) as u64))?;
+                    }
+                }};
             }
             /// 5.0's `OP_RETURN`: `n` values from `R(a)` to the caller's frame.
             macro_rules! ret {
@@ -1614,6 +1813,9 @@ impl Vm {
                             b as usize - 1
                         };
                         save!();
+                        if self.hooked {
+                            slow!(self.hook_count(1))?;
+                        }
                         // A Lua function without `...`: the frame is pushed here, as C Lua's
                         // `luaD_precall` does for it, without the general path.
                         if let Some(f) = r!(a).as_func() {

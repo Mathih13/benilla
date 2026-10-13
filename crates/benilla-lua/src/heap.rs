@@ -11,6 +11,10 @@ use crate::value::{FuncRef, StrRef, TableRef, UserRef, Value, STR_HASH_MASK, STR
 /// its results and answers how many.
 pub type NativeFn = fn(&mut crate::vm::Vm, usize) -> Result<usize, crate::vm::LuaError>;
 
+/// A native function the host built at run time, with state of its own: the same calling
+/// convention as [`NativeFn`].
+pub type HostFn = Rc<dyn Fn(&mut crate::vm::Vm, usize) -> Result<usize, crate::vm::LuaError>>;
+
 #[derive(Clone, Debug)]
 pub struct StrObj {
     pub bytes: Box<[u8]>,
@@ -56,6 +60,8 @@ pub enum FuncObj {
     },
     Native {
         f: NativeFn,
+        /// A host closure, called in `f`'s place when present.
+        host: Option<HostFn>,
         name: &'static str,
         upvals: Box<[Value]>,
         env: TableRef,

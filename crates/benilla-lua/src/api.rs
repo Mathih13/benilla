@@ -112,6 +112,7 @@ impl Vm {
         let env = self.globals;
         Value::Func(self.heap.new_func(FuncObj::Native {
             f,
+            host: None,
             name,
             upvals: upvals.into_boxed_slice(),
             env,
