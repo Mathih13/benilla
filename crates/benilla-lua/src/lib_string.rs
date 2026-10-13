@@ -60,8 +60,11 @@ fn sub(vm: &mut Vm, nargs: usize) -> R<usize> {
         end = l as i64;
     }
     if start <= end {
-        let b = vm.heap.str(s)[start as usize - 1..end as usize].to_vec();
-        Ok(vm.ret_str(&b))
+        let (a, e) = (start as usize - 1, end as usize);
+        let r = vm
+            .heap
+            .intern_with(|h, b| b.extend_from_slice(&h.str(s)[a..e]));
+        Ok(vm.ret1(Value::Str(r)))
     } else {
         Ok(vm.ret_str(b""))
     }
@@ -69,14 +72,20 @@ fn sub(vm: &mut Vm, nargs: usize) -> R<usize> {
 
 fn lower(vm: &mut Vm, nargs: usize) -> R<usize> {
     let s = vm.check_str(nargs, 1)?;
-    let b = vm.heap.str(s).to_ascii_lowercase();
-    Ok(vm.ret_str(&b))
+    let r = vm.heap.intern_with(|h, b| {
+        b.extend_from_slice(h.str(s));
+        b.make_ascii_lowercase();
+    });
+    Ok(vm.ret1(Value::Str(r)))
 }
 
 fn upper(vm: &mut Vm, nargs: usize) -> R<usize> {
     let s = vm.check_str(nargs, 1)?;
-    let b = vm.heap.str(s).to_ascii_uppercase();
-    Ok(vm.ret_str(&b))
+    let r = vm.heap.intern_with(|h, b| {
+        b.extend_from_slice(h.str(s));
+        b.make_ascii_uppercase();
+    });
+    Ok(vm.ret1(Value::Str(r)))
 }
 
 fn char_(vm: &mut Vm, nargs: usize) -> R<usize> {
@@ -123,9 +132,16 @@ fn dump(vm: &mut Vm, nargs: usize) -> R<usize> {
 // ── string.format ────────────────────────────────────────────────────────────────────────────
 
 fn format(vm: &mut Vm, nargs: usize) -> R<usize> {
+    let mut b = vm.take_bufs::<2>();
+    let r = format_in(vm, nargs, &mut b);
+    vm.give_bufs(b);
+    r
+}
+
+fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize> {
     let fs = vm.check_str(nargs, 1)?;
-    let f = vm.heap.str(fs).to_vec();
-    let mut out = Vec::new();
+    f.extend_from_slice(vm.heap.str(fs));
+    let f = &f[..];
     let mut arg = 1;
     let mut i = 0;
     while i < f.len() {
@@ -193,7 +209,7 @@ fn format(vm: &mut Vm, nargs: usize) -> R<usize> {
                 let n = vm.check_int(nargs, arg)?;
                 if spec.is_plain() {
                     // A bare `%d`: the digits alone.
-                    crate::number::push_g14(n as f64, &mut out);
+                    crate::number::push_g14(n as f64, out);
                 } else {
                     out.extend_from_slice(cfmt::fmt_int(n, &spec).as_bytes());
                 }
@@ -239,7 +255,7 @@ fn format(vm: &mut Vm, nargs: usize) -> R<usize> {
             _ => return Err(vm.error_at(1, "invalid option in `format'")),
         }
     }
-    Ok(vm.ret_str(&out))
+    Ok(vm.ret_str(out))
 }
 
 // ── the matcher ──────────────────────────────────────────────────────────────────────────────
@@ -252,7 +268,7 @@ const SPECIALS: &[u8] = b"^$*+?.([%-";
 struct MatchState<'a> {
     src: &'a [u8],
     /// The pattern, NUL-terminated as 5.0's C string is.
-    pat: Vec<u8>,
+    pat: &'a [u8],
     level: usize,
     capture: [(usize, isize); MAX_CAPTURES],
 }
@@ -588,13 +604,14 @@ fn pat_err(vm: &mut Vm, e: PatErr) -> LuaError {
 }
 
 /// The pattern as 5.0 reads it: up to its first NUL, then a NUL.
-fn c_pattern(p: &[u8]) -> Vec<u8> {
-    let mut v = p[..p.iter().position(|&b| b == 0).unwrap_or(p.len())].to_vec();
-    v.push(0);
-    v
+/// The pattern as 5.0's matcher reads it, a C string: up to its first NUL, then one.
+fn c_pattern(p: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&p[..p.iter().position(|&b| b == 0).unwrap_or(p.len())]);
+    out.push(0);
 }
 
-fn new_state(src: &[u8], pat: Vec<u8>) -> MatchState<'_> {
+fn new_state<'a>(src: &'a [u8], pat: &'a [u8]) -> MatchState<'a> {
     MatchState {
         src,
         pat,
@@ -603,7 +620,16 @@ fn new_state(src: &[u8], pat: Vec<u8>) -> MatchState<'_> {
     }
 }
 
+// The pattern functions copy the subject and pattern out of the heap (a match calls back into
+// the VM); the copies go into buffers the VM keeps, not fresh allocations.
 fn find(vm: &mut Vm, nargs: usize) -> R<usize> {
+    let mut b = vm.take_bufs::<3>();
+    let r = find_in(vm, nargs, &mut b);
+    vm.give_bufs(b);
+    r
+}
+
+fn find_in(vm: &mut Vm, nargs: usize, [src, pat, cpat]: &mut [Vec<u8>; 3]) -> R<usize> {
     let s = vm.check_str(nargs, 1)?;
     let p = vm.check_str(nargs, 2)?;
     let l1 = vm.heap.str(s).len();
@@ -615,9 +641,10 @@ fn find(vm: &mut Vm, nargs: usize) -> R<usize> {
     }
     let init = init as usize;
     let plain = vm.arg(nargs, 3).truthy();
-    let src = vm.heap.str(s).to_vec();
-    let pat = vm.heap.str(p).to_vec();
-    let cpat = c_pattern(&pat);
+    src.extend_from_slice(vm.heap.str(s));
+    pat.extend_from_slice(vm.heap.str(p));
+    c_pattern(pat, cpat);
+    let (src, pat, cpat) = (&src[..], &pat[..], &cpat[..]);
     if plain || !cpat[..cpat.len() - 1].iter().any(|c| SPECIALS.contains(c)) {
         // `lmemfind` over the whole pattern, NULs included.
         let hay = &src[init..];
@@ -626,7 +653,7 @@ fn find(vm: &mut Vm, nargs: usize) -> R<usize> {
         } else if pat.len() > hay.len() {
             None
         } else {
-            hay.windows(pat.len()).position(|w| w == &pat[..])
+            hay.windows(pat.len()).position(|w| w == pat)
         };
         if let Some(i) = found {
             vm.push(Value::Num((init + i + 1) as f64));
@@ -640,7 +667,7 @@ fn find(vm: &mut Vm, nargs: usize) -> R<usize> {
     } else {
         (false, 0)
     };
-    let mut ms = new_state(&src, cpat);
+    let mut ms = new_state(src, cpat);
     let mut s1 = init;
     loop {
         ms.level = 0;
@@ -680,14 +707,22 @@ fn gfind(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(vm.ret1(f))
 }
 
-fn gfind_aux(vm: &mut Vm, _nargs: usize) -> R<usize> {
+fn gfind_aux(vm: &mut Vm, nargs: usize) -> R<usize> {
+    let mut b = vm.take_bufs::<2>();
+    let r = gfind_in(vm, nargs, &mut b);
+    vm.give_bufs(b);
+    r
+}
+
+fn gfind_in(vm: &mut Vm, _nargs: usize, [src, cpat]: &mut [Vec<u8>; 2]) -> R<usize> {
     let (V::Str(s), V::Str(p)) = ((vm.upvalue(0)).unpack(), (vm.upvalue(1)).unpack()) else {
         return Ok(0);
     };
     let pos = vm.tonumber(vm.upvalue(2)).unwrap_or(0.0) as usize;
-    let src = vm.heap.str(s).to_vec();
-    let cpat = c_pattern(vm.heap.str(p));
-    let mut ms = new_state(&src, cpat);
+    src.extend_from_slice(vm.heap.str(s));
+    c_pattern(vm.heap.str(p), cpat);
+    let (src, cpat) = (&src[..], &cpat[..]);
+    let mut ms = new_state(src, cpat);
     let mut at = pos;
     while at <= src.len() {
         ms.level = 0;
@@ -714,6 +749,13 @@ fn gfind_aux(vm: &mut Vm, _nargs: usize) -> R<usize> {
 /// 5.0's `gsub`: a string or function replacement; a function answering neither string nor
 /// number deletes the match.
 fn gsub(vm: &mut Vm, nargs: usize) -> R<usize> {
+    let mut b = vm.take_bufs::<4>();
+    let r = gsub_in(vm, nargs, &mut b);
+    vm.give_bufs(b);
+    r
+}
+
+fn gsub_in(vm: &mut Vm, nargs: usize, [src, cpat, out, repl_buf]: &mut [Vec<u8>; 4]) -> R<usize> {
     let s = vm.check_str(nargs, 1)?;
     let p = vm.check_str(nargs, 2)?;
     let srcl = vm.heap.str(s).len();
@@ -726,18 +768,19 @@ fn gsub(vm: &mut Vm, nargs: usize) -> R<usize> {
         V::Func(_) => None,
         _ => {
             let r = vm.tostr(repl).unwrap();
-            Some(vm.heap.str(r).to_vec())
+            repl_buf.extend_from_slice(vm.heap.str(r));
+            Some(&repl_buf[..])
         }
     };
-    let src = vm.heap.str(s).to_vec();
-    let cpat = c_pattern(vm.heap.str(p));
+    src.extend_from_slice(vm.heap.str(s));
+    c_pattern(vm.heap.str(p), cpat);
+    let (src, cpat) = (&src[..], &cpat[..]);
     let (anchor, pstart) = if cpat[0] == b'^' {
         (true, 1)
     } else {
         (false, 0)
     };
-    let mut ms = new_state(&src, cpat);
-    let mut out: Vec<u8> = Vec::new();
+    let mut ms = new_state(src, cpat);
     let mut at = 0usize;
     let mut n = 0;
     while n < max_s {
@@ -802,7 +845,7 @@ fn gsub(vm: &mut Vm, nargs: usize) -> R<usize> {
         }
     }
     out.extend_from_slice(&src[at..]);
-    let r = vm.str(&out);
+    let r = vm.str(out);
     vm.push(r);
     vm.push(Value::Num(n as f64));
     Ok(2)

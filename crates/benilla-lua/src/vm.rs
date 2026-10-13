@@ -116,6 +116,8 @@ pub struct Vm {
     open: Vec<(usize, u32)>,
     /// `concat`'s scratch buffer, kept between calls.
     concat_buf: Vec<u8>,
+    /// Byte buffers the string library borrows for a call (`take_bufs`).
+    bufs: Vec<Vec<u8>>,
     /// The base library's `next`: a generic `for` over it steps the table in place.
     pub(crate) builtin_next: Value,
     pub globals: TableRef,
@@ -257,6 +259,7 @@ impl Vm {
             frames: Vec::new(),
             open: Vec::new(),
             concat_buf: Vec::new(),
+            bufs: Vec::new(),
             builtin_next: Value::Nil,
             globals,
             registry,
@@ -279,6 +282,21 @@ impl Vm {
     }
 
     // ── strings and values ───────────────────────────────────────────────────────────────────
+
+    /// `N` empty byte buffers, reused from earlier calls where there are some.
+    pub(crate) fn take_bufs<const N: usize>(&mut self) -> [Vec<u8>; N] {
+        std::array::from_fn(|_| self.bufs.pop().unwrap_or_default())
+    }
+
+    /// Buffers back to the pool; a very large one is dropped, so one huge string does not stay.
+    pub(crate) fn give_bufs<const N: usize>(&mut self, bufs: [Vec<u8>; N]) {
+        for mut b in bufs {
+            if self.bufs.len() < 16 && b.capacity() <= 64 * 1024 {
+                b.clear();
+                self.bufs.push(b);
+            }
+        }
+    }
 
     pub fn str(&mut self, s: &[u8]) -> Value {
         self.heap.str_value(s)

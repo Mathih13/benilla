@@ -245,6 +245,8 @@ pub struct Heap {
     source_ids: std::collections::HashMap<crate::ast::Bytes, u32>,
     /// The chunk whose code runs now; a new table is charged to it.
     pub cur_source: u32,
+    /// `intern_with`'s buffer.
+    scratch: Vec<u8>,
 }
 
 impl Default for Heap {
@@ -262,6 +264,7 @@ impl Default for Heap {
             sources: vec![Rc::from(&b"=[host]"[..])],
             source_ids: Default::default(),
             cur_source: 0,
+            scratch: Vec::new(),
         }
     }
 }
@@ -320,6 +323,17 @@ impl Heap {
             }
         }
         self.strt = strt;
+    }
+
+    /// The string `fill` writes, built in a buffer the heap keeps: a string made from heap
+    /// strings without a fresh allocation.
+    pub fn intern_with(&mut self, fill: impl FnOnce(&Heap, &mut Vec<u8>)) -> StrRef {
+        let mut b = std::mem::take(&mut self.scratch);
+        b.clear();
+        fill(self, &mut b);
+        let r = self.intern(&b);
+        self.scratch = b;
+        r
     }
 
     pub fn str_value(&mut self, s: &[u8]) -> Value {
