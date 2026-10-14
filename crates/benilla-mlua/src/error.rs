@@ -12,6 +12,8 @@ pub enum Error {
     },
     RuntimeError(String),
     MemoryError(String),
+    /// A callback's arguments and results overflow the stack a C function may use.
+    StackError,
     BadArgument {
         to: Option<String>,
         pos: usize,
@@ -70,6 +72,10 @@ impl fmt::Display for Error {
             Error::SyntaxError { message, .. } => write!(f, "syntax error: {message}"),
             Error::RuntimeError(msg) => write!(f, "runtime error: {msg}"),
             Error::MemoryError(msg) => write!(f, "memory error: {msg}"),
+            Error::StackError => write!(
+                f,
+                "out of Lua stack, too many arguments to a Lua function or too many return values from a callback"
+            ),
             Error::BadArgument {
                 to,
                 pos,

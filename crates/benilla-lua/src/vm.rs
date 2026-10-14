@@ -153,8 +153,7 @@ pub struct Vm {
     pub(crate) fenv_gen: u32,
     /// Values a host holds outside the VM (a handle to a table or function), each a collector
     /// root while its count is above zero: mlua's registry references.
-    roots: Vec<(Value, u32)>,
-    root_free: Vec<u32>,
+    roots: Roots,
     /// The instruction-budget hook, and whether one is set (read where loops and calls pass).
     hook: Option<Hook>,
     /// A hook or a profile is on: the flag the dispatch loop tests.
@@ -168,6 +167,80 @@ pub struct Vm {
     /// instead of capturing it, so a cloned VM's closures reach the clone's host. Weak, so the
     /// host owning this VM makes no cycle.
     pub host: Option<std::rc::Weak<dyn std::any::Any>>,
+}
+
+/// Values a host holds outside the VM, each with a count of holders; mlua's registry
+/// references. Counted through `&self`, so a holder can let go while the VM is borrowed.
+#[derive(Debug, Default)]
+pub struct RootTable {
+    slots: std::cell::RefCell<Vec<(Value, u32)>>,
+    free: std::cell::RefCell<Vec<u32>>,
+}
+
+impl RootTable {
+    fn root(&self, v: Value) -> u32 {
+        let mut slots = self.slots.borrow_mut();
+        match self.free.borrow_mut().pop() {
+            Some(i) => {
+                slots[i as usize] = (v, 1);
+                i
+            }
+            None => {
+                slots.push((v, 1));
+                (slots.len() - 1) as u32
+            }
+        }
+    }
+
+    /// Another holder of root `i`; an id this table never gave is ignored.
+    pub fn retain(&self, i: u32) {
+        if let Some(r) = self
+            .slots
+            .borrow_mut()
+            .get_mut(i as usize)
+            .filter(|r| r.1 > 0)
+        {
+            r.1 += 1;
+        }
+    }
+
+    /// One holder of root `i` lets go; an id that holds nothing is ignored.
+    pub fn unroot(&self, i: u32) {
+        let mut slots = self.slots.borrow_mut();
+        if let Some(r) = slots.get_mut(i as usize).filter(|r| r.1 > 0) {
+            r.1 -= 1;
+            if r.1 == 0 {
+                r.0 = Value::Nil;
+                self.free.borrow_mut().push(i);
+            }
+        }
+    }
+
+    /// Root `i`'s value; nil for an id that holds nothing.
+    pub fn get(&self, i: u32) -> Value {
+        self.slots
+            .borrow()
+            .get(i as usize)
+            .map_or(Value::Nil, |r| r.0)
+    }
+
+    fn live(&self) -> Vec<Value> {
+        let slots = self.slots.borrow();
+        slots.iter().filter(|r| r.1 > 0).map(|r| r.0).collect()
+    }
+}
+
+/// A VM's root table. A cloned VM gets its own copy, as it gets its own heap.
+#[derive(Default)]
+struct Roots(Rc<RootTable>);
+
+impl Clone for Roots {
+    fn clone(&self) -> Self {
+        Roots(Rc::new(RootTable {
+            slots: self.0.slots.clone(),
+            free: self.0.free.clone(),
+        }))
+    }
 }
 
 /// The host's hook body; an error it answers is raised where the hook ran.
@@ -292,8 +365,7 @@ impl Vm {
             gc_stress: false,
             retired: Vec::new(),
             fenv_gen: 0,
-            roots: Vec::new(),
-            root_free: Vec::new(),
+            roots: Roots::default(),
             hook: None,
             hooked: false,
             in_hook: false,
@@ -1348,35 +1420,28 @@ impl Vm {
 
     /// Hold `v` for the host: a collector root until [`Vm::unroot`] brings its count to zero.
     pub fn root(&mut self, v: Value) -> u32 {
-        match self.root_free.pop() {
-            Some(i) => {
-                self.roots[i as usize] = (v, 1);
-                i
-            }
-            None => {
-                self.roots.push((v, 1));
-                (self.roots.len() - 1) as u32
-            }
-        }
+        self.roots.0.root(v)
     }
 
     /// Another holder of root `i`.
     pub fn retain(&mut self, i: u32) {
-        self.roots[i as usize].1 += 1;
+        self.roots.0.retain(i);
     }
 
     /// One holder of root `i` lets go.
     pub fn unroot(&mut self, i: u32) {
-        let r = &mut self.roots[i as usize];
-        r.1 -= 1;
-        if r.1 == 0 {
-            r.0 = Value::Nil;
-            self.root_free.push(i);
-        }
+        self.roots.0.unroot(i);
     }
 
     pub fn rooted(&self, i: u32) -> Value {
-        self.roots[i as usize].0
+        self.roots.0.get(i)
+    }
+
+    /// The root table itself, which a host handle keeps to let go of its root without reaching
+    /// the VM: a handle dropped while the VM runs (a host closure the collector frees) or after
+    /// it is gone touches only the table.
+    pub fn root_table(&self) -> Rc<RootTable> {
+        self.roots.0.clone()
     }
 
     // ── the hook ─────────────────────────────────────────────────────────────────────────────
@@ -1593,7 +1658,7 @@ impl Vm {
             roots.push(Value::Func(f.func));
         }
         roots.extend(self.handlers.iter().flatten().copied());
-        roots.extend(self.roots.iter().filter(|r| r.1 > 0).map(|r| r.0));
+        roots.extend(self.roots.0.live());
         // The generic `for` fast path compares against it by identity: a freed `next` whose id
         // a new function took would step a table without calling that function.
         roots.push(self.builtin_next);

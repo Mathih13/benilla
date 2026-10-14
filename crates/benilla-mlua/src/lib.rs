@@ -3,11 +3,15 @@
 //! interpreter unchanged.
 //!
 //! A [`Lua`] owns one VM. Handles to tables, functions and strings ([`Table`], [`Function`],
-//! [`String`]) are counted collector roots, as mlua's registry references are. A Rust callback
-//! runs with the `&mut Vm` the interpreter hands it; while it runs, every handle reaches the VM
-//! through that reference, so one chain of borrows covers each access. A callback's error is
-//! raised in Lua as its message, a string, as a 1.12 C function raises one; a Lua error that
-//! reaches Rust is a [`Error::RuntimeError`] with that value's text.
+//! [`String`]) are counted collector roots, as mlua's registry references are, and hold their
+//! state weakly, as mlua 0.11's do: a host closure that captures one makes no cycle, and a handle
+//! used after its state is gone panics. A Rust callback runs with the `&mut Vm` the interpreter
+//! hands it; while it runs, every access reaches the VM through that reference, so one chain of
+//! borrows covers each access, and a handle lets go of its root through the root table alone,
+//! never the VM. A callback's error is raised in Lua as its message, a string, as a 1.12 C
+//! function raises one; a callback's panic is raised as an error value `pcall` can catch, and
+//! resumes as a panic if it reaches Rust, as mlua's does. A Lua error that reaches Rust is a
+//! [`Error::RuntimeError`] with that value's text.
 
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
@@ -19,7 +23,7 @@ use std::rc::Rc;
 
 use benilla_lua::heap::HostFn;
 use benilla_lua::value::V;
-use benilla_lua::vm::Vm;
+use benilla_lua::vm::{LuaError, RootTable, Vm};
 
 mod conv;
 mod error;
@@ -60,20 +64,108 @@ pub(crate) struct Inner {
 thread_local! {
     /// The family and VM of the callback running now, if any.
     static RUNNING: Cell<(u64, *mut Vm)> = const { Cell::new((0, std::ptr::null_mut())) };
+    /// Each panic a callback raised as a Lua error, by its error value's tag: the payload until
+    /// it resumes in Rust, and its text for `tostring`.
+    static PANICS: RefCell<HashMap<u64, Panic>> = RefCell::new(HashMap::new());
 }
+
+/// A panic raised as a Lua error: its payload until it resumes, and its text.
+type Panic = (Option<Box<dyn Any + Send>>, std::string::String);
 
 static NEXT_FAMILY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Run `f` as a callback of `lua`'s family on `vm`: handles of the family reach `vm`.
+/// The userdata tags of panic values, in a range no host object uses.
+const PANIC_TAG: u64 = 0xBE11_0000_0000_0000;
+static NEXT_PANIC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 5.1's `LUAI_MAXCSTACK`: a callback's arguments and results share this many stack slots, as
+/// `lua_checkstack` allows a C function.
+const MAXCSTACK: usize = 8000;
+
+/// Run `f` as a callback of `lua`'s family on `vm`: handles of the family reach `vm`. The VM in
+/// effect before is restored however `f` ends, a panic included.
 #[inline]
 fn in_callback<T>(lua: &Lua, vm: *mut Vm, f: impl FnOnce() -> T) -> T {
-    let prev = lua.0.cur.replace(vm);
-    let prev_running = RUNNING.replace((lua.0.family, vm));
-    let out = f();
-    RUNNING.set(prev_running);
-    lua.0.cur.set(prev);
-    out
+    struct Restore<'a> {
+        lua: &'a Lua,
+        prev: *mut Vm,
+        prev_running: (u64, *mut Vm),
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            RUNNING.set(self.prev_running);
+            self.lua.0.cur.set(self.prev);
+        }
+    }
+    let _restore = Restore {
+        lua,
+        prev: lua.0.cur.replace(vm),
+        prev_running: RUNNING.replace((lua.0.family, vm)),
+    };
+    f()
 }
+
+/// A callback's panic as a Lua error: a userdata whose `tostring` is the panic's text, as mlua's
+/// wrapped panic is. The payload waits in `PANICS` and resumes if the error reaches Rust.
+fn raise_panic(vm: &mut Vm, payload: Box<dyn Any + Send>) -> LuaError {
+    let text = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<std::string::String>() {
+        s.clone()
+    } else {
+        "<panic>".to_owned()
+    };
+    let tag = PANIC_TAG | NEXT_PANIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PANICS.with(|p| p.borrow_mut().insert(tag, (Some(payload), text)));
+    let meta = panic_meta(vm);
+    let u = vm.new_user(tag, Some(meta));
+    vm.throw(u)
+}
+
+/// The metatable of panic values, made once per VM and kept in its registry.
+fn panic_meta(vm: &mut Vm) -> benilla_lua::value::TableRef {
+    let key = vm.str(b"benilla-mlua panic");
+    let reg = vm.registry;
+    if let Some(t) = vm.heap.table(reg).get(key).as_table() {
+        return t;
+    }
+    fn tostring(vm: &mut Vm, nargs: usize) -> std::result::Result<usize, LuaError> {
+        let text = match vm.arg(nargs, 0).unpack() {
+            V::User(u) => {
+                let tag = vm.heap.user(u).tag;
+                PANICS.with(|p| p.borrow().get(&tag).map(|e| e.1.clone()))
+            }
+            _ => None,
+        };
+        let s = vm.str(text.unwrap_or_else(|| "<panic>".to_owned()).as_bytes());
+        vm.push(s);
+        Ok(1)
+    }
+    let meta = vm.heap.new_table(0, 1);
+    let f = vm.new_native("__tostring", tostring);
+    let name = vm.str(b"__tostring");
+    vm.heap.table_mut(meta).set(name, f).expect("a string key");
+    vm.heap
+        .table_mut(reg)
+        .set(key, benilla_lua::Value::Table(meta))
+        .expect("a string key");
+    meta
+}
+
+/// The panic a Lua error value carries, if it is one whose payload has not resumed yet.
+fn take_panic(vm: &Vm, e: benilla_lua::Value) -> Option<Box<dyn Any + Send>> {
+    let V::User(u) = e.unpack() else {
+        return None;
+    };
+    let tag = vm.heap.user(u).tag;
+    if tag & PANIC_TAG != PANIC_TAG {
+        return None;
+    }
+    PANICS.with(|p| p.borrow_mut().get_mut(&tag).and_then(|e| e.0.take()))
+}
+
+const DESTROYED: &str = "Lua instance is destroyed";
+const FOREIGN: &str = "Lua instance passed Value created from a different main Lua state";
 
 /// A Lua state: a cheap handle, cloned freely, as mlua's is.
 #[derive(Clone)]
@@ -127,7 +219,12 @@ impl Lua {
         Lua::over(Box::new(vm), self.0.family)
     }
 
-    /// The VM in effect. Every use is short and holds nothing across a call into Lua.
+    /// The VM in effect. Every use is short: a reference from here is not held across anything
+    /// that can run Lua or reach the VM another way, except a call on the reference itself (the
+    /// VM hands its own `&mut` down to a callback, which is where `RUNNING` points), so no two
+    /// live references alias. A handle's root count is kept in its `RootTable`, never through
+    /// here, so a handle dropped while the VM is borrowed (a host closure the collector frees)
+    /// makes no second reference.
     #[allow(clippy::mut_from_ref)]
     #[inline]
     pub(crate) fn vm(&self) -> &mut Vm {
@@ -143,6 +240,13 @@ impl Lua {
     }
 
     /// The interpreter itself, for code that works below this API.
+    ///
+    /// The contract, which the type cannot state: the reference is a borrow of the VM that ends
+    /// before the caller does anything else with this state. Do not hold it across any call that
+    /// can run Lua (a `call`, `exec`, `eval`, `set` or `get` that may reach a metamethod) or that
+    /// touches this API (any method of `Lua`, `Table`, `Function` or `String`), and do not take
+    /// a second one while it lives: each of those reaches the same VM through another reference.
+    /// Inside a callback it is the VM the callback runs on (a fork's, for a fork).
     #[allow(clippy::mut_from_ref)]
     pub fn raw_vm(&self) -> &mut Vm {
         self.vm()
@@ -150,12 +254,30 @@ impl Lua {
 
     // ── values ───────────────────────────────────────────────────────────────────────────────
 
+    /// A rooted handle to `v` in the VM in effect, owned by that VM's state.
     fn make_ref(&self, v: benilla_lua::Value) -> RefH {
-        let id = self.vm().root(v);
+        let vm = self.vm();
+        let id = vm.root(v);
         RefH {
-            lua: self.clone(),
+            roots: vm.root_table(),
+            owner: vm.host.clone().expect("a benilla-mlua VM"),
+            family: self.0.family,
             id,
         }
+    }
+
+    /// The value a handle names, for this state. A handle names a value in the state that made
+    /// it; while a callback of its family runs, in the VM that callback runs on, which is how a
+    /// fork's copy of a host closure reaches the fork's copy of what it captured. Anything else
+    /// is another state's value and panics, as mlua's does.
+    fn unref(&self, r: &RefH) -> benilla_lua::Value {
+        let own = std::ptr::eq(
+            r.owner.as_ptr() as *const u8,
+            Rc::as_ptr(&self.0) as *const u8,
+        );
+        let in_family_callback = r.family == self.0.family && RUNNING.get().0 == self.0.family;
+        assert!(own || in_family_callback, "{FOREIGN}");
+        r.get()
     }
 
     /// A VM value as an API value: collectables become rooted handles, and an integral number
@@ -187,9 +309,9 @@ impl Lua {
             Value::Boolean(b) => benilla_lua::Value::Bool(*b),
             Value::Integer(i) => benilla_lua::Value::Num(*i as f64),
             Value::Number(n) => benilla_lua::Value::Num(*n),
-            Value::String(s) => s.0.get(),
-            Value::Table(t) => t.0.get(),
-            Value::Function(f) => f.0.get(),
+            Value::String(s) => self.unref(&s.0),
+            Value::Table(t) => self.unref(&t.0),
+            Value::Function(f) => self.unref(&f.0),
             Value::LightUserData(l) => benilla_lua::Value::Light(l.0 as usize),
             Value::Thread(_) | Value::Error(_) => benilla_lua::Value::Nil,
         }
@@ -248,7 +370,9 @@ impl Lua {
         let host: HostFn = Rc::new(move |vm: &mut Vm, nargs: usize| {
             let lua = Lua::of_vm(vm);
             in_callback(&lua, vm, || {
-                let res = (|| {
+                // A panic becomes a Lua error here, as mlua's `callback_error` makes one, so it
+                // never unwinds through the interpreter.
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let args: MultiValue = lua
                         .vm()
                         .args(nargs)
@@ -257,10 +381,15 @@ impl Lua {
                         .map(|v| lua.wrap(v))
                         .collect();
                     let a = A::from_lua_args(args, &lua)?;
-                    func(&lua, a)?.into_lua_multi(&lua)
-                })();
+                    let rets = func(&lua, a)?.into_lua_multi(&lua)?;
+                    // mlua's `check_stack` for the results, against 5.1's `LUAI_MAXCSTACK`.
+                    if nargs + rets.len() >= MAXCSTACK {
+                        return Err(Error::StackError);
+                    }
+                    Ok(rets)
+                }));
                 let out = match res {
-                    Ok(rets) => {
+                    Ok(Ok(rets)) => {
                         let n = rets.len();
                         for v in rets.iter() {
                             let x = lua.unwrap(v);
@@ -268,11 +397,12 @@ impl Lua {
                         }
                         Ok(n)
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         let vm = lua.vm();
                         let msg = vm.str(e.lua_message().as_bytes());
                         Err(vm.throw(msg))
                     }
+                    Err(payload) => Err(raise_panic(lua.vm(), payload)),
                 };
                 out
             })
@@ -463,14 +593,17 @@ impl Lua {
                 let lua = Lua::of_vm(vm);
                 in_callback(&lua, vm, || {
                     let info = lua.vm().frame_info(0).unwrap_or_default();
-                    let r = callback(&lua, &Debug { info });
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        callback(&lua, &Debug { info })
+                    }));
                     let out = match r {
-                        Ok(_) => Ok(()),
-                        Err(e) => {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(e)) => {
                             let vm = lua.vm();
                             let msg = vm.str(e.lua_message().as_bytes());
                             Err(vm.throw(msg))
                         }
+                        Err(payload) => Err(raise_panic(lua.vm(), payload)),
                     };
                     out
                 })
@@ -495,8 +628,12 @@ impl Lua {
         }
     }
 
-    /// A Lua error value as an `Error`: its text, as mlua reports a runtime error.
+    /// A Lua error value as an `Error`: its text, as mlua reports a runtime error. A callback's
+    /// panic resumes here, as mlua's `pop_error` resumes it.
     pub(crate) fn error_from(&self, e: benilla_lua::Value) -> Error {
+        if let Some(payload) = take_panic(self.vm(), e) {
+            std::panic::resume_unwind(payload);
+        }
         Error::RuntimeError(self.vm().display(e))
     }
 }
@@ -505,24 +642,55 @@ impl Lua {
 // Handles
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-/// A counted collector root: mlua's registry reference.
+/// A counted collector root: mlua's registry reference. It holds its state weakly, as mlua
+/// 0.11's `WeakLua`, and counts itself in the root table it was made in, which outlives the VM.
 pub(crate) struct RefH {
-    lua: Lua,
+    roots: Rc<RootTable>,
+    /// The state whose VM made the root.
+    owner: std::rc::Weak<dyn Any>,
+    family: u64,
     id: u32,
 }
 
 impl RefH {
+    /// The VM the handle reads: a running callback's of its family, else its own state's.
+    #[inline]
+    fn vm(&self) -> *mut Vm {
+        let (family, running) = RUNNING.get();
+        if family == self.family {
+            return running;
+        }
+        let owner = self.owner.upgrade().expect(DESTROYED);
+        let inner = owner.downcast_ref::<Inner>().expect("a benilla-mlua state");
+        // Another holder keeps the state alive past this temporary one: the upgrade succeeded.
+        inner.cur.get()
+    }
+
     #[inline]
     pub(crate) fn get(&self) -> benilla_lua::Value {
-        self.lua.vm().rooted(self.id)
+        // SAFETY: `vm` is live (see `Lua::vm`), and the read ends here.
+        unsafe { (*self.vm()).rooted(self.id) }
+    }
+
+    /// The state the handle acts in: as `vm`.
+    pub(crate) fn lua(&self) -> Lua {
+        let (family, running) = RUNNING.get();
+        if family == self.family {
+            // SAFETY: a running callback's VM, read for its host link alone.
+            return Lua::of_vm(unsafe { &*running });
+        }
+        let owner = self.owner.upgrade().expect(DESTROYED);
+        Lua(owner.downcast::<Inner>().expect("a benilla-mlua state"))
     }
 }
 
 impl Clone for RefH {
     fn clone(&self) -> Self {
-        self.lua.vm().retain(self.id);
+        self.roots.retain(self.id);
         RefH {
-            lua: self.lua.clone(),
+            roots: self.roots.clone(),
+            owner: self.owner.clone(),
+            family: self.family,
             id: self.id,
         }
     }
@@ -530,7 +698,7 @@ impl Clone for RefH {
 
 impl Drop for RefH {
     fn drop(&mut self) {
-        self.lua.vm().unroot(self.id);
+        self.roots.unroot(self.id);
     }
 }
 
@@ -751,8 +919,8 @@ fn pointer_of(r: &RefH) -> *const c_void {
 // ── tables ───────────────────────────────────────────────────────────────────────────────────
 
 impl Table {
-    fn lua(&self) -> &Lua {
-        &self.0.lua
+    fn lua(&self) -> Lua {
+        self.0.lua()
     }
 
     fn tref(&self) -> benilla_lua::value::TableRef {
@@ -761,7 +929,7 @@ impl Table {
 
     /// `t[key] = value`, with metamethods.
     pub fn set(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()> {
-        let lua = self.lua();
+        let lua = &self.lua();
         let k = key.into_lua(lua)?;
         let v = value.into_lua(lua)?;
         let (kx, vx) = (lua.unwrap(&k), lua.unwrap(&v));
@@ -773,7 +941,7 @@ impl Table {
 
     /// `t[key]`, with metamethods.
     pub fn get<V2: FromLua>(&self, key: impl IntoLua) -> Result<V2> {
-        let lua = self.lua();
+        let lua = &self.lua();
         let k = key.into_lua(lua)?;
         let kx = lua.unwrap(&k);
         let t = self.0.get();
@@ -789,7 +957,7 @@ impl Table {
     }
 
     pub fn raw_set(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()> {
-        let lua = self.lua();
+        let lua = &self.lua();
         let k = key.into_lua(lua)?;
         let v = value.into_lua(lua)?;
         let (kx, vx) = (lua.unwrap(&k), lua.unwrap(&v));
@@ -801,7 +969,7 @@ impl Table {
     }
 
     pub fn raw_get<V2: FromLua>(&self, key: impl IntoLua) -> Result<V2> {
-        let lua = self.lua();
+        let lua = &self.lua();
         let k = key.into_lua(lua)?;
         let kx = lua.unwrap(&k);
         let v = lua.vm().heap.table(self.tref()).get(kx);
@@ -812,8 +980,9 @@ impl Table {
         self.raw_set(key, Value::Nil)
     }
 
-    /// The border: the count from 1 to the first nil.
+    /// `lua_objlen`: 5.1's `luaH_getn`.
     pub fn raw_len(&self) -> usize {
+        // TODO(fix-libs merge): `.length()`, the `luaH_getn` port on `fix-libs`, for `.border()`.
         self.lua().vm().heap.table(self.tref()).border()
     }
 
@@ -822,7 +991,7 @@ impl Table {
     }
 
     pub fn is_empty(&self) -> bool {
-        let lua = self.lua();
+        let lua = &self.lua();
         matches!(
             lua.vm()
                 .heap
@@ -845,21 +1014,21 @@ impl Table {
     pub fn pop<V2: FromLua>(&self) -> Result<V2> {
         let n = self.raw_len();
         if n == 0 {
-            return V2::from_lua(Value::Nil, self.lua());
+            return V2::from_lua(Value::Nil, &self.lua());
         }
         let v: Value = self.get(n)?;
         self.set(n, Value::Nil)?;
-        V2::from_lua(v, self.lua())
+        V2::from_lua(v, &self.lua())
     }
 
     pub fn raw_pop<V2: FromLua>(&self) -> Result<V2> {
         let n = self.raw_len();
         if n == 0 {
-            return V2::from_lua(Value::Nil, self.lua());
+            return V2::from_lua(Value::Nil, &self.lua());
         }
         let v: Value = self.raw_get(n)?;
         self.raw_set(n, Value::Nil)?;
-        V2::from_lua(v, self.lua())
+        V2::from_lua(v, &self.lua())
     }
 
     pub fn raw_insert(&self, idx: Integer, value: impl IntoLua) -> Result<()> {
@@ -885,7 +1054,7 @@ impl Table {
     }
 
     pub fn metatable(&self) -> Option<Table> {
-        let lua = self.lua();
+        let lua = &self.lua();
         let m = lua.vm().heap.table(self.tref()).meta?;
         Some(Table(lua.make_ref(benilla_lua::Value::Table(m))))
     }
@@ -895,9 +1064,10 @@ impl Table {
     }
 
     pub fn set_metatable(&self, metatable: Option<Table>) -> Result<()> {
-        let m = metatable.map(|m| m.tref());
+        let lua = &self.lua();
+        let m = metatable.and_then(|m| lua.unref(&m.0).as_table());
         let t = self.tref();
-        self.lua().vm().heap.table_mut(t).meta = m;
+        lua.vm().heap.table_mut(t).meta = m;
         Ok(())
     }
 
@@ -906,8 +1076,8 @@ impl Table {
     }
 
     pub fn equals(&self, other: &Table) -> Result<bool> {
-        let (a, b) = (self.0.get(), other.0.get());
-        let lua = self.lua();
+        let lua = &self.lua();
+        let (a, b) = (self.0.get(), lua.unref(&other.0));
         lua.vm()
             .protected(|vm| vm.equals(a, b))
             .map_err(|e| lua.error_from(e))
@@ -965,7 +1135,7 @@ impl<K: FromLua, V2: FromLua> Iterator for TablePairs<K, V2> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.key.take()?;
-        let lua = self.table.lua().clone();
+        let lua = self.table.lua();
         let kx = lua.unwrap(&key);
         let next = lua.vm().heap.table(self.table.tref()).next(kx);
         match next {
@@ -998,7 +1168,7 @@ impl<V2: FromLua> Iterator for TableSequence<V2> {
             return None;
         }
         self.index += 1;
-        Some(V2::from_lua(v, self.table.lua()))
+        Some(V2::from_lua(v, &self.table.lua()))
     }
 }
 
@@ -1024,7 +1194,7 @@ impl ObjectLike for Table {
     }
 
     fn call<R: FromLuaMulti>(&self, args: impl IntoLuaMulti) -> Result<R> {
-        let lua = self.lua();
+        let lua = &self.lua();
         let mut a = args.into_lua_multi(lua)?;
         a.push_front(Value::Table(self.clone()));
         let r = lua.call_raw(self.0.get(), a)?;
@@ -1033,7 +1203,7 @@ impl ObjectLike for Table {
 
     fn call_method<R: FromLuaMulti>(&self, name: &str, args: impl IntoLuaMulti) -> Result<R> {
         let f: Function = Table::get(self, name)?;
-        let lua = self.lua();
+        let lua = &self.lua();
         let mut a = args.into_lua_multi(lua)?;
         a.push_front(Value::Table(self.clone()));
         f.call(a)
@@ -1052,11 +1222,11 @@ impl ObjectLike for Table {
                 _ => Value::Nil,
             };
         }
-        V2::from_lua(cur, self.lua())
+        V2::from_lua(cur, &self.lua())
     }
 
     fn to_string(&self) -> Result<std::string::String> {
-        let lua = self.lua();
+        let lua = &self.lua();
         let t = self.0.get();
         let s = lua
             .vm()
@@ -1074,7 +1244,7 @@ impl ObjectLike for Table {
 
 impl Function {
     pub fn call<R: FromLuaMulti>(&self, args: impl IntoLuaMulti) -> Result<R> {
-        let lua = &self.0.lua;
+        let lua = &self.0.lua();
         let a = args.into_lua_multi(lua)?;
         let r = lua.call_raw(self.0.get(), a)?;
         R::from_lua_multi(r, lua)
@@ -1086,7 +1256,7 @@ impl Function {
 
     /// The function's environment, for a Lua function.
     pub fn environment(&self) -> Option<Table> {
-        let lua = &self.0.lua;
+        let lua = &self.0.lua();
         let f = self.0.get().as_func()?;
         let env = match lua.vm().heap.func(f) {
             benilla_lua::heap::FuncObj::Lua { env, .. } => *env,
@@ -1097,7 +1267,7 @@ impl Function {
 
     /// Where the function was defined, as `lua_getinfo(L, "S")` says.
     pub fn info(&self) -> FunctionInfo {
-        let lua = &self.0.lua;
+        let lua = &self.0.lua();
         let mut out = FunctionInfo {
             what: "C",
             source: Some("=[C]".into()),
@@ -1122,11 +1292,13 @@ impl Function {
     }
 
     pub fn set_environment(&self, env: Table) -> Result<bool> {
-        let lua = &self.0.lua;
+        let lua = &self.0.lua();
         let Some(f) = self.0.get().as_func() else {
             return Ok(false);
         };
-        let t = env.tref();
+        let Some(t) = lua.unref(&env.0).as_table() else {
+            return Ok(false);
+        };
         match lua.vm().heap.func_mut(f) {
             benilla_lua::heap::FuncObj::Lua { env, .. } => {
                 *env = t;
@@ -1152,32 +1324,43 @@ pub struct FunctionInfo {
 // ── strings ──────────────────────────────────────────────────────────────────────────────────
 
 impl String {
-    fn bytes_raw(&self) -> &[u8] {
-        let v = self.0.get();
-        let s = v.as_str().expect("a string handle");
-        let b = self.0.lua.vm().heap.str(s);
-        // SAFETY: the string is rooted while this handle lives, and its bytes are a boxed slice
-        // that never moves.
-        unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }
+    /// `f` over the string's bytes, read in place: `f` must not reach the VM.
+    fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        // SAFETY: as `RefH::get`; `f` holds nothing that reaches the VM.
+        let vm = unsafe { &*self.0.vm() };
+        let s = vm.rooted(self.0.id).as_str().expect("a string handle");
+        f(vm.heap.str(s))
+    }
+
+    /// The bytes, copied: a short string's bytes live inside the heap's arena, which moves as
+    /// it grows, so a borrow of them could not outlive the next allocation.
+    fn copy(&self) -> Bytes {
+        self.with_bytes(Bytes::of)
     }
 
     pub fn to_str(&self) -> Result<BorrowedStr<'_>> {
-        std::str::from_utf8(self.bytes_raw())
-            .map(|s| BorrowedStr { s })
-            .map_err(|e| Error::FromLuaConversionError {
+        let b = self.copy();
+        match std::str::from_utf8(b.as_slice()) {
+            Ok(_) => Ok(BorrowedStr {
+                b,
+                _p: std::marker::PhantomData,
+            }),
+            Err(e) => Err(Error::FromLuaConversionError {
                 from: "string",
                 to: "&str".to_string(),
                 message: Some(e.to_string()),
-            })
+            }),
+        }
     }
 
     pub fn to_string_lossy(&self) -> std::string::String {
-        std::string::String::from_utf8_lossy(self.bytes_raw()).into_owned()
+        self.with_bytes(|b| std::string::String::from_utf8_lossy(b).into_owned())
     }
 
     pub fn as_bytes(&self) -> BorrowedBytes<'_> {
         BorrowedBytes {
-            b: self.bytes_raw(),
+            b: self.copy(),
+            _p: std::marker::PhantomData,
         }
     }
 
@@ -1192,112 +1375,151 @@ impl String {
 
 impl PartialEq for String {
     fn eq(&self, other: &Self) -> bool {
-        self.bytes_raw() == other.bytes_raw()
+        let theirs = other.copy();
+        self.with_bytes(|b| b == theirs.as_slice())
     }
 }
 
 impl<T: AsRef<[u8]> + ?Sized> PartialEq<T> for String {
     fn eq(&self, other: &T) -> bool {
-        self.bytes_raw() == other.as_ref()
+        self.with_bytes(|b| b == other.as_ref())
     }
 }
 
-/// A string's text, borrowed from its handle. Not `Clone`, as mlua's is not, so `to_owned()`
-/// reaches `str`'s and answers a `String`.
+/// A copy of a string's bytes: in place up to the length the heap keeps inline, so reading a
+/// short string allocates nothing; boxed beyond.
+enum Bytes {
+    Inline(u8, [u8; Bytes::INLINE]),
+    Boxed(Box<[u8]>),
+}
+
+impl Bytes {
+    const INLINE: usize = 22;
+
+    fn of(b: &[u8]) -> Bytes {
+        if b.len() <= Bytes::INLINE {
+            let mut buf = [0; Bytes::INLINE];
+            buf[..b.len()].copy_from_slice(b);
+            Bytes::Inline(b.len() as u8, buf)
+        } else {
+            Bytes::Boxed(b.into())
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Bytes::Inline(n, buf) => &buf[..*n as usize],
+            Bytes::Boxed(b) => b,
+        }
+    }
+}
+
+/// A string's text, read from its handle. Not `Clone`, as mlua's is not, so `to_owned()`
+/// reaches `str`'s and answers a `String`. It owns a copy (see `String::copy`).
 pub struct BorrowedStr<'a> {
-    s: &'a str,
+    /// Valid UTF-8, checked when made.
+    b: Bytes,
+    _p: std::marker::PhantomData<&'a String>,
+}
+
+impl BorrowedStr<'_> {
+    fn s(&self) -> &str {
+        // SAFETY: `to_str` checked the bytes are UTF-8, and they never change.
+        unsafe { std::str::from_utf8_unchecked(self.b.as_slice()) }
+    }
 }
 
 impl Deref for BorrowedStr<'_> {
     type Target = str;
     fn deref(&self) -> &str {
-        self.s
+        self.s()
     }
 }
 
 impl AsRef<str> for BorrowedStr<'_> {
     fn as_ref(&self) -> &str {
-        self.s
+        self.s()
     }
 }
 
 impl std::borrow::Borrow<str> for BorrowedStr<'_> {
     fn borrow(&self) -> &str {
-        self.s
+        self.s()
     }
 }
 
 impl std::fmt::Display for BorrowedStr<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.s.fmt(f)
+        self.s().fmt(f)
     }
 }
 
 impl std::fmt::Debug for BorrowedStr<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.s.fmt(f)
+        self.s().fmt(f)
     }
 }
 
 impl<T: AsRef<str> + ?Sized> PartialEq<T> for BorrowedStr<'_> {
     fn eq(&self, other: &T) -> bool {
-        self.s == other.as_ref()
+        self.s() == other.as_ref()
     }
 }
 
 impl From<BorrowedStr<'_>> for std::string::String {
     fn from(b: BorrowedStr<'_>) -> Self {
-        b.s.to_owned()
+        b.s().to_owned()
     }
 }
 
 impl<'a> From<BorrowedStr<'a>> for Cow<'a, str> {
     fn from(b: BorrowedStr<'a>) -> Self {
-        Cow::Borrowed(b.s)
+        Cow::Owned(b.s().to_owned())
     }
 }
 
-/// A string's bytes, borrowed from its handle.
+/// A string's bytes, read from its handle; it owns a copy (see `String::copy`).
 pub struct BorrowedBytes<'a> {
-    b: &'a [u8],
+    b: Bytes,
+    _p: std::marker::PhantomData<&'a String>,
 }
 
 impl Deref for BorrowedBytes<'_> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        self.b
+        self.b.as_slice()
     }
 }
 
 impl AsRef<[u8]> for BorrowedBytes<'_> {
     fn as_ref(&self) -> &[u8] {
-        self.b
+        self.b.as_slice()
     }
 }
 
 impl std::borrow::Borrow<[u8]> for BorrowedBytes<'_> {
     fn borrow(&self) -> &[u8] {
-        self.b
+        self.b.as_slice()
     }
 }
 
 impl std::fmt::Debug for BorrowedBytes<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.b.fmt(f)
+        self.b.as_slice().fmt(f)
     }
 }
 
 impl<T: AsRef<[u8]> + ?Sized> PartialEq<T> for BorrowedBytes<'_> {
     fn eq(&self, other: &T) -> bool {
-        self.b == other.as_ref()
+        self.b.as_slice() == other.as_ref()
     }
 }
 
-impl<'a> IntoIterator for BorrowedBytes<'a> {
-    type Item = &'a u8;
-    type IntoIter = std::slice::Iter<'a, u8>;
+impl<'a, 'b> IntoIterator for &'b BorrowedBytes<'a> {
+    type Item = &'b u8;
+    type IntoIter = std::slice::Iter<'b, u8>;
     fn into_iter(self) -> Self::IntoIter {
-        self.b.iter()
+        self.b.as_slice().iter()
     }
 }
 
