@@ -80,7 +80,15 @@ pub(crate) struct LuaInspector {
     owners_epoch: Option<u64>,
     /// [`FRAME_HELPER`]'s function, a VM root, and the session of its VM.
     helper: Option<(u32, u64)>,
+    /// Each listed table's frame name, or `None` for a table that is no frame: running the frame
+    /// helper for every row on every frame cost about a millisecond of Lua over `_G`. Cleared every
+    /// [`NAME_FRAMES`] draws, so a label may trail a change, or a recycled table id, that long.
+    names: std::collections::HashMap<u32, Option<String>>,
+    draws: u32,
 }
+
+/// Draws a cached frame name lasts.
+const NAME_FRAMES: u32 = 30;
 
 pub(super) fn toggle(
     keys: Res<ButtonInput<KeyCode>>,
@@ -171,6 +179,7 @@ struct Cx<'a> {
     edit: &'a mut Option<(egui::Id, String, bool)>,
     asks: &'a mut Asks,
     helper: Value,
+    names: &'a mut std::collections::HashMap<u32, Option<String>>,
 }
 
 /// A frame's name and its scripts, when `t` is a frame's table (its `[0]` is a userdata).
@@ -209,6 +218,7 @@ pub(super) fn panel_ui(
     if ins.root.is_some_and(|(_, s)| s != script.session()) {
         ins.root = None;
         ins.owners_epoch = None;
+        ins.names.clear();
         evaluate(&mut ins, &script);
     }
     let ctx = contexts.ctx_mut()?;
@@ -235,6 +245,10 @@ pub(super) fn panel_ui(
     }
     let root = vm.rooted(root_id);
     let ins = &mut *ins;
+    ins.draws = ins.draws.wrapping_add(1);
+    if ins.draws.is_multiple_of(NAME_FRAMES) {
+        ins.names.clear();
+    }
     let mut asks = Asks::default();
 
     egui::Window::new("Lua inspector")
@@ -292,6 +306,7 @@ pub(super) fn panel_ui(
                 edit: &mut ins.edit,
                 asks: &mut asks,
                 helper,
+                names: &mut ins.names,
             };
             let head = describe(&mut cx, root);
             ui.label(egui::RichText::new(head).strong().color(colour(root)));
@@ -408,10 +423,20 @@ fn brief(vm: &mut Vm, v: Value) -> String {
 /// [`brief`], with a frame's name.
 fn describe(cx: &mut Cx, v: Value) -> String {
     match v.unpack() {
-        V::Table(t) => match frame_info(cx, t) {
-            Some((name, _)) => format!("frame {name} · table #{}", t.0),
-            None => brief(cx.vm, v),
-        },
+        V::Table(t) => {
+            let name = match cx.names.get(&t.0) {
+                Some(n) => n.clone(),
+                None => {
+                    let n = frame_info(cx, t).map(|(name, _)| name);
+                    cx.names.insert(t.0, n.clone());
+                    n
+                }
+            };
+            match name {
+                Some(name) => format!("frame {name} · table #{}", t.0),
+                None => brief(cx.vm, v),
+            }
+        }
         _ => brief(cx.vm, v),
     }
 }
