@@ -1082,6 +1082,18 @@ impl Vm {
                         // first, a string nothing else ever sees.
                         let mut buf = std::mem::take(&mut self.concat_buf);
                         buf.clear();
+                        // The result's length first, a number's text at most 24 bytes: past
+                        // `MAX_STRING`, or room the allocator refuses, is `not enough memory`
+                        // (C's `luaV_concat` allocates the sum and fails there).
+                        let len = (1..=n).fold(0usize, |l, i| {
+                            l.saturating_add(match self.stack[top - i].unpack() {
+                                V::Str(s) => self.heap.str(s).len(),
+                                _ => 24,
+                            })
+                        });
+                        if len > crate::api::MAX_STRING || buf.try_reserve(len).is_err() {
+                            return Err(self.memory_error());
+                        }
                         for i in (1..=n).rev() {
                             match self.stack[top - i].unpack() {
                                 V::Str(s) => buf.extend_from_slice(self.heap.str(s)),
@@ -1090,7 +1102,10 @@ impl Vm {
                             }
                         }
                         self.stack[top - n] = self.str(&buf);
-                        self.concat_buf = buf;
+                        // A large buffer is not kept: one long result would hold its memory.
+                        if buf.capacity() <= 64 * 1024 {
+                            self.concat_buf = buf;
+                        }
                     }
                 }
                 _ => match self.bin_tm(a, b, self.names.concat)? {

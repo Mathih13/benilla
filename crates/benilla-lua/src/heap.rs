@@ -32,15 +32,19 @@ pub struct StrObj {
 }
 
 impl StrObj {
-    fn new(s: &[u8], hash: u32) -> StrObj {
+    /// A string object holding `s`, or `None` when its bytes cannot be allocated.
+    fn new(s: &[u8], hash: u32) -> Option<StrObj> {
         let data = if s.len() <= INLINE {
             let mut buf = [0; INLINE];
             buf[..s.len()].copy_from_slice(s);
             StrData::Inline(s.len() as u8, buf)
         } else {
-            StrData::Boxed(s.into())
+            let mut b = Vec::new();
+            b.try_reserve_exact(s.len()).ok()?;
+            b.extend_from_slice(s);
+            StrData::Boxed(b.into_boxed_slice())
         };
-        StrObj { data, hash }
+        Some(StrObj { data, hash })
     }
 
     #[inline]
@@ -414,8 +418,16 @@ impl Heap {
             self.threshold = 0;
             self.str_gc_at = self.strs.used + (self.str_id_limit - self.strs.used) / 2;
         }
+        // A string past `MAX_STRING`, or one whose bytes the allocator refuses, is C's
+        // `not enough memory` too, where Rust's allocator would abort.
+        if s.len() > crate::api::MAX_STRING {
+            return self.out_of_memory();
+        }
+        let Some(obj) = StrObj::new(s, hash) else {
+            return self.out_of_memory();
+        };
         self.bytes += 32 + s.len();
-        let id = self.strs.alloc(StrObj::new(s, hash));
+        let id = self.strs.alloc(obj);
         self.strt[b] = strt_entry(hash, id);
         if self.strs.live() * 2 > self.strt.len() {
             self.resize_strt(self.strt.len() * 2);
