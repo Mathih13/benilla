@@ -2379,23 +2379,24 @@ impl Vm {
 }
 
 /// 5.1's `getobjname` over a prototype: a local's name, else what a symbolic run from the start
-/// says last wrote `reg` before `pc`.
+/// says last wrote `reg` before `pc`. Names are C strings there, so a constant's stops at a NUL.
 fn objname_in(p: &Proto, heap: &Heap, pc: usize, reg: usize) -> Option<(&'static str, Vec<u8>)> {
     if let Some(n) = p.local_name(reg as Reg, pc) {
         return Some(("local", n.to_vec()));
     }
     let last = symbexec(p, pc, reg)?;
+    let cstr = |s: &[u8]| crate::lex::cstr(s).to_vec();
     let kname = |c: Rk| -> Vec<u8> {
         if c >= RK_CONST {
             if let V::Str(s) = p.consts[(c - RK_CONST) as usize].unpack() {
-                return heap.str(s).to_vec();
+                return cstr(heap.str(s));
             }
         }
         b"?".to_vec()
     };
     match p.code[last] {
         Op::GetGlobal(_, kx) => match p.consts[kx as usize].unpack() {
-            V::Str(s) => Some(("global", heap.str(s).to_vec())),
+            V::Str(s) => Some(("global", cstr(heap.str(s)))),
             _ => None,
         },
         Op::Move(a, b) if (b as usize) < (a as usize) => objname_in(p, heap, pc, b as usize),

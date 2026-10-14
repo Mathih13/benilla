@@ -124,6 +124,11 @@ pub struct Lexer<'a> {
 
 const EOZ: i32 = -1;
 
+/// `s` as C's `%s` reads it: up to its first NUL.
+pub fn cstr(s: &[u8]) -> &[u8] {
+    s.iter().position(|&c| c == 0).map_or(s, |i| &s[..i])
+}
+
 /// C's `isspace` in the "C" locale.
 fn is_space(c: i32) -> bool {
     matches!(c, 0x20 | 0x09..=0x0D)
@@ -144,7 +149,8 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             lastline: 1,
-            chunk: chunkid(chunkname),
+            // `luaO_chunkid` reads the name as a C string.
+            chunk: chunkid(cstr(chunkname)),
             cur: Token {
                 tok: Tok::Eof,
                 bytes: Vec::new(),
@@ -178,22 +184,25 @@ impl<'a> Lexer<'a> {
         Ok(self.ahead.as_ref().unwrap().tok)
     }
 
-    /// `luaX_lexerror`: `chunkid:line: msg`, then ` near `tok'` unless `near` is `None`.
+    /// `luaX_lexerror`: `chunkid:line: msg`, then ` near `tok'` unless `near` is `None`. C
+    /// formats with `%s`, so the near text stops at its first NUL.
     fn error_at(&self, msg: &[u8], near: Option<&[u8]>) -> SyntaxError {
         let mut out = self.chunk.clone();
         out.extend_from_slice(format!(":{}: ", self.line).as_bytes());
         out.extend_from_slice(msg);
         if let Some(near) = near {
             out.extend_from_slice(b" near `");
-            out.extend_from_slice(near);
+            out.extend_from_slice(cstr(near));
             out.push(b'\'');
         }
         SyntaxError(out)
     }
 
-    /// `luaX_syntaxerror` at the current token.
+    /// `luaX_syntaxerror` at the current token. A NUL byte is token 0, which `luaX_lexerror`
+    /// takes for "no token": the message then names none.
     pub fn error(&self, msg: &str) -> SyntaxError {
         let near = match self.cur.tok {
+            Tok::Char(0) => return self.error_at(msg.as_bytes(), None),
             Tok::Name => self.cur.bytes.clone(),
             Tok::String | Tok::Number => self.buff.clone(),
             t => t.text(),

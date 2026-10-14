@@ -365,6 +365,9 @@ b]])"#),
     ("fix-front_negative_zero_local", "local x = 1/0 return S(-0, x, 1/0)"),
     ("fix-front_for_names", r#"return S(E(function() for k, v in pairs({1}), 5 do end end), E(function() for i in string.rep do end end),
         E(function() for i in next, 5 do end end), E(function() local t = {} for k in t.f do end end))"#),
+    ("fix-front_nul_in_messages", r#"local function L(src, name) local f, e = loadstring(src, name or "=t") return e end
+        return S(L('x = "a\0b\n'), L("x = \0"), L("\0"), L("x = 1 \0 y"), L('x = "a\0b" +'),
+          E(function() local t = {} t["a\0b"]() end), E(function() local t = {} t:m(1) end), E(function() return _G["g\0h"].x end))"#),
     ("fix-front_constants_and_folding", r#"local function R(src) return S(loadstring(src)()) end
         return table.concat({R("return 1 + 2 * 3 - 4 / 2, 2^10, -(-3), - - 2, 10 / 0 > 1, 3 .. 4"),
           R("local a = 5 return a + 1 * 2, 2 * a, a / 2, 1 - a, a ^ 2, -a"),

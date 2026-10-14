@@ -375,6 +375,21 @@ mod tests {
         assert_eq!(err("x = 1\r\ny = +"), "t:2: unexpected symbol near `+'");
     }
 
+    /// C reads a chunk name as a C string (lua5.1 prints the same with 5.1's quotes).
+    #[test]
+    fn a_chunk_name_stops_at_a_nul() {
+        let e = |src: &[u8], name: &[u8]| check(src, name).unwrap_err().to_string();
+        assert_eq!(e(b"x = +", b"=a\0b"), "a:1: unexpected symbol near `+'");
+        assert_eq!(
+            e(b"x = \0", b"x = \0"),
+            "[string \"x = \"]:1: unexpected symbol"
+        );
+        assert_eq!(
+            e(b"x = +\0", b"x = +\0"),
+            "[string \"x = +\"]:1: unexpected symbol near `+'"
+        );
+    }
+
     #[test]
     fn chunk_names_are_5_0_s() {
         assert_eq!(chunkid(b"=name"), b"name");
