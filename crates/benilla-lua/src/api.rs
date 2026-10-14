@@ -187,7 +187,18 @@ impl Vm {
 
     /// `luaL_checklstring`: a string, or a number converted in its stack slot as
     /// `lua_tolstring` converts it.
+    #[inline]
     pub fn check_str(&mut self, nargs: usize, n: usize) -> R<StrRef> {
+        // A string, the common argument, here: converting it in place would store it unchanged.
+        // A number or an error out of line. An argument past `nargs` reads nil.
+        if let Some(s) = self.arg(nargs, n - 1).as_str() {
+            return Ok(s);
+        }
+        self.check_str_slow(nargs, n)
+    }
+
+    #[inline(never)]
+    fn check_str_slow(&mut self, nargs: usize, n: usize) -> R<StrRef> {
         let v = self.arg(nargs, n - 1);
         if n <= nargs {
             if let Some(s) = self.tostr(v) {
