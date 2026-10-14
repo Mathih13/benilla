@@ -128,6 +128,48 @@ enum KKey {
     Str(u32),
 }
 
+/// The constant map's hash: a multiply-rotate over the key's words, as 5.1's constant table
+/// (a Lua table) hashes a number by its bits and a string by its own hash. The map is only
+/// looked up, never iterated, so the hash decides no order.
+#[derive(Default)]
+struct KHasher(u64);
+
+impl std::hash::Hasher for KHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u64(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_u32(&mut self, x: u32) {
+        self.write_u64(u64::from(x));
+    }
+
+    fn write_u8(&mut self, x: u8) {
+        self.write_u64(u64::from(x));
+    }
+
+    fn write_isize(&mut self, x: isize) {
+        self.write_u64(x as u64);
+    }
+
+    fn write_usize(&mut self, x: usize) {
+        self.write_u64(x as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        // A product's low bits depend on the key's low bits alone, and a number's are often
+        // zero: the high bits are turned down to where the map picks its bucket.
+        self.0.rotate_left(26)
+    }
+}
+
+type KMap = HashMap<KKey, u32, std::hash::BuildHasherDefault<KHasher>>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BinOpr {
     Add,
@@ -169,7 +211,7 @@ pub(crate) struct FuncState {
     cpc: Vec<u32>,
     cpc_next: u32,
     pub consts: Vec<Value>,
-    kmap: HashMap<KKey, u32>,
+    kmap: KMap,
     pub protos: Vec<Rc<Proto>>,
     /// Each upvalue as `(true, register)` in the enclosing function or `(false, upvalue)`.
     pub upvals: Vec<(bool, u16)>,
@@ -205,7 +247,7 @@ impl FuncState {
             cpc: Vec::new(),
             cpc_next: 0,
             consts: Vec::new(),
-            kmap: HashMap::new(),
+            kmap: KMap::default(),
             protos: Vec::new(),
             upvals: Vec::new(),
             upval_names: Vec::new(),
