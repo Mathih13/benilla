@@ -286,8 +286,10 @@ impl Lua {
     fn make_ref(&self, v: benilla_lua::Value) -> RefH {
         let vm = self.vm();
         let id = vm.root(v);
+        let roots = vm.root_table();
         RefH {
-            roots: vm.root_table(),
+            serial: roots.serial(id),
+            roots,
             owner: vm.host.clone().expect("a benilla-mlua VM"),
             family: self.0.family,
             id,
@@ -417,16 +419,16 @@ impl Lua {
                     if nargs + rets.len() >= MAXCSTACK {
                         return Err(Error::StackError);
                     }
-                    Ok(rets)
+                    // Converted inside the guard: another state's value panics here.
+                    Ok(rets.iter().map(|v| lua.unwrap(v)).collect::<Vec<_>>())
                 }));
                 let out = match res {
                     Ok(Ok(rets)) => {
-                        let n = rets.len();
-                        for v in rets.iter() {
-                            let x = lua.unwrap(v);
-                            lua.vm().push(x);
+                        let vm = lua.vm();
+                        for &x in &rets {
+                            vm.push(x);
                         }
-                        Ok(n)
+                        Ok(rets.len())
                     }
                     Ok(Err(e)) => {
                         let vm = lua.vm();
@@ -681,6 +683,8 @@ pub(crate) struct RefH {
     owner: std::rc::Weak<dyn Any>,
     family: u64,
     id: u32,
+    /// The root's serial, which a fork's copy keeps (`RootTable::get_as`).
+    serial: u64,
 }
 
 impl RefH {
@@ -699,8 +703,10 @@ impl RefH {
 
     #[inline]
     pub(crate) fn get(&self) -> benilla_lua::Value {
+        // A fork's VM has the roots made before the fork, by serial; a root made after it, in
+        // either state, names nothing in the other, which is another state's value.
         // SAFETY: `vm` is live (see `Lua::vm`), and the read ends here.
-        unsafe { (*self.vm()).rooted(self.id) }
+        unsafe { (*self.vm()).rooted_as(self.id, self.serial) }.expect(FOREIGN)
     }
 
     /// The state the handle acts in: as `vm`.
@@ -723,6 +729,7 @@ impl Clone for RefH {
             owner: self.owner.clone(),
             family: self.family,
             id: self.id,
+            serial: self.serial,
         }
     }
 }
@@ -1782,8 +1789,14 @@ impl<'a> Chunk<'a> {
             )));
         }
         if src.first() == Some(&0x1b) {
+            // mlua-sys's `luaL_loadbufferx` text, for the mode in effect; with no mode set, a
+            // binary chunk would load on the C build, which this VM cannot.
+            let message = match self.mode {
+                Some(ChunkMode::Text) => "attempt to load a binary chunk (mode is 't')".into(),
+                _ => "attempt to load a binary chunk".into(),
+            };
             return Err(Error::SyntaxError {
-                message: "attempt to load a binary chunk".into(),
+                message,
                 incomplete_input: false,
             });
         }

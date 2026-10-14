@@ -32,3 +32,34 @@ fn a_copied_host_closure_acts_on_its_own_fork() {
     lua.load("bump()").exec().unwrap();
     assert_eq!((n(&lua), n(&fork)), (2, 3));
 }
+
+/// A handle made after the fork names nothing in the fork: reading it from a callback the fork
+/// copied is another state's value, mlua's panic, which the fork's `pcall` catches.
+#[test]
+fn a_handle_made_after_the_fork_is_foreign_to_it() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let lua = Lua::new();
+    let slot: Rc<RefCell<Option<Table>>> = Default::default();
+    let held = slot.clone();
+    let read = lua
+        .create_function(move |_, ()| {
+            let t = held.borrow().clone().expect("set before the call");
+            t.get::<i64>("v")
+        })
+        .unwrap();
+    lua.globals().set("read", read).unwrap();
+    let fork = lua.fork();
+    let t = lua.create_table().unwrap();
+    t.set("v", 7).unwrap();
+    *slot.borrow_mut() = Some(t);
+    assert_eq!(lua.load("return read()").eval::<i64>().unwrap(), 7);
+    let r: String = fork
+        .load("local ok, e = pcall(read) return tostring(ok) .. ' ' .. tostring(e)")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        r,
+        "false Lua instance passed Value created from a different main Lua state"
+    );
+}

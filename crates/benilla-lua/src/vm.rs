@@ -184,23 +184,48 @@ pub type Reentry = Rc<dyn Fn(&mut Vm, &mut dyn FnMut())>;
 /// references. Counted through `&self`, so a holder can let go while the VM is borrowed.
 #[derive(Debug, Default)]
 pub struct RootTable {
-    slots: std::cell::RefCell<Vec<(Value, u32)>>,
+    /// Each root's value, holder count and serial (`ROOT_SERIAL`).
+    slots: std::cell::RefCell<Vec<(Value, u32, u64)>>,
     free: std::cell::RefCell<Vec<u32>>,
 }
 
+/// Serials for roots, unique across every VM: a fork's copy of a root keeps its serial, and a
+/// root made after the fork, in either, has one the other never had.
+static ROOT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl RootTable {
     fn root(&self, v: Value) -> u32 {
+        let serial = ROOT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut slots = self.slots.borrow_mut();
         match self.free.borrow_mut().pop() {
             Some(i) => {
-                slots[i as usize] = (v, 1);
+                slots[i as usize] = (v, 1, serial);
                 i
             }
             None => {
-                slots.push((v, 1));
+                slots.push((v, 1, serial));
                 (slots.len() - 1) as u32
             }
         }
+    }
+
+    /// Root `i`'s serial; 0 for an id that holds nothing.
+    pub fn serial(&self, i: u32) -> u64 {
+        self.slots
+            .borrow()
+            .get(i as usize)
+            .filter(|r| r.1 > 0)
+            .map_or(0, |r| r.2)
+    }
+
+    /// Root `i`'s value if it is the root with `serial`: a handle made in this VM, or in the
+    /// VM it was forked from before the fork.
+    pub fn get_as(&self, i: u32, serial: u64) -> Option<Value> {
+        self.slots
+            .borrow()
+            .get(i as usize)
+            .filter(|r| r.1 > 0 && r.2 == serial)
+            .map(|r| r.0)
     }
 
     /// Another holder of root `i`; an id this table never gave is ignored.
@@ -536,7 +561,16 @@ impl Vm {
             self.top,
             self.handlers.len(),
         );
-        match f(self) {
+        // A protected call of its own, as mlua's `lua_pcall` with no handler: an error inside
+        // runs no enclosing `xpcall`'s handler.
+        self.handlers.push(None);
+        let r = if frames == 0 {
+            self.unwind_guard(f)
+        } else {
+            f(self)
+        };
+        self.handlers.truncate(handlers);
+        match r {
             Ok(v) => Ok(v),
             Err(e) => {
                 self.close_upvals(top);
@@ -590,24 +624,29 @@ impl Vm {
     /// Raise `v`: the innermost protected call's handler runs here, before the stack unwinds, as
     /// 5.0's `luaD_throw` runs `errfunc` at the raise.
     pub fn throw(&mut self, v: Value) -> LuaError {
-        let mut e = LuaError {
-            value: v,
-            handled: false,
-        };
-        if let Some(Some(h)) = self.handlers.last().copied() {
-            // The handler runs unprotected; an error inside it is 5.0's "error in error handling".
-            self.handlers.push(None);
-            self.in_handler += 1;
-            let r = self.call_value(h, &[v], 1);
-            self.in_handler -= 1;
-            self.handlers.pop();
-            e.value = match r {
-                Ok(vals) => vals.first().copied().unwrap_or(Value::Nil),
-                Err(_) => self.str(b"error in error handling"),
+        let Some(Some(h)) = self.handlers.last().copied() else {
+            return LuaError {
+                value: v,
+                handled: false,
             };
-            e.handled = true;
+        };
+        // 5.1's `luaG_errormsg`: a handler that is not a function is LUA_ERRERR, uncalled.
+        if !matches!(h.unpack(), V::Func(_)) {
+            return self.errerr();
         }
-        e
+        // The handler stays in place while it runs, as `errfunc` does: an error inside it runs
+        // it again, for that error, until the host-call limit throws LUA_ERRERR past every
+        // handler. Its answer, or that error, is what the protected call gets.
+        self.in_handler += 1;
+        let r = self.call_value(h, &[v], 1);
+        self.in_handler -= 1;
+        match r {
+            Ok(vals) => LuaError {
+                value: vals.first().copied().unwrap_or(Value::Nil),
+                handled: true,
+            },
+            Err(e) => e,
+        }
     }
 
     /// `luaG_runerror`: the message with the current Lua function's position.
@@ -1196,14 +1235,43 @@ impl Vm {
     /// them, `top` just past the last. Runs a Lua function to completion.
     pub fn call_at(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<(), LuaError> {
         // From the host into Lua: a profile charges what runs until it is back out.
-        let outer = self.frames.is_empty();
-        let r = self.call_at_inner(func_idx, nargs, nres);
-        if outer {
-            if let Some(p) = self.profile.as_mut() {
-                p.close();
-            }
+        if !self.frames.is_empty() {
+            return self.call_at_inner(func_idx, nargs, nres);
+        }
+        let r = self.unwind_guard(|vm| vm.call_at_inner(func_idx, nargs, nres));
+        if let Some(p) = self.profile.as_mut() {
+            p.close();
         }
         r
+    }
+
+    /// Run `f`, the host's entry into the VM: a Rust panic that unwinds out of it (a host
+    /// function's, or the VM's own) first puts the VM back as it was at entry, so the state
+    /// stays usable after the host catches the panic.
+    fn unwind_guard<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> T {
+        let at = (
+            self.frames.len(),
+            self.c_depth,
+            self.top,
+            self.handlers.len(),
+            self.in_handler,
+            self.in_hook,
+        );
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(v) => v,
+            Err(payload) => {
+                let (frames, c_depth, top, handlers, in_handler, in_hook) = at;
+                self.close_upvals(top);
+                self.frames.truncate(frames);
+                self.c_depth = c_depth;
+                self.top = top;
+                self.handlers.truncate(handlers);
+                self.in_handler = in_handler;
+                self.in_hook = in_hook;
+                self.restore_stack_limit();
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 
     fn call_at_inner(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<(), LuaError> {
@@ -1282,31 +1350,13 @@ impl Vm {
     #[inline(never)]
     fn precall(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<Called, LuaError> {
         let mut nargs = nargs;
-        let fref = loop {
-            let other = self.stack[func_idx];
-            match other.unpack() {
-                V::Func(f) => break f,
-                _ => {
-                    // `tryfuncTM`: `__call` goes below the arguments.
-                    let tm = self.tm(other, self.names.call);
-                    if !matches!(tm.unpack(), V::Func(_)) {
-                        // A name only for a register of the running Lua function, as 5.1's
-                        // `isinstack`: a metamethod is called from above them.
-                        let reg = self
-                            .frames
-                            .last()
-                            .filter(|f| !f.proto.is_null())
-                            .map(|f| func_idx.wrapping_sub(f.base()))
-                            .filter(|&r| r < self.frames.last().map_or(0, |f| f.maxstack as usize));
-                        return Err(self.type_error(other, reg, "call"));
-                    }
-                    self.ensure(func_idx + nargs + 2);
-                    self.stack
-                        .copy_within(func_idx..func_idx + nargs + 1, func_idx + 1);
-                    self.stack[func_idx] = tm;
-                    nargs += 1;
-                    self.top = func_idx + nargs + 1;
-                }
+        let fref = match self.stack[func_idx].unpack() {
+            V::Func(f) => f,
+            _ => {
+                nargs = self.tryfunc(func_idx, nargs)?;
+                self.stack[func_idx]
+                    .as_func()
+                    .expect("`tryfunc` placed a function")
             }
         };
         if self.frames.len() >= self.ci_limit {
@@ -1408,6 +1458,32 @@ impl Vm {
                 Ok(Called::Done)
             }
         }
+    }
+
+    /// 5.1's `tryfuncTM`: the value at `func_idx` is not a function, so its `__call` goes below
+    /// the arguments, the value first among them; answers the new argument count.
+    #[cold]
+    #[inline(never)]
+    fn tryfunc(&mut self, func_idx: usize, nargs: usize) -> Result<usize, LuaError> {
+        let other = self.stack[func_idx];
+        let tm = self.tm(other, self.names.call);
+        if !matches!(tm.unpack(), V::Func(_)) {
+            // A name only for a register of the running Lua function, as 5.1's `isinstack`: a
+            // metamethod is called from above them.
+            let reg = self
+                .frames
+                .last()
+                .filter(|f| !f.proto.is_null())
+                .map(|f| func_idx.wrapping_sub(f.base()))
+                .filter(|&r| r < self.frames.last().map_or(0, |f| f.maxstack as usize));
+            return Err(self.type_error(other, reg, "call"));
+        }
+        self.ensure(func_idx + nargs + 2);
+        self.stack
+            .copy_within(func_idx..func_idx + nargs + 1, func_idx + 1);
+        self.stack[func_idx] = tm;
+        self.top = func_idx + nargs + 2;
+        Ok(nargs + 1)
     }
 
     /// 5.1.5's `growCI`: the call-info array doubles; past `LUAI_MAXCALLS` the call is refused
@@ -1550,6 +1626,11 @@ impl Vm {
 
     pub fn rooted(&self, i: u32) -> Value {
         self.roots.0.get(i)
+    }
+
+    /// Root `i` if it is the one with `serial` ([`RootTable::get_as`]).
+    pub fn rooted_as(&self, i: u32, serial: u64) -> Option<Value> {
+        self.roots.0.get_as(i, serial)
     }
 
     /// The root table itself, which a host handle keeps to let go of its root without reaching
@@ -2470,7 +2551,7 @@ impl Vm {
                     }
                     Op::TailCall(a, b) => {
                         let func_idx = base!() + a as usize;
-                        let nargs = if b == 0 {
+                        let mut nargs = if b == 0 {
                             self.top - func_idx - 1
                         } else {
                             b as usize - 1
@@ -2480,6 +2561,11 @@ impl Vm {
                         // no back edge and no `Call`.
                         if self.hooked {
                             slow!(self.hook_count(1))?;
+                        }
+                        // 5.1's `OP_TAILCALL` resolves `__call` first, so a callable table's
+                        // Lua `__call` replaces this frame too.
+                        if r!(a).as_func().is_none() {
+                            nargs = slow!(self.tryfunc(func_idx, nargs))?;
                         }
                         // A Lua callee replaces this frame; a native runs and its results
                         // return through the `Return` that follows.
@@ -2494,6 +2580,12 @@ impl Vm {
                                     continue;
                                 }
                             }
+                        }
+                        // `luaD_precall`'s `inc_ci` counts the callee while this frame is still
+                        // there, as C replaces it only after.
+                        if self.frames.len() >= self.ci_limit {
+                            // Saved above; on success the stack is as it was.
+                            self.grow_ci()?;
                         }
                         let b0 = base!();
                         self.close_upvals(b0);

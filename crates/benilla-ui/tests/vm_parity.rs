@@ -529,6 +529,33 @@ b]])"#),
         return S(R("for k in function() end, nil, nil, 42 do end return 7"),
           R("local n = 0 for k in function(s, c) if c ~= 3 then return (c or 0) + 1 end end, nil, nil, 9, 8 do do local y = k n = n + y end end return n"),
           R("local n = 0 for k, v in function(s, c) if c ~= 2 then return (c or 0) + 1, 10 end end, 1, nil, 4 do n = n + k + v end return n"))"#),
+    // ── r2-vm: error handlers as 5.1's `luaG_errormsg` runs them ──
+    ("r2-vm handler_reenters", r#"local n = 0
+        local ok, e = xpcall(function() error("a", 0) end, function(m) n = n + 1 error("b", 0) end)
+        return S(ok, e, n)"#),
+    ("r2-vm handler_raises_once", r#"local n = 0
+        local ok, e = xpcall(function() error("a", 0) end, function(m) n = n + 1 if n == 1 then error("again", 0) end return "H:" .. m end)
+        return S(ok, e, n)"#),
+    ("r2-vm handler_not_function", r#"local h = setmetatable({}, {__call = function(self, m) return "T:" .. m end})
+        local r1 = {xpcall(function() error("a", 0) end, h)}
+        local r2 = {xpcall(function() error("a", 0) end, 42)}
+        local r3 = {xpcall(function() return 1 end, 42)}
+        return S(r1[1], r1[2], r2[1], r2[2], r3[1], r3[2])"#),
+    ("r2-vm handler_runtime_error", r#"local n = 0
+        local ok, e = xpcall(function() local x = nil; return x.y end, function(m) n = n + 1 return "H:" .. m end)
+        return S(ok, e, n)"#),
+    // ── r2-vm: tail calls through `__call`, and the depth they are counted at ──
+    ("r2-vm tailcall_call_tm", r#"local t = setmetatable({}, {__call = function(self, n) if n == 0 then return "done" end return self(n - 1) end})
+        return S(E(function() return t(30000) end), E(function() local u = setmetatable({}, {}) return u(1) end))"#),
+    ("r2-vm tailcall_depth", r#"local n = 0
+        local f
+        local function h() return f() end
+        f = function() n = n + 1 local r = h() return r end
+        local o = {}
+        for i = 1, 3 do n = 0 local ok, e = pcall(f) table.insert(o, n .. ":" .. tostring(e)) end
+        return table.concat(o, " ")"#),
+    // ── r2-vm: the script host's loadstring refuses a binary chunk with mlua's text ──
+    ("r2-vm loadstring_binary", r#"return S(loadstring("\27Lua\81\0", "=bin"), loadstring("\27Lua"))"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.
