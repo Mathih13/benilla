@@ -19,7 +19,9 @@ pub struct Report {
     pub closures: usize,
     /// Functions whose live closures were swapped.
     pub swapped: Vec<String>,
-    /// Functions whose captured variables changed, left on the old code: a full reload's work.
+    /// Functions left on the old code, a full reload's work: their captured variables changed,
+    /// or their key is numbered and the count of functions sharing its name changed, so it may
+    /// name another function now.
     pub reshaped: Vec<String>,
     /// Functions only the new source has; they exist once their definition runs again.
     pub added: Vec<String>,
@@ -71,18 +73,22 @@ impl Vm {
                 seen.entry(key).or_insert(false);
                 continue;
             };
-            // The new function's upvalues, by name, from the closure's existing ones.
-            let remap: Option<Vec<u32>> = new
-                .upval_names
-                .iter()
-                .map(|n| {
-                    proto
-                        .upval_names
-                        .iter()
-                        .position(|o| o == n)
-                        .map(|i| upvals[i])
-                })
-                .collect();
+            // The new function's upvalues, by name, from the closure's existing ones; none when
+            // the key may now name another function.
+            let remap: Option<Vec<u32>> = if new.key_counts != proto.key_counts {
+                None
+            } else {
+                new.upval_names
+                    .iter()
+                    .map(|d| {
+                        proto
+                            .upval_names
+                            .iter()
+                            .position(|o| o == d)
+                            .map(|i| upvals[i])
+                    })
+                    .collect()
+            };
             match remap {
                 Some(ups) => {
                     *shape = crate::heap::Shape::of(new);

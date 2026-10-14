@@ -84,7 +84,7 @@ fn a_function_whose_captures_changed_is_reported_and_left_running() {
     let mut vm = benilla_lua::new_state();
     vm.exec(V1.as_bytes(), NAME).unwrap();
     let report = vm.hot_reload(NAME, V3.as_bytes()).unwrap();
-    assert_eq!(report.reshaped, vec!["MyAddon.OnEvent".to_string()]);
+    assert_eq!(report.reshaped, vec!["MyAddon:OnEvent".to_string()]);
     // The old code still answers; the rest of the file swapped.
     assert_eq!(run(&mut vm, "return Handlers[1]('A')"), "v1:A:1");
     assert_eq!(run(&mut vm, "return MyAddon.Double(5)"), "15");
@@ -171,4 +171,136 @@ fn a_running_frame_keeps_its_replaced_code_alive_through_a_collection() {
     );
     // The next call runs the new code.
     assert_eq!(run(&mut vm, "return F()"), "1");
+}
+
+/// `probe` after running `v1`, after reloading `v2` over it, and on a fresh state running `v2`,
+/// with the reload's report.
+fn three(
+    v1: &str,
+    keep: &str,
+    v2: &str,
+    probe: &str,
+) -> (String, String, String, benilla_lua::reload::Report) {
+    let mut vm = benilla_lua::new_state();
+    vm.exec(v1.as_bytes(), NAME).unwrap();
+    run(&mut vm, keep);
+    let before = run(&mut vm, probe);
+    let report = vm.hot_reload(NAME, v2.as_bytes()).unwrap();
+    let after = run(&mut vm, probe);
+    let mut fresh_vm = benilla_lua::new_state();
+    fresh_vm.exec(v2.as_bytes(), NAME).unwrap();
+    run(&mut fresh_vm, keep);
+    let fresh = run(&mut fresh_vm, probe);
+    (before, after, fresh, report)
+}
+
+#[test]
+fn a_function_added_above_an_assigned_one_leaves_its_key_alone() {
+    let (before, after, fresh, _) = three(
+        "A = function() return 'a' end",
+        "KeepA = A",
+        "C = function() return 'c' end A = function() return 'a2' end",
+        "return KeepA()",
+    );
+    assert_eq!(
+        (before.as_str(), after.as_str(), fresh.as_str()),
+        ("a", "a2", "a2")
+    );
+}
+
+#[test]
+fn swapped_fields_of_a_local_table_keep_their_keys() {
+    let (before, after, fresh, report) = three(
+        "local M = {} Mod = M function M.f() return 'f' end function M.g() return 'g' end",
+        "F, G = Mod.f, Mod.g",
+        "local M = {} Mod = M function M.g() return 'g' end function M.f() return 'f' end",
+        "return F() .. ',' .. G()",
+    );
+    assert_eq!(
+        (before.as_str(), after.as_str(), fresh.as_str()),
+        ("f,g", "f,g", "f,g")
+    );
+    assert_eq!(report.swapped, ["M.f", "M.g"]);
+}
+
+#[test]
+fn a_method_added_above_another_leaves_its_key_alone() {
+    let (before, after, fresh, report) = three(
+        "local M = {} Mod = M function M:f() return 'f' end",
+        "F = Mod.f",
+        "local M = {} Mod = M function M:new() return 'new' end function M:f() return 'f2' end",
+        "return F(Mod)",
+    );
+    assert_eq!(
+        (before.as_str(), after.as_str(), fresh.as_str()),
+        ("f", "f2", "f2")
+    );
+    assert_eq!(report.swapped, ["M:f"]);
+    assert_eq!(report.added, ["M:new"]);
+}
+
+#[test]
+fn a_method_and_a_field_of_one_name_are_two_functions() {
+    let v = "T = {} function T.m() return 'dot' end D = T.m function T:m() return 'colon' end";
+    let (_, after, _, report) = three(v, "", v, "return D() .. ',' .. T.m(T)");
+    assert_eq!(after, "dot,colon");
+    assert_eq!(report.swapped, ["T.m", "T:m"]);
+    assert!(report.reshaped.is_empty(), "{report:#?}");
+}
+
+#[test]
+fn swapped_handler_assignments_keep_their_keys() {
+    let (before, after, fresh, _) = three(
+        "H = {} H.OnShow = function() return 'show' end H.OnHide = function() return 'hide' end",
+        "S, D = H.OnShow, H.OnHide",
+        "H = {} H.OnHide = function() return 'hide' end H.OnShow = function() return 'show' end",
+        "return S() .. ',' .. D()",
+    );
+    assert_eq!(
+        (before.as_str(), after.as_str(), fresh.as_str()),
+        ("show,hide", "show,hide", "show,hide")
+    );
+}
+
+#[test]
+fn an_anonymous_function_added_above_a_nested_one_leaves_it_alone() {
+    let (before, after, fresh, _) = three(
+        "Mk = function() return function() return 'inner1' end end",
+        "Inner = Mk()",
+        "Pre = function() return 'PRE' end Mk = function() return function() return 'inner2' end end",
+        "return Inner()",
+    );
+    assert_eq!(
+        (before.as_str(), after.as_str(), fresh.as_str()),
+        ("inner1", "inner2", "inner2")
+    );
+}
+
+#[test]
+fn table_fields_and_locals_are_named_after_their_target() {
+    let (before, after, fresh, report) = three(
+        "local f = function() return 'f' end T = { a = function() return 'a' end, b = function() return f() end }",
+        "A, B = T.a, T.b",
+        "T = { b = function() return 'b2' end, a = function() return 'a2' end }",
+        "return A() .. ',' .. B()",
+    );
+    assert_eq!(
+        (before.as_str(), after.as_str(), fresh.as_str()),
+        ("a,f", "a2,b2", "a2,b2")
+    );
+    assert_eq!(report.swapped, ["T.a", "T.b"]);
+}
+
+#[test]
+fn numbered_keys_whose_count_changed_stay_on_the_old_code() {
+    let (before, after, _, report) = three(
+        "L = {} table.insert(L, function() return 1 end) table.insert(L, function() return 2 end)",
+        "",
+        "L = {} table.insert(L, function() return 0 end) table.insert(L, function() return 1 end) \
+         table.insert(L, function() return 2 end)",
+        "return L[1]() .. ',' .. L[2]()",
+    );
+    assert_eq!((before.as_str(), after.as_str()), ("1,2", "1,2"));
+    assert_eq!(report.reshaped, ["anon", "anon#2"]);
+    assert!(report.swapped.is_empty(), "{report:#?}");
 }

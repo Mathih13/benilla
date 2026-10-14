@@ -272,9 +272,38 @@ impl FuncState {
             line_defined: self.linedefined,
             locvars: self.locvars,
             key: self.key,
+            key_counts: Box::new([]),
             gc_mark: Default::default(),
         }
     }
+}
+
+/// The name a key's last part was numbered from: `anon` for `Init/anon#2`.
+fn key_base(key: &[u8]) -> &[u8] {
+    let last = key.rsplit(|&c| c == b'/').next().unwrap_or(key);
+    match last.iter().rposition(|&c| c == b'#') {
+        Some(i) if i + 1 < last.len() && last[i + 1..].iter().all(u8::is_ascii_digit) => &last[..i],
+        _ => last,
+    }
+}
+
+/// Fill in each function's [`Proto::key_counts`] once the whole chunk is compiled.
+pub(crate) fn finish_keys(root: &mut Proto) {
+    fn counts(p: &mut Proto, path: &[u32]) {
+        p.key_counts = path.into();
+        let mut same: HashMap<&[u8], u32> = HashMap::new();
+        for q in &p.protos {
+            *same.entry(key_base(&q.key)).or_insert(0) += 1;
+        }
+        let n: Vec<u32> = p.protos.iter().map(|q| same[key_base(&q.key)]).collect();
+        let mut sub = path.to_vec();
+        for (q, n) in p.protos.iter_mut().zip(n) {
+            sub.push(n);
+            counts(Rc::get_mut(q).expect("a fresh prototype"), &sub);
+            sub.pop();
+        }
+    }
+    counts(root, &[]);
 }
 
 /// The jump offset an instruction carries, if it is a jump.

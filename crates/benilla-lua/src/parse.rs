@@ -28,6 +28,9 @@ pub(crate) struct Parser<'a> {
     pub(crate) heap: &'a mut Heap,
     /// 5.1's `L->nCcalls`: the caller's host-call depth, then one per syntax level.
     ccalls: u32,
+    /// The name of the single target the next expression is assigned to, for the key of a
+    /// function or constructor it opens with (`t.x = function`, `local f = function`).
+    name_hint: Option<Vec<u8>>,
 }
 
 /// 5.1's `ConsControl`.
@@ -39,6 +42,8 @@ struct ConsControl {
     nh: u32,
     na: u32,
     tostore: u32,
+    /// The name the table is assigned to, which its `name = function` fields' keys extend.
+    prefix: Option<Vec<u8>>,
 }
 
 /// `luaY_parser`: a chunk compiled into its main function, which is vararg but declares no
@@ -50,12 +55,15 @@ pub(crate) fn parse(src: &[u8], chunkname: &[u8], heap: &mut Heap, ccalls: u32) 
         fs: Vec::new(),
         heap,
         ccalls,
+        name_hint: None,
     };
     p.fs.push(FuncState::new(Rc::from(chunkname), 0, Rc::from(&b""[..])));
     p.chunk()?;
     p.check(Tok::Eof)?;
     let fs = p.close_func()?;
-    Ok(Rc::new(fs.into_proto(p.heap)))
+    let mut root = fs.into_proto(p.heap);
+    crate::compile::finish_keys(&mut root);
+    Ok(Rc::new(root))
 }
 
 fn block_follow(t: Tok) -> bool {
@@ -701,6 +709,13 @@ impl<'a> Parser<'a> {
             }
         }
         let (nexps, mut e) = if self.testnext(Tok::Char(b'='))? {
+            if nvars == 1 {
+                let fs = self.fsr();
+                let name = &fs.locvars[fs.actvar[fs.nactvar as usize] as usize].name;
+                let mut hint = b"local ".to_vec();
+                hint.extend_from_slice(name);
+                self.name_hint = Some(hint);
+            }
             self.explist1()?
         } else {
             (0, Exp::new(Kind::Void))
@@ -711,28 +726,23 @@ impl<'a> Parser<'a> {
     }
 
     /// `funcname`: `NAME {'.' NAME} [':' NAME]`. Answers the target, whether the body takes
-    /// `self`, and the function's name for its key: `a.b.c` from a global, a local's or upvalue's
-    /// own name, or none for a field of a local.
-    fn funcname(&mut self) -> R<(Exp, bool, Option<Vec<u8>>)> {
+    /// `self`, and the function's name for its key, as written: `a.b.c`, `Frame:OnEvent`.
+    fn funcname(&mut self) -> R<(Exp, bool, Vec<u8>)> {
         let (mut v, root) = self.singlevar()?;
-        let mut name = Some(root.to_vec());
-        let global = matches!(v.k, Kind::Global(_));
+        let mut name = root.to_vec();
         let mut needself = false;
         loop {
-            match self.tok() {
-                Tok::Char(b'.') => {}
-                Tok::Char(b':') if !needself => needself = true,
-                _ => break,
-            }
-            let field = self.field(&mut v)?;
-            name = match name {
-                Some(mut n) if global => {
-                    n.push(b'.');
-                    n.extend_from_slice(&field);
-                    Some(n)
+            let sep = match self.tok() {
+                Tok::Char(b'.') => b'.',
+                Tok::Char(b':') if !needself => {
+                    needself = true;
+                    b':'
                 }
-                _ => None,
+                _ => break,
             };
+            let field = self.field(&mut v)?;
+            name.push(sep);
+            name.extend_from_slice(&field);
             if needself {
                 break;
             }
@@ -743,7 +753,7 @@ impl<'a> Parser<'a> {
     fn funcstat(&mut self, line: u32) -> R<()> {
         self.next()?;
         let (v, needself, name) = self.funcname()?;
-        let mut b = self.body(needself, line, name)?;
+        let mut b = self.body(needself, line, Some(name))?;
         self.storevar(&v, &mut b)?;
         self.fixline(line);
         Ok(())
@@ -775,7 +785,7 @@ impl<'a> Parser<'a> {
 
     /// `assignment`, its recursion over the targets as a loop: the stores run from the last
     /// target back to the first.
-    fn assignment(&mut self, first: Exp) -> R<()> {
+    fn assignment(&mut self, first: Exp, name: Option<Vec<u8>>) -> R<()> {
         let mut lhs = vec![first];
         loop {
             let v = lhs.last().unwrap();
@@ -801,6 +811,9 @@ impl<'a> Parser<'a> {
         }
         self.checknext(Tok::Char(b'='))?;
         let nvars = lhs.len();
+        if nvars == 1 {
+            self.name_hint = name;
+        }
         let (nexps, mut e) = self.explist1()?;
         let mut rest = nvars;
         if nexps != nvars {
@@ -822,7 +835,7 @@ impl<'a> Parser<'a> {
     }
 
     fn exprstat(&mut self) -> R<()> {
-        let v = self.primaryexp()?;
+        let (v, name) = self.primaryexp_named(true)?;
         if let Kind::Call(pc) = v.k {
             // A call statement keeps no results.
             if let Op::Call(_, _, c) = &mut self.fs().code[pc] {
@@ -830,7 +843,7 @@ impl<'a> Parser<'a> {
             }
             Ok(())
         } else {
-            self.assignment(v)
+            self.assignment(v, name)
         }
     }
 
@@ -891,16 +904,25 @@ impl<'a> Parser<'a> {
 
     fn recfield(&mut self, cc: &mut ConsControl) -> R<()> {
         let reg = self.fsr().freereg;
+        let mut hint = None;
         let mut key = if self.tok() == Tok::Name {
             // The 1.12 grammar's placement: only a `name = v` field counts toward the hash
             // size hint, as 5.0's `recfield` counted it.
             cc.nh += 1;
-            self.checkname()?
+            let name = self.str_checkname()?;
+            if let Some(p) = &cc.prefix {
+                let mut n = p.clone();
+                n.push(b'.');
+                n.extend_from_slice(&name);
+                hint = Some(n);
+            }
+            Exp::new(Kind::K(self.string_k(&name)?))
         } else {
             self.yindex()?
         };
         self.checknext(Tok::Char(b'='))?;
         let rkkey = self.exp2rk(&mut key)?;
+        self.name_hint = hint;
         let mut val = self.expr()?;
         let rv = self.exp2rk(&mut val)?;
         self.code_settable(cc.t, rkkey, rv)?;
@@ -948,7 +970,7 @@ impl<'a> Parser<'a> {
 
     /// `constructor`, with 5.0's compat-semicolon at the head of each item, as the 1.12 grammar
     /// has it.
-    fn constructor(&mut self) -> R<Exp> {
+    fn constructor(&mut self, prefix: Option<Vec<u8>>) -> R<Exp> {
         let line = self.lx.line;
         let pc = self.code(Op::NewTable(0, 0, 0), 1)?;
         let mut t = Exp::new(Kind::Reloc(pc));
@@ -962,6 +984,7 @@ impl<'a> Parser<'a> {
             nh: 0,
             na: 0,
             tostore: 0,
+            prefix,
         };
         self.checknext(Tok::Char(b'{'))?;
         loop {
@@ -1028,7 +1051,7 @@ impl<'a> Parser<'a> {
                 self.check_match(Tok::Char(b')'), Tok::Char(b'('), line)?;
                 args
             }
-            Tok::Char(b'{') => self.constructor()?,
+            Tok::Char(b'{') => self.constructor(None)?,
             Tok::String => {
                 let k = self.string_k(&self.lx.cur.bytes.clone())?;
                 self.next()?;
@@ -1070,11 +1093,26 @@ impl<'a> Parser<'a> {
 
     /// `primaryexp`: a prefix and its suffixes, read in a loop.
     fn primaryexp(&mut self) -> R<Exp> {
-        let mut v = self.prefixexp()?;
+        Ok(self.primaryexp_named(false)?.0)
+    }
+
+    /// [`Self::primaryexp`], and with `want` its name when it is a name and fields: `t.a.b`.
+    fn primaryexp_named(&mut self, want: bool) -> R<(Exp, Option<Vec<u8>>)> {
+        let (mut v, mut name) = if want && self.tok() == Tok::Name {
+            let (v, n) = self.singlevar()?;
+            (v, Some(n.to_vec()))
+        } else {
+            (self.prefixexp()?, None)
+        };
         loop {
             match self.tok() {
                 Tok::Char(b'.') => {
-                    self.field(&mut v)?;
+                    let field = self.field(&mut v)?;
+                    if let Some(n) = &mut name {
+                        n.push(b'.');
+                        n.extend_from_slice(&field);
+                    }
+                    continue;
                 }
                 Tok::Char(b'[') => {
                     self.exp2anyreg(&mut v)?;
@@ -1091,13 +1129,16 @@ impl<'a> Parser<'a> {
                     self.exp2nextreg(&mut v)?;
                     self.funcargs(&mut v)?;
                 }
-                _ => return Ok(v),
+                _ => return Ok((v, name)),
             }
+            name = None;
         }
     }
 
     /// `simpleexp`: the 1.12 grammar has no `...` expression.
     fn simpleexp(&mut self) -> R<Exp> {
+        // Only the expression's first operand is named after the target.
+        let hint = self.name_hint.take();
         let v = match self.tok() {
             Tok::Number => Exp::new(Kind::KNum(self.lx.cur.num)),
             Tok::String => {
@@ -1107,11 +1148,11 @@ impl<'a> Parser<'a> {
             Tok::Nil => Exp::new(Kind::Nil),
             Tok::True => Exp::new(Kind::True),
             Tok::False => Exp::new(Kind::False),
-            Tok::Char(b'{') => return self.constructor(),
+            Tok::Char(b'{') => return self.constructor(hint),
             Tok::Function => {
                 self.next()?;
                 let line = self.lx.line;
-                return self.body(false, line, None);
+                return self.body(false, line, hint);
             }
             _ => return self.primaryexp(),
         };

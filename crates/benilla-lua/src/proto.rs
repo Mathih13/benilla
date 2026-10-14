@@ -177,8 +177,14 @@ pub struct Proto {
     pub line_defined: u32,
     pub locvars: Vec<LocVar>,
     /// The function's identity within its chunk, stable across edits that leave its name and
-    /// nesting alone: `Frame:OnEvent`, `local helper`, `Init/anon#2`. Hot reload matches on it.
+    /// nesting alone. A function is named as written (`Frame:OnEvent`, `Frame.Init`,
+    /// `local helper`), or after the single target it is assigned to (`H.OnShow = function`,
+    /// `local f = function`, a constructor's `name = function`), or `anon`; a name used twice
+    /// is numbered (`Init/anon#2`). Hot reload matches on it.
     pub key: Bytes,
+    /// For each part of `key`, how many siblings share its name: a numbered key matches the
+    /// same function across an edit only while these counts hold.
+    pub key_counts: Box<[u32]>,
     /// `source`'s id in the heap's chunk list, for profiles and memory censuses.
     pub source_id: u32,
     /// The collection that last marked this prototype's constants (`Heap::collect`).
