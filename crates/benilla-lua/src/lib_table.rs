@@ -1,7 +1,9 @@
-//! The table library: `ltablib.c` as the script host runs it, `n`-based through
-//! `luaL_getn`/`luaL_setn`, and its own quicksort, so an inconsistent comparator does what it
-//! does in the client.
-
+//! The table library. In the script host's state (`native`), `getn` and `sort` are 5.1.5's:
+//! they read `lua_objlen` ([`crate::table::Table::length`]) as the C build does, and the host's
+//! own layer wraps them. [`open`] gives the 1.12 state 5.0's `n`-based `getn`. The other
+//! functions are 5.0's, `n`-based through `luaL_getn`/`luaL_setn`, and the script host replaces
+//! each of them. `sort` is `ltablib.c`'s quicksort step for step, so an inconsistent comparator
+//! does what it does there.
 use crate::api::R;
 use crate::lib_base::{getn, setn};
 use crate::value::{TableRef, Value, V};
@@ -13,7 +15,7 @@ pub(crate) fn native(name: &str) -> Option<crate::heap::NativeFn> {
         "concat" => concat,
         "foreach" => foreach,
         "foreachi" => foreachi,
-        "getn" => getn_,
+        "getn" => getn_51,
         "setn" => setn_,
         "sort" => sort,
         "insert" => insert,
@@ -45,6 +47,13 @@ pub fn open(vm: &mut Vm) {
 fn getn_(vm: &mut Vm, nargs: usize) -> R<usize> {
     let t = vm.check_table(nargs, 1)?;
     let n = getn(vm, t);
+    Ok(vm.ret1(Value::Num(n as f64)))
+}
+
+/// 5.1's `getn`: `luaL_getn`, which is `lua_objlen` without `LUA_COMPAT_GETN`.
+fn getn_51(vm: &mut Vm, nargs: usize) -> R<usize> {
+    let t = vm.check_table(nargs, 1)?;
+    let n = vm.heap.table(t).length();
     Ok(vm.ret1(Value::Num(n as f64)))
 }
 
@@ -195,7 +204,7 @@ fn comp(vm: &mut Vm, f: Value, a: Value, b: Value) -> R<bool> {
     }
 }
 
-/// 5.0's `auxsort`, step for step, so a comparator's call order is the client's.
+/// 5.1's `auxsort`, step for step, so a comparator's call order is the client's.
 fn auxsort(vm: &mut Vm, t: TableRef, f: Value, mut l: i64, mut u: i64) -> R<()> {
     while l < u {
         let al = rawgeti(vm, t, l);
@@ -277,9 +286,10 @@ fn auxsort(vm: &mut Vm, t: TableRef, f: Value, mut l: i64, mut u: i64) -> R<()> 
     Ok(())
 }
 
+/// 5.1's `sort`: `1..lua_objlen(t)`, whatever `t.n` says.
 fn sort(vm: &mut Vm, nargs: usize) -> R<usize> {
     let t = vm.check_table(nargs, 1)?;
-    let n = getn(vm, t) as i64;
+    let n = vm.heap.table(t).length() as i64;
     let f = vm.arg(nargs, 1);
     if !f.is_nil() {
         vm.check_function(nargs, 2)?;

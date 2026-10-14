@@ -389,6 +389,14 @@ b]])"#),
     ("fix-libs hex_float", r#"local f = function(x) return string.format("%.17g", x or -1) end
         return S(f(tonumber("0x1p-1074")), f(tonumber("0x1000000000000p-1070")), f(tonumber("0x1p1023")), f(tonumber("0x1p1024")), f(tonumber("0x.1p-1070")), f(tonumber("0x1p-1075")), f(tonumber("0x3p-1075")), f(tonumber("0x1.8p-1074")), f(tonumber("0x1fffffffffffffp-1126")), f(tonumber("0x123456789abcdef0123p-1100")), f(tonumber("0x1p-1080")), f("0x1p-1074" + 0))"#),
     ("fix-libs str_nul", r#"return S(tonumber("1\0"), tonumber("12\0 "), tonumber("1\0x"), E(function() return "1\0" + 1 end), E(function() return "0x10\0" + 0 end), tonumber("\0"), tonumber(" 5\0abc"), tonumber("ff\0", 16), tonumber("0x1\0"), tonumber("\0 1"), tonumber("1e\0"), tonumber("1 \0 x"))"#),
+    ("fix-libs sort_objlen", r#"local function f(...) table.sort(arg) return arg[1], arg[2], arg[3] end
+        local t = {3, 1, 2, n = 5} local ok = pcall(table.sort, t)
+        local a = {3, 1, nil, 2} local oka = pcall(table.sort, a)
+        local b = {5, 4, 3, 2, 1, n = 2} table.sort(b)
+        local c = {} c[1] = 3 c[2] = 1 c[4] = 0 local okc = pcall(sort, c)
+        local d = {} table.setn(d, 2) d[1] = 9 d[2] = 8 d[3] = 7 sort(d)
+        local e = {4, 3, 2, 1} e[3] = nil local oke = pcall(table.sort, e)
+        return S(E(f, 3, 1, nil), ok, t[1], t[2], t[3], oka, a[1], a[2], a[3], a[4]) .. "|" .. S(b[1], b[2], b[3], b[4], b[5], okc, c[1], c[2], c[4], d[1], d[2], d[3], oke, e[1], e[2], e[4])"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

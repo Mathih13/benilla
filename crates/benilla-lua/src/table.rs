@@ -564,6 +564,53 @@ impl Table {
         n
     }
 
+    /// 5.1's `luaH_getn`, the `lua_objlen` 5.1's table library reads: a border found by binary
+    /// search in the array part, or past it by `unbound_search`. On a table with holes it need
+    /// not be the first one.
+    pub fn length(&self) -> usize {
+        let mut j = self.array.len();
+        if j > 0 && self.array[j - 1].is_nil() {
+            let mut i = 0;
+            while j - i > 1 {
+                let m = (i + j) / 2;
+                if self.array[m - 1].is_nil() {
+                    j = m;
+                } else {
+                    i = m;
+                }
+            }
+            return i;
+        }
+        if self.dummy {
+            return j;
+        }
+        // `unbound_search`.
+        let get = |k: usize| self.get(Value::Num(k as f64));
+        let mut i = j;
+        let mut j = j + 1;
+        while !get(j).is_nil() {
+            i = j;
+            j *= 2;
+            if j > i32::MAX as usize {
+                // A pathological table: a linear count.
+                let mut i = 1;
+                while !get(i).is_nil() {
+                    i += 1;
+                }
+                return i - 1;
+            }
+        }
+        while j - i > 1 {
+            let m = (i + j) / 2;
+            if get(m).is_nil() {
+                j = m;
+            } else {
+                i = m;
+            }
+        }
+        i
+    }
+
     /// A byte estimate for the collector's accounting.
     pub fn bytes(&self) -> usize {
         64 + self.array.len() * 16 + self.node.len() * 40
