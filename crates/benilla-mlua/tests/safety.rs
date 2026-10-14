@@ -156,3 +156,46 @@ fn another_states_value_is_refused() {
         Value::Nil
     );
 }
+
+/// A freed host closure's captures drop after the collection, as host code on the VM: a
+/// destructor that uses the state reaches it soundly, and runs.
+#[test]
+fn a_destructor_run_by_the_collector_can_use_the_state() {
+    struct D(Lua, Rc<Cell<bool>>);
+    impl Drop for D {
+        fn drop(&mut self) {
+            let f = self.0.create_function(|_, ()| Ok(5)).unwrap();
+            assert_eq!(f.call::<i64>(()).unwrap(), 5);
+            self.1.set(true);
+        }
+    }
+    let lua = Lua::new();
+    let ran = Rc::new(Cell::new(false));
+    let d = D(lua.clone(), ran.clone());
+    let f = lua
+        .create_function(move |_, ()| {
+            let _ = &d;
+            Ok(())
+        })
+        .unwrap();
+    drop(f);
+    lua.gc_collect().unwrap();
+    assert!(ran.get(), "the destructor ran");
+    // And from a collection the interpreter starts itself.
+    let ran = Rc::new(Cell::new(false));
+    let d = D(lua.clone(), ran.clone());
+    let f = lua
+        .create_function(move |_, ()| {
+            let _ = &d;
+            Ok(())
+        })
+        .unwrap();
+    drop(f);
+    lua.load("for i = 1, 20000 do local t = {} end")
+        .exec()
+        .unwrap();
+    assert!(
+        ran.get(),
+        "the destructor ran inside the interpreter's collection"
+    );
+}

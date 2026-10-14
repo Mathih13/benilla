@@ -15,7 +15,7 @@
 
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
-use std::cell::{Cell, Ref, RefCell, RefMut, UnsafeCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
@@ -50,8 +50,10 @@ pub mod prelude {
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 pub(crate) struct Inner {
-    /// The VM, owned here and reached through `cur`.
-    _owned: UnsafeCell<Box<Vm>>,
+    /// The VM, owned here (`Box::into_raw`, freed in `drop`) and reached through `cur`. A raw
+    /// pointer, not a `Box`: a `Box` asserts unique access, which every reference `cur` makes
+    /// would contradict.
+    owned: *mut Vm,
     /// The VM every access goes through: the owned one, or the `&mut Vm` a running callback was
     /// handed.
     cur: Cell<*mut Vm>,
@@ -59,6 +61,14 @@ pub(crate) struct Inner {
     /// Shared by a state and its forks: a host closure the fork copied still holds handles made
     /// on the original, and while a callback of the family runs they resolve through its VM.
     family: u64,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // SAFETY: `owned` came from `Box::into_raw` in `Lua::over` and is freed only here; no
+        // reference to the VM outlives the last `Lua`, which is going.
+        drop(unsafe { Box::from_raw(self.owned) });
+    }
 }
 
 thread_local! {
@@ -187,16 +197,27 @@ impl Lua {
     }
 
     /// A state over `vm`, which learns its host here.
-    fn over(mut vm: Box<Vm>, family: u64) -> Lua {
-        let ptr: *mut Vm = &mut *vm;
+    fn over(vm: Box<Vm>, family: u64) -> Lua {
+        let ptr: *mut Vm = Box::into_raw(vm);
         let lua = Lua(Rc::new(Inner {
-            _owned: UnsafeCell::new(vm),
+            owned: ptr,
             cur: Cell::new(ptr),
             app: RefCell::new(HashMap::new()),
             family,
         }));
         let host: std::rc::Weak<dyn Any> = Rc::downgrade(&lua.0) as std::rc::Weak<dyn Any>;
-        lua.vm().host = Some(host);
+        // Host code the VM runs from inside (a freed closure's destructors) runs as a callback
+        // does, on the `&mut Vm` the VM hands down.
+        let reentry: benilla_lua::vm::Reentry = Rc::new(|vm: &mut Vm, f: &mut dyn FnMut()| {
+            let inner = vm.host.as_ref().and_then(std::rc::Weak::upgrade);
+            match inner.and_then(|i| i.downcast::<Inner>().ok()) {
+                Some(inner) => in_callback(&Lua(inner), vm, f),
+                None => f(),
+            }
+        });
+        let vm = lua.vm();
+        vm.host = Some(host);
+        vm.reentry = Some(reentry);
         lua
     }
 
@@ -239,16 +260,23 @@ impl Lua {
         unsafe { &mut *vm }
     }
 
-    /// The interpreter itself, for code that works below this API.
+    /// The interpreter itself, for code that works below this API. Inside a callback it is the
+    /// VM the callback runs on (a fork's, for a fork).
     ///
-    /// The contract, which the type cannot state: the reference is a borrow of the VM that ends
-    /// before the caller does anything else with this state. Do not hold it across any call that
-    /// can run Lua (a `call`, `exec`, `eval`, `set` or `get` that may reach a metamethod) or that
-    /// touches this API (any method of `Lua`, `Table`, `Function` or `String`), and do not take
-    /// a second one while it lives: each of those reaches the same VM through another reference.
-    /// Inside a callback it is the VM the callback runs on (a fork's, for a fork).
+    /// # Safety
+    ///
+    /// The reference is an exclusive borrow of the VM, which every other access to this state
+    /// also takes. While it lives, the caller must not:
+    /// - call `raw_vm` again, on this `Lua` or any clone of it or of a fork of it;
+    /// - call any method of `Lua`, `Table`, `Function`, `String` or `Value` of this state's
+    ///   family, nor drop a `Lua` of it (each reaches the VM another way);
+    /// - call anything that runs Lua (`Vm::call_value`, `pcall_value`, `exec`, `hot_reload`,
+    ///   an `index` that reaches a metamethod), unless through this reference itself, which
+    ///   hands itself down to the callbacks it runs.
+    ///
+    /// Use it for one statement or a block of plain `Vm` and `Heap` calls, and let it go.
     #[allow(clippy::mut_from_ref)]
-    pub fn raw_vm(&self) -> &mut Vm {
+    pub unsafe fn raw_vm(&self) -> &mut Vm {
         self.vm()
     }
 
@@ -1261,7 +1289,7 @@ impl Function {
         let lua = &self.0.lua();
         let f = self.0.get().as_func()?;
         let env = match lua.vm().heap.func(f) {
-            benilla_lua::heap::FuncObj::Lua { env, .. } => *env,
+            benilla_lua::heap::FuncObj::Lua(l) => l.env(),
             benilla_lua::heap::FuncObj::Native { env, .. } => *env,
         };
         Some(Table(lua.make_ref(benilla_lua::Value::Table(env))))
@@ -1279,7 +1307,8 @@ impl Function {
         let Some(f) = self.0.get().as_func() else {
             return out;
         };
-        if let benilla_lua::heap::FuncObj::Lua { proto, .. } = lua.vm().heap.func(f) {
+        if let benilla_lua::heap::FuncObj::Lua(l) = lua.vm().heap.func(f) {
+            let proto = l.proto();
             let short = benilla_lua::chunkid_n(&proto.source, 60);
             out.what = if proto.line_defined == 0 {
                 "main"
@@ -1301,13 +1330,8 @@ impl Function {
         let Some(t) = lua.unref(&env.0).as_table() else {
             return Ok(false);
         };
-        match lua.vm().heap.func_mut(f) {
-            benilla_lua::heap::FuncObj::Lua { env, .. } => {
-                *env = t;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
+        // `setfenv`: a running frame rereads its cached environment.
+        Ok(lua.vm().set_function_env(f, t))
     }
 }
 

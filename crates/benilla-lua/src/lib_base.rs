@@ -148,7 +148,7 @@ fn getfenv(vm: &mut Vm, nargs: usize) -> R<usize> {
     let f = getfunc(vm, nargs, true)?;
     let env = match f.unpack() {
         V::Func(f) => match vm.heap.func(f) {
-            FuncObj::Lua { env, .. } => *env,
+            FuncObj::Lua(l) => l.env(),
             FuncObj::Native { .. } => vm.globals,
         },
         _ => vm.globals,
@@ -167,15 +167,11 @@ fn setfenv(vm: &mut Vm, nargs: usize) -> R<usize> {
         return Ok(0);
     }
     match f.unpack() {
-        V::Func(fr) => match vm.heap.func_mut(fr) {
-            FuncObj::Lua { env, .. } => {
-                *env = t;
-                vm.fenv_gen = vm.fenv_gen.wrapping_add(1);
+        V::Func(fr) => {
+            if !vm.set_function_env(fr, t) {
+                return Err(vm.error_at(1, "`setfenv' cannot change environment of given object"));
             }
-            FuncObj::Native { .. } => {
-                return Err(vm.error_at(1, "`setfenv' cannot change environment of given object"))
-            }
-        },
+        }
         _ => unreachable!("getfunc answers a function"),
     }
     Ok(vm.ret1(f))

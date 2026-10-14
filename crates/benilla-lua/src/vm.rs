@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use crate::heap::{FuncObj, Heap, NativeFn, UpvalObj, UserObj};
+use crate::heap::{FuncObj, Heap, LuaFunc, NativeFn, UpvalObj, UserObj};
 use crate::number::{fmt_g14, str2d};
 use crate::proto::{Arith, Cmp, Op, Proto, Reg, Rk, RK_CONST};
 use crate::table::KeyError;
@@ -118,8 +118,10 @@ pub struct Names {
 #[derive(Clone)]
 pub struct Vm {
     pub heap: Heap,
-    pub stack: Vec<Value>,
-    pub top: usize,
+    /// The value stack. Crate-internal: frames address it through raw pointers, so only the VM
+    /// changes its length; the host reads and writes slots through `stack` and `stack_mut`.
+    pub(crate) stack: Vec<Value>,
+    pub(crate) top: usize,
     frames: Vec<Frame>,
     /// Open upvalues, by stack slot, ascending.
     open: Vec<(usize, u32)>,
@@ -170,7 +172,13 @@ pub struct Vm {
     /// instead of capturing it, so a cloned VM's closures reach the clone's host. Weak, so the
     /// host owning this VM makes no cycle.
     pub host: Option<std::rc::Weak<dyn std::any::Any>>,
+    /// How the host runs its own code against this VM from inside it (`Vm::as_host`): it makes
+    /// the `&mut Vm` it is handed the one its API reaches, as for a callback.
+    pub reentry: Option<Reentry>,
 }
+
+/// The host's way in: run the closure with the `&mut Vm` as the VM in effect.
+pub type Reentry = Rc<dyn Fn(&mut Vm, &mut dyn FnMut())>;
 
 /// Values a host holds outside the VM, each with a count of holders; mlua's registry
 /// references. Counted through `&self`, so a holder can let go while the VM is borrowed.
@@ -375,6 +383,7 @@ impl Vm {
             in_hook: false,
             profile: None,
             host: None,
+            reentry: None,
         };
         vm.heap.threshold = 2 * vm.heap.bytes.max(32 * 1024);
         vm
@@ -395,6 +404,21 @@ impl Vm {
                 self.bufs.push(b);
             }
         }
+    }
+
+    /// The value stack, up to its allocated length.
+    pub fn stack(&self) -> &[Value] {
+        &self.stack
+    }
+
+    /// The value stack's slots, to write values into (not to resize).
+    pub fn stack_mut(&mut self) -> &mut [Value] {
+        &mut self.stack
+    }
+
+    /// The first free stack slot.
+    pub fn top(&self) -> usize {
+        self.top
     }
 
     pub fn str(&mut self, s: &[u8]) -> Value {
@@ -483,13 +507,11 @@ impl Vm {
             return Err(crate::SyntaxError(b"not enough memory".to_vec()));
         }
         let env = self.globals;
-        let shape = crate::heap::Shape::of(&proto);
-        Ok(Value::Func(self.heap.new_func(FuncObj::Lua {
+        Ok(Value::Func(self.heap.new_func(FuncObj::Lua(LuaFunc::new(
             proto,
-            upvals: Box::new([]),
+            Box::new([]),
             env,
-            shape,
-        })))
+        )))))
     }
 
     /// Load and run a chunk protected, answering its results or its error value.
@@ -1191,7 +1213,12 @@ impl Vm {
         if self.c_depth == 1 {
             self.stack_base = here;
         }
-        let used = self.stack_base.abs_diff(here);
+        // Miri gives each local its own allocation, at no stack address: no measure there.
+        let used = if cfg!(miri) {
+            0
+        } else {
+            self.stack_base.abs_diff(here)
+        };
         if self.c_depth >= MAXCCALLS || used > MAX_RUST_STACK {
             // 5.1.5's `luaD_call`: the error at the limit, raised at the deeper level so its
             // handler has room; a handler's calls past the margin raise without a handler.
@@ -1286,9 +1313,9 @@ impl Vm {
             self.grow_ci()?;
         }
         match self.heap.func(fref) {
-            FuncObj::Lua {
+            FuncObj::Lua(LuaFunc {
                 proto, upvals, env, ..
-            } => {
+            }) => {
                 let pp = Rc::as_ptr(proto);
                 let (fup, fenv): (*const [u32], TableRef) = (&**upvals, *env);
                 // SAFETY: the closure being called holds this code, and the closure sits in the
@@ -1467,7 +1494,40 @@ impl Vm {
     pub fn current_env(&self) -> TableRef {
         let f = self.frames.last().unwrap().func;
         match self.heap.func(f) {
-            FuncObj::Lua { env, .. } | FuncObj::Native { env, .. } => *env,
+            FuncObj::Lua(LuaFunc { env, .. }) | FuncObj::Native { env, .. } => *env,
+        }
+    }
+
+    /// `setfenv` of a Lua function: its environment becomes `env`, and every running frame
+    /// rereads its cached one. False for a native, whose environment does not change.
+    pub fn set_function_env(&mut self, f: FuncRef, env: TableRef) -> bool {
+        match self.heap.func_mut(f) {
+            FuncObj::Lua(l) => {
+                l.env = env;
+                self.fenv_gen = self.fenv_gen.wrapping_add(1);
+                true
+            }
+            FuncObj::Native { .. } => false,
+        }
+    }
+
+    /// The value of upvalue `u` (a handle from `LuaFunc::upvals`): its stack slot's while open.
+    pub fn read_upvalue(&self, u: u32) -> Value {
+        match self.heap.upval(u) {
+            UpvalObj::Open(i) => self.stack.get(i as usize).copied().unwrap_or(Value::Nil),
+            UpvalObj::Closed(v) => v,
+        }
+    }
+
+    /// Set upvalue `u`, as `SETUPVAL` does: its stack slot while open, else the upvalue.
+    pub fn write_upvalue(&mut self, u: u32, v: Value) {
+        match self.heap.upval(u) {
+            UpvalObj::Open(i) => {
+                if let Some(slot) = self.stack.get_mut(i as usize) {
+                    *slot = v;
+                }
+            }
+            UpvalObj::Closed(_) => *self.heap.upval_mut(u) = UpvalObj::Closed(v),
         }
     }
 
@@ -1763,6 +1823,27 @@ impl Vm {
                 self.set_ci_size(self.ci_size / 2);
             }
         }
+        // The host closures it freed drop last, with no arena borrowed, as host code: their
+        // captures' destructors may use the state.
+        if !self.heap.freed_hosts.is_empty() {
+            let freed = std::mem::take(&mut self.heap.freed_hosts);
+            self.as_host(move || drop(freed));
+        }
+    }
+
+    /// Run `f`, host code that may reach this VM through its host (a destructor that calls the
+    /// host's API), through `reentry` when the host set one, as a callback runs.
+    pub fn as_host(&mut self, f: impl FnOnce()) {
+        let mut f = Some(f);
+        let mut once = || {
+            if let Some(f) = f.take() {
+                f()
+            }
+        };
+        match self.reentry.clone() {
+            Some(r) => r(self, &mut once),
+            None => once(),
+        }
     }
 
     // ── the interpreter ──────────────────────────────────────────────────────────────────────
@@ -1895,7 +1976,7 @@ impl Vm {
                     if f.env_gen != fenv_gen {
                         f.env_gen = self.fenv_gen;
                         f.env = match self.heap.func(f.func) {
-                            FuncObj::Lua { env, .. } => *env,
+                            FuncObj::Lua(LuaFunc { env, .. }) => *env,
                             _ => unreachable!(),
                         };
                     }
@@ -2326,12 +2407,12 @@ impl Vm {
                         // A Lua function without `...`: the frame is pushed here, as C Lua's
                         // `luaD_precall` does for it, without the general path.
                         if let Some(f) = r!(a).as_func() {
-                            if let FuncObj::Lua {
+                            if let FuncObj::Lua(LuaFunc {
                                 proto: p,
                                 upvals: fup,
                                 env: fenv,
                                 shape,
-                            } = self.heap.func(f)
+                            }) = self.heap.func(f)
                             {
                                 // `fi + 1` frames are live: the depth without reading the
                                 // frame list.
@@ -2403,7 +2484,7 @@ impl Vm {
                         // A Lua callee replaces this frame; a native runs and its results
                         // return through the `Return` that follows.
                         let is_lua = matches!((r!(a)).unpack(),
-                            V::Func(f) if matches!(self.heap.func(f), FuncObj::Lua { .. })
+                            V::Func(f) if matches!(self.heap.func(f), FuncObj::Lua(_))
                         );
                         if !is_lua {
                             match self.precall(func_idx, nargs, -1)? {
@@ -2608,13 +2689,11 @@ impl Vm {
                                 upval!(idx)
                             });
                         }
-                        let shape = crate::heap::Shape::of(&p);
-                        let f = self.heap.new_func(FuncObj::Lua {
-                            proto: p,
-                            upvals: ups.into_boxed_slice(),
+                        let f = self.heap.new_func(FuncObj::Lua(LuaFunc::new(
+                            p,
+                            ups.into_boxed_slice(),
                             env,
-                            shape,
-                        });
+                        )));
                         r!(a) = Value::Func(f);
                         save!();
                         self.top = base!() + maxstack!();

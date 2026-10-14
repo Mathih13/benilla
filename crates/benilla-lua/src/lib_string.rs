@@ -176,7 +176,7 @@ fn dump(vm: &mut Vm, nargs: usize) -> R<usize> {
         unreachable!("checked a function")
     };
     let source = match vm.heap.func(f) {
-        crate::heap::FuncObj::Lua { proto, .. } => proto.source.clone(),
+        crate::heap::FuncObj::Lua(l) => l.proto().source.clone(),
         crate::heap::FuncObj::Native { .. } => {
             return Err(vm.error_at(1, "unable to dump given function"))
         }

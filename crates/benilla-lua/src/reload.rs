@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::Bytes;
-use crate::heap::FuncObj;
+use crate::heap::{FuncObj, LuaFunc};
 use crate::proto::Proto;
 use crate::vm::Vm;
 use crate::SyntaxError;
@@ -58,12 +58,12 @@ impl Vm {
         // The keys the old source had, from what its live closures carry.
         let mut old_keys: Vec<Rc<[Bytes]>> = Vec::new();
         for f in self.heap.funcs_mut() {
-            let FuncObj::Lua {
+            let FuncObj::Lua(LuaFunc {
                 proto,
                 upvals,
                 shape,
                 ..
-            } = f
+            }) = f
             else {
                 continue;
             };

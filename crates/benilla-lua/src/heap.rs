@@ -81,23 +81,24 @@ fn strt_home(hash: u32, mask: usize) -> usize {
 }
 
 /// What a call needs of a Lua function's prototype, copied into the closure so a call
-/// reads it without following the prototype pointer.
+/// reads it without following the prototype pointer. Made only from the prototype it sits
+/// beside (`LuaFunc`), so its pointers are always that prototype's.
 #[derive(Clone, Copy, Debug)]
-pub struct Shape {
+pub(crate) struct Shape {
     /// The chunk the function was compiled from (`Heap::sources`).
-    pub source: u32,
-    pub nparams: u8,
-    pub vararg: bool,
-    pub maxstack: u16,
+    pub(crate) source: u32,
+    pub(crate) nparams: u8,
+    pub(crate) vararg: bool,
+    pub(crate) maxstack: u16,
     /// The first instruction, so a call starts its frame without reaching the prototype.
     /// Valid as long as the prototype, which the closure holds.
-    pub code: *const crate::proto::Op,
+    pub(crate) code: *const crate::proto::Op,
     /// The constant table, for the same reason.
-    pub consts: *const Value,
+    pub(crate) consts: *const Value,
 }
 
 impl Shape {
-    pub fn of(p: &Proto) -> Shape {
+    pub(crate) fn of(p: &Proto) -> Shape {
         Shape {
             source: p.source_id,
             nparams: p.nparams,
@@ -109,15 +110,97 @@ impl Shape {
     }
 }
 
+/// A Lua closure: its code, its upvalues and its environment. The interpreter runs its code
+/// through raw pointers (`Shape`, and a running frame's copies), so its parts are fixed by the
+/// VM: the host reads them, and can copy a whole closure, but cannot build one or change one.
+///
+/// What the host can do:
+///
+/// ```
+/// use benilla_lua::heap::FuncObj;
+/// let mut vm = benilla_lua::new_state();
+/// vm.exec(b"local n = 1 function F() n = n + 1 return n end", b"=t").unwrap();
+/// let f = vm.get_global("F").as_func().unwrap();
+/// let FuncObj::Lua(l) = vm.heap.func(f).clone() else { unreachable!() };
+/// assert_eq!(&*l.proto().upval_names[0], b"n");
+/// assert_eq!(vm.read_upvalue(l.upvals()[0]), benilla_lua::Value::Num(1.0));
+/// vm.write_upvalue(l.upvals()[0], benilla_lua::Value::Num(41.0));
+/// let env = vm.heap.new_table(0, 0);
+/// assert!(vm.set_function_env(f, vm.globals));
+/// let copy = vm.heap.new_func(FuncObj::Lua(l));
+/// assert_eq!(vm.call_value(benilla_lua::Value::Func(copy), &[], 1).unwrap()[0],
+///            benilla_lua::Value::Num(42.0));
+/// # let _ = env;
+/// ```
+///
+/// What it cannot, as each would free or misdirect code a frame is running:
+///
+/// ```compile_fail
+/// let mut vm = benilla_lua::new_state();
+/// let f = vm.get_global("print").as_func().unwrap();
+/// let g = vm.heap.func(f).clone();
+/// *vm.heap.func_mut(f) = g;
+/// ```
+///
+/// ```compile_fail
+/// use benilla_lua::heap::{FuncObj, LuaFunc};
+/// let mut vm = benilla_lua::new_state();
+/// vm.exec(b"function F() end", b"=t").unwrap();
+/// let f = vm.get_global("F").as_func().unwrap();
+/// let FuncObj::Lua(l) = vm.heap.func(f).clone() else { unreachable!() };
+/// let forged = LuaFunc { proto: l.proto().clone(), upvals: Box::new([7]), ..l };
+/// ```
+///
+/// ```compile_fail
+/// let mut vm = benilla_lua::new_state();
+/// vm.stack.truncate(0);
+/// ```
+///
+/// ```compile_fail
+/// let mut vm = benilla_lua::new_state();
+/// *vm.heap.upval_mut(0) = benilla_lua::heap::UpvalObj::Open(u32::MAX);
+/// ```
+#[derive(Clone)]
+pub struct LuaFunc {
+    pub(crate) proto: Rc<Proto>,
+    /// One upvalue per entry of `proto.upvals`.
+    pub(crate) upvals: Box<[u32]>,
+    pub(crate) env: TableRef,
+    /// The prototype's call shape; replaced with it on a hot reload.
+    pub(crate) shape: Shape,
+}
+
+impl LuaFunc {
+    pub(crate) fn new(proto: Rc<Proto>, upvals: Box<[u32]>, env: TableRef) -> LuaFunc {
+        debug_assert_eq!(upvals.len(), proto.upvals.len());
+        let shape = Shape::of(&proto);
+        LuaFunc {
+            proto,
+            upvals,
+            env,
+            shape,
+        }
+    }
+
+    /// The code.
+    pub fn proto(&self) -> &Rc<Proto> {
+        &self.proto
+    }
+
+    /// The upvalues, as handles for `Vm::read_upvalue` and `Vm::write_upvalue`, in `proto().upvals`
+    /// order.
+    pub fn upvals(&self) -> &[u32] {
+        &self.upvals
+    }
+
+    pub fn env(&self) -> TableRef {
+        self.env
+    }
+}
+
 #[derive(Clone)]
 pub enum FuncObj {
-    Lua {
-        proto: Rc<Proto>,
-        upvals: Box<[u32]>,
-        env: TableRef,
-        /// The prototype's call shape; replaced with it on a hot reload.
-        shape: Shape,
-    },
+    Lua(LuaFunc),
     Native {
         f: NativeFn,
         /// A host closure, called in `f`'s place when present.
@@ -358,6 +441,8 @@ pub struct Heap {
     str_id_limit: u32,
     /// Past this many ids, with none free, a collection is asked for before ids run out.
     str_gc_at: u32,
+    /// Host closures the last collection freed, not yet dropped (`Vm::full_gc`).
+    pub(crate) freed_hosts: Vec<FuncObj>,
 }
 
 /// [`Heap::sources`]' bookkeeping.
@@ -401,6 +486,7 @@ impl Default for Heap {
             oom_str: StrRef { id: 0, hash: 0 },
             str_id_limit: STR_ID_MASK,
             str_gc_at: STR_ID_MASK / 2,
+            freed_hosts: Vec::new(),
         };
         h.oom_str = h.intern(b"not enough memory");
         h
@@ -630,7 +716,7 @@ impl Heap {
             c.bytes += t.bytes();
         }
         for (_, f) in self.funcs.iter_live() {
-            if let FuncObj::Lua { proto, upvals, .. } = f {
+            if let FuncObj::Lua(LuaFunc { proto, upvals, .. }) = f {
                 let c = &mut out[proto.source_id as usize];
                 c.functions += 1;
                 c.bytes += 48 + upvals.len() * 4;
@@ -670,12 +756,13 @@ impl Heap {
     }
 
     #[inline]
-    pub fn func_mut(&mut self, f: FuncRef) -> &mut FuncObj {
+    /// Crate-internal: replacing a running closure's code would free what its frame executes.
+    pub(crate) fn func_mut(&mut self, f: FuncRef) -> &mut FuncObj {
         self.funcs.get_mut(f.0)
     }
 
     /// Every live function, for a hot reload's walk.
-    pub fn funcs_mut(&mut self) -> impl Iterator<Item = &mut FuncObj> {
+    pub(crate) fn funcs_mut(&mut self) -> impl Iterator<Item = &mut FuncObj> {
         self.funcs.iter_live_mut()
     }
 
@@ -690,7 +777,9 @@ impl Heap {
     }
 
     #[inline]
-    pub fn upval_mut(&mut self, i: u32) -> &mut UpvalObj {
+    /// Crate-internal: an open upvalue names a stack slot the interpreter reads unchecked, so
+    /// the host writes an upvalue's value through `Vm::write_upvalue`.
+    pub(crate) fn upval_mut(&mut self, i: u32) -> &mut UpvalObj {
         self.upvals.get_mut(i)
     }
 
@@ -810,9 +899,9 @@ impl Heap {
                         continue;
                     }
                     match self.funcs.get(f.0) {
-                        FuncObj::Lua {
+                        FuncObj::Lua(LuaFunc {
                             proto, upvals, env, ..
-                        } => {
+                        }) => {
                             gray.push(Value::Table(*env));
                             gray_upvals.extend_from_slice(upvals);
                             mark_proto(proto, &mut gray, epoch);
@@ -858,12 +947,22 @@ impl Heap {
         }
         // Sweep. Dead strings leave the intern chains.
         let mut live = 0usize;
-        live += sweep(&mut self.tables, |t| t.bytes());
-        live += sweep(&mut self.funcs, |_| 48);
-        live += sweep(&mut self.upvals, |_| 24);
-        live += sweep(&mut self.users, |_| 32);
+        live += sweep(&mut self.tables, |t| t.bytes(), drop);
+        // A host closure's captures run Rust destructors, which may reach the VM: they wait in
+        // `freed_hosts` until the collection ends (`Vm::full_gc`).
+        let freed = &mut self.freed_hosts;
+        live += sweep(
+            &mut self.funcs,
+            |_| 48,
+            |f| match f {
+                FuncObj::Native { host: Some(_), .. } => freed.push(f),
+                _ => drop(f),
+            },
+        );
+        live += sweep(&mut self.upvals, |_| 24, drop);
+        live += sweep(&mut self.users, |_| 32, drop);
         let freed = self.strs.free.len();
-        live += sweep(&mut self.strs, |s| 32 + s.bytes().len());
+        live += sweep(&mut self.strs, |s| 32 + s.bytes().len(), drop);
         let dead_str = self.strs.free.len() != freed;
         let live_strs = self.strs.live() as u32;
         self.str_gc_at = live_strs + (self.str_id_limit.saturating_sub(live_strs)) / 2;
@@ -929,7 +1028,11 @@ fn mark_proto(p: &Rc<Proto>, gray: &mut Vec<Value>, epoch: u32) {
 
 /// Free every live object the mark left unmarked, and unmark the rest; answers the bytes that
 /// stay.
-fn sweep<T: Dead>(a: &mut Arena<T>, size: impl Fn(&T) -> usize) -> usize {
+fn sweep<T: Dead>(
+    a: &mut Arena<T>,
+    size: impl Fn(&T) -> usize,
+    mut on_free: impl FnMut(T),
+) -> usize {
     let mut live = 0;
     let n = a.used as usize;
     let (items, state) = (&mut a.items[..n], &mut a.state[..n]);
@@ -941,7 +1044,7 @@ fn sweep<T: Dead>(a: &mut Arena<T>, size: impl Fn(&T) -> usize) -> usize {
                 live += size(&items[i]);
             }
             _ => {
-                items[i] = T::dead();
+                on_free(std::mem::replace(&mut items[i], T::dead()));
                 state[i] = FREE;
                 a.free.push(i as u32);
             }
