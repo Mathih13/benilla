@@ -99,7 +99,7 @@ impl Vm {
                 Some(ups) => {
                     *shape = crate::heap::Shape::of(new);
                     let old_proto = std::mem::replace(proto, new.clone());
-                    let old_ups = std::mem::replace(upvals, ups.into_boxed_slice());
+                    let old_ups = std::mem::replace(upvals, crate::heap::Upvals::new(ups));
                     retired.push((old_proto, old_ups));
                     report.closures += 1;
                     seen.insert(key, true);

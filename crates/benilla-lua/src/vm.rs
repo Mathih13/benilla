@@ -152,7 +152,7 @@ pub struct Vm {
     /// Collect at every safe point: a test switch that finds a value the roots miss.
     pub gc_stress: bool,
     /// Code and upvalue lists a hot reload replaced, kept while a frame may still run them.
-    pub(crate) retired: Vec<(Rc<Proto>, Box<[u32]>)>,
+    pub(crate) retired: Vec<(Rc<Proto>, crate::heap::Upvals)>,
     /// Bumped by every `setfenv` of a Lua function, so a running frame's cached environment
     /// knows to reread.
     pub(crate) fenv_gen: u32,
@@ -534,7 +534,7 @@ impl Vm {
         let env = self.globals;
         Ok(Value::Func(self.heap.new_func(FuncObj::Lua(LuaFunc::new(
             proto,
-            Box::new([]),
+            crate::heap::Upvals::new(Vec::new()),
             env,
         )))))
     }
@@ -2783,7 +2783,7 @@ impl Vm {
                         }
                         let f = self.heap.new_func(FuncObj::Lua(LuaFunc::new(
                             p,
-                            ups.into_boxed_slice(),
+                            crate::heap::Upvals::new(ups),
                             env,
                         )));
                         r!(a) = Value::Func(f);

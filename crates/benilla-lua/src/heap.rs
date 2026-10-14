@@ -164,14 +164,14 @@ impl Shape {
 pub struct LuaFunc {
     pub(crate) proto: Rc<Proto>,
     /// One upvalue per entry of `proto.upvals`.
-    pub(crate) upvals: Box<[u32]>,
+    pub(crate) upvals: Upvals,
     pub(crate) env: TableRef,
     /// The prototype's call shape; replaced with it on a hot reload.
     pub(crate) shape: Shape,
 }
 
 impl LuaFunc {
-    pub(crate) fn new(proto: Rc<Proto>, upvals: Box<[u32]>, env: TableRef) -> LuaFunc {
+    pub(crate) fn new(proto: Rc<Proto>, upvals: Upvals, env: TableRef) -> LuaFunc {
         debug_assert_eq!(upvals.len(), proto.upvals.len());
         let shape = Shape::of(&proto);
         LuaFunc {
@@ -195,6 +195,43 @@ impl LuaFunc {
 
     pub fn env(&self) -> TableRef {
         self.env
+    }
+}
+
+/// A Lua closure's upvalue list: a boxed slice held by raw pointer. A running frame reads it
+/// through a raw pointer of its own, and a hot reload moves the list into `Vm::retired` while
+/// the frame still runs; a `Box`, moved, would assert unique access and invalidate the frame's
+/// pointer, so the list is a `Box` only while it is made and when it is freed.
+pub(crate) struct Upvals(std::ptr::NonNull<[u32]>);
+
+impl Upvals {
+    pub(crate) fn new(list: Vec<u32>) -> Upvals {
+        Upvals(std::ptr::NonNull::from(Box::leak(list.into_boxed_slice())))
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u32 {
+        self.0.as_ptr() as *const u32
+    }
+}
+
+impl std::ops::Deref for Upvals {
+    type Target = [u32];
+    fn deref(&self) -> &[u32] {
+        // SAFETY: the slice is live from `new` to `drop` and never written.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl Clone for Upvals {
+    fn clone(&self) -> Upvals {
+        Upvals::new(self.to_vec())
+    }
+}
+
+impl Drop for Upvals {
+    fn drop(&mut self) {
+        // SAFETY: made by `Box::leak` in `new`, freed once, here.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
     }
 }
 
@@ -822,11 +859,12 @@ impl Heap {
     /// upvalue lists no closure holds but a running frame does), clear weak entries, sweep.
     /// Answers the live byte estimate, which 5.0's `luaC_collectgarbage` doubles into the next
     /// threshold.
-    pub fn collect(
+    /// Crate-internal: roots the host chose could free a closure a frame is running.
+    pub(crate) fn collect(
         &mut self,
         roots: &[Value],
         extra_upvals: &[u32],
-        code: &[(Rc<Proto>, Box<[u32]>)],
+        code: &[(Rc<Proto>, Upvals)],
         mode_key: StrRef,
     ) -> usize {
         let mut gray: Vec<Value> = roots.to_vec();
