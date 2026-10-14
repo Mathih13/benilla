@@ -525,6 +525,10 @@ b]])"#),
           E(function() return string.gsub("abc", "b%1", "x") end), E(function() return string.gsub("xyz", "b[", "x") end),
           E(function() return string.gsub("abc", "b[", "x") end), E(function() return string.gsub("abc", "b", "%2") end),
           E(function() return string.gsub("xyz", "b", "%2") end))"#),
+    ("r2-front_forlist_extra_values", r#"local function R(src) return E(loadstring(src, "=t")) end
+        return S(R("for k in function() end, nil, nil, 42 do end return 7"),
+          R("local n = 0 for k in function(s, c) if c ~= 3 then return (c or 0) + 1 end end, nil, nil, 9, 8 do do local y = k n = n + y end end return n"),
+          R("local n = 0 for k, v in function(s, c) if c ~= 2 then return (c or 0) + 1, 10 end end, 1, nil, 4 do n = n + k + v end return n"))"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

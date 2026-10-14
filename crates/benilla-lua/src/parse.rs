@@ -246,8 +246,10 @@ impl<'a> Parser<'a> {
     }
 
     fn enterblock(&mut self, isbreakable: bool) {
+        // 5.1 asserts `freereg == nactvar` here, which its release build does not check and
+        // which does not hold in a generic for with more than three values
+        // (`for k in f, s, c, x do`): `forlist` adjusts them to three without freeing the rest.
         let fs = self.fs();
-        debug_assert_eq!(fs.freereg, fs.nactvar);
         let nactvar = fs.nactvar;
         fs.bl.push(BlockCnt {
             breaklist: NO_JUMP,

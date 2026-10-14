@@ -2452,6 +2452,10 @@ impl Vm {
                             r!(a + 3) = v;
                         }
                     }
+                    // 5.0's `TFORPREP`: a table becomes `next` over it once, at loop entry. The
+                    // C build's patch swaps at every `TFORLOOP` instead, so a callable-table
+                    // global `next` raises `invalid key to 'next'` after one pass there; benilla
+                    // keeps 5.0's single swap, which the 1.12 client runs.
                     Op::TForPrep(a, off) => {
                         if let V::Table(_) = (r!(a)).unpack() {
                             r!(a + 1) = r!(a);
