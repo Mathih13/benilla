@@ -1,4 +1,5 @@
-//! Compiled functions: a register machine close to 5.0's, with compare-and-jump fused.
+//! Compiled functions: 5.1.5's register machine, with each test fused with the jump after it
+//! and the common operand shapes given ops of their own.
 
 use crate::ast::Bytes;
 use crate::value::Value;
@@ -8,10 +9,10 @@ pub type Reg = u8;
 pub type Rk = u16;
 pub const RK_CONST: u16 = 256;
 
-/// 5.0's `MAXSTACK`: registers per function.
+/// 5.1's `MAXSTACK`: a function uses fewer registers than this.
 pub const MAXSTACK: usize = 250;
-/// 5.0's `LFIELDS_PER_FLUSH`.
-pub const FIELDS_PER_FLUSH: usize = 32;
+/// 5.1's `LFIELDS_PER_FLUSH`: list items a constructor stores per `SetList`.
+pub const FIELDS_PER_FLUSH: u32 = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cmp {
@@ -111,8 +112,10 @@ pub enum Op {
     JmpCmpK(CmpJ, Reg, u8, i32),
     /// `cmp(K(b), R(c))`: `n > 2`, swapped into `2 < n`.
     JmpCmpKR(CmpJ, u8, Reg, i32),
-    /// Jump when the truth of `R(a)` is `cond`.
+    /// 5.1's `TEST` and its `JMP`: jump when the truth of `R(a)` is `cond`.
     JmpIf(Reg, bool, i32),
+    /// 5.1's `TESTSET` and its `JMP`: when the truth of `R(b)` is `cond`, `R(a) = R(b)` and jump.
+    TestSet(Reg, Reg, bool, i32),
     /// `b` is the argument count + 1 (0: up to the top), `c` the result count + 1 (0: all).
     Call(Reg, u8, u8),
     TailCall(Reg, u8),

@@ -1,88 +1,44 @@
-//! AST to [`Proto`]: registers allocated as 5.0's code generator allocates them (locals in
-//! declaration order, temporaries above), and 5.0's observable choices kept: a constructor's
-//! size hints and 32-item `SETLIST` batches (which fix the table's layout, and so `next`'s
-//! order), right-to-left multiple assignment, tail calls, and loop variables shared across
-//! iterations.
+//! The code generator: 5.1.5's `lcode.c`, run by the parser as it reads, so registers, constants,
+//! jumps, line numbers and compile errors come out where the script host's C Lua puts them. The
+//! instructions are benilla's: each test is fused with the `JMP` after it, and the common operand
+//! shapes (a constant key, a constant operand, a positive constant step) have ops of their own,
+//! chosen as an instruction is emitted. Jump ranges are checked in 5.1's instruction count.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ast::*;
+use crate::ast::Bytes;
 use crate::heap::Heap;
 use crate::lex::SyntaxError;
+use crate::parse::Parser;
 use crate::proto::*;
 use crate::value::Value;
 
-type R<T> = Result<T, SyntaxError>;
+pub(crate) type R<T> = Result<T, SyntaxError>;
 
-/// One operator's register, register-constant and constant-register ops.
-type ArithOps = (
-    fn(Reg, Reg, Reg) -> Op,
-    fn(Reg, Reg, u16) -> Op,
-    fn(Reg, u16, Reg) -> Op,
-);
+/// The end of a jump list, and a jump not yet pointed anywhere.
+pub(crate) const NO_JUMP: i32 = -1;
+/// 5.1's `NO_REG` (`MAXARG_A`): no register, beyond any a function has.
+pub(crate) const NO_REG: Reg = 255;
+/// 5.1's `MAXINDEXRK`: constants past it are loaded into a register to be an operand.
+const MAXINDEXRK: u32 = 255;
+/// 5.1's `MAXARG_Bx`: constants and nested functions per function.
+const MAXARG_BX: usize = (1 << 18) - 1;
+/// 5.1's `MAXARG_sBx`: the longest jump, in 5.1's instructions.
+const MAXARG_SBX: i64 = MAXARG_BX as i64 >> 1;
+/// 5.1's `MAXARG_C`: a `SETLIST` batch number past it takes a second instruction word.
+const MAXARG_C: u32 = (1 << 9) - 1;
+/// `SHRT_MAX`, `registerlocalvar`'s limit on local declarations per function.
+const MAX_LOCVARS: usize = 32767;
 
-/// Compile a parsed main function.
-pub fn compile(f: &Func, heap: &mut Heap) -> R<Rc<Proto>> {
-    let fc = Fc::new(f, heap, &[], Rc::from(&b""[..]));
-    fc.run()
-}
-
-/// A function's name as its definition gives it: `a.b.c`, or none.
-fn def_name(target: &Expr) -> Option<Vec<u8>> {
-    match target {
-        Expr::Global(n) => Some(n.to_vec()),
-        Expr::Index(o, k, _) => {
-            let mut out = def_name(o)?;
-            let Expr::Str(k) = &**k else { return None };
-            out.push(b'.');
-            out.extend_from_slice(k);
-            Some(out)
-        }
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum KKey {
-    Nil,
-    Bool(bool),
-    Num(u64),
-    Str(u32),
-}
-
-struct Scope {
-    nactive: u8,
-    captured: bool,
-    is_loop: bool,
-    breaks: Vec<usize>,
-}
-
-struct Fc<'a> {
-    heap: &'a mut Heap,
-    f: &'a Func,
-    code: Vec<Op>,
-    lines: Vec<u32>,
-    consts: Vec<Value>,
-    kmap: HashMap<KKey, u32>,
-    protos: Vec<Rc<Proto>>,
-    reg_of: Vec<u8>,
-    nactive: u8,
-    freereg: u8,
-    maxstack: u8,
-    scopes: Vec<Scope>,
-    line: u32,
-    locvars: Vec<LocVar>,
-    /// `locvars` index of each active local, innermost last.
-    active_vars: Vec<usize>,
-    upvals: Vec<(bool, u16)>,
-    /// This function's [`Proto::key`], and how often each child name was used.
-    key: Bytes,
-    child_names: HashMap<Vec<u8>, u32>,
+/// Compile a chunk into its main function. `ccalls` is the caller's nesting of host calls, which
+/// 5.1 counts toward the parser's level limit (`L->nCcalls`).
+pub fn compile(src: &[u8], chunkname: &[u8], heap: &mut Heap, ccalls: u32) -> R<Rc<Proto>> {
+    crate::parse::parse(src, chunkname, heap, ccalls)
 }
 
 /// 5.1's `luaO_int2fb`: a size as a "floating point byte", `eeeeexxx`, rounded up.
-fn int2fb(mut x: u32) -> u32 {
+pub fn int2fb(mut x: u32) -> u32 {
     let mut e = 0;
     while x >= 16 {
         x = (x + 1) >> 1;
@@ -105,60 +61,177 @@ pub fn fb2int(x: u32) -> u32 {
     }
 }
 
-/// An expression that writes its destination before it has read all its operands, so it may
-/// not target a local it reads.
-fn writes_early(e: &Expr) -> bool {
-    match e {
-        Expr::Table(_) | Expr::Bin(BinOp::And | BinOp::Or, ..) => true,
-        Expr::Paren(e) => writes_early(e),
-        _ => false,
+/// 5.1's `expkind`, with each kind's `info` in it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Kind {
+    Void,
+    Nil,
+    True,
+    False,
+    /// A constant, by index.
+    K(u32),
+    KNum(f64),
+    /// A local, by register.
+    Local(Reg),
+    Upval(u16),
+    /// A global, by its name's constant.
+    Global(u32),
+    /// A table in a register and a key in a register or constant.
+    Indexed(Reg, Rk),
+    /// A comparison: the pc of its fused jump.
+    Jmp(usize),
+    /// The pc of an instruction whose destination is still open.
+    Reloc(usize),
+    NonReloc(Reg),
+    /// The pc of an open call.
+    Call(usize),
+}
+
+/// 5.1's `expdesc`: a kind and the lists of jumps taken when it is true and false.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Exp {
+    pub k: Kind,
+    pub t: i32,
+    pub f: i32,
+}
+
+impl Exp {
+    pub fn new(k: Kind) -> Exp {
+        Exp {
+            k,
+            t: NO_JUMP,
+            f: NO_JUMP,
+        }
+    }
+
+    fn has_jumps(&self) -> bool {
+        self.t != self.f
+    }
+
+    fn is_numeral(&self) -> Option<f64> {
+        match self.k {
+            Kind::KNum(n) if self.t == NO_JUMP && self.f == NO_JUMP => Some(n),
+            _ => None,
+        }
+    }
+
+    pub fn has_multret(&self) -> bool {
+        matches!(self.k, Kind::Call(_))
     }
 }
 
-enum Target {
-    Local(u8),
-    Upval(u16),
-    Global(u32),
-    Index(u8, Rk),
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum KKey {
+    Nil,
+    Bool(bool),
+    Num(u64),
+    Str(u32),
 }
 
-impl<'a> Fc<'a> {
-    fn new(f: &'a Func, heap: &'a mut Heap, parent_regs: &[u8], key: Bytes) -> Fc<'a> {
-        let upvals = f
-            .upvals
-            .iter()
-            .map(|u| {
-                if u.from_local {
-                    (true, parent_regs[u.index as usize] as u16)
-                } else {
-                    (false, u.index)
-                }
-            })
-            .collect();
-        Fc {
-            heap,
-            f,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BinOpr {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+    Concat,
+    Ne,
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnOpr {
+    Minus,
+    Not,
+}
+
+/// 5.1's `BlockCnt`.
+pub(crate) struct BlockCnt {
+    pub breaklist: i32,
+    pub nactvar: u8,
+    pub upval: bool,
+    pub isbreakable: bool,
+}
+
+/// 5.1's `FuncState`, with the `Proto` it fills.
+pub(crate) struct FuncState {
+    pub code: Vec<Op>,
+    pub lines: Vec<u32>,
+    /// Each instruction's position in 5.1's own code, which a fused test takes two words of: the
+    /// jump-range limit is 5.1's.
+    cpc: Vec<u32>,
+    cpc_next: u32,
+    pub consts: Vec<Value>,
+    kmap: HashMap<KKey, u32>,
+    pub protos: Vec<Rc<Proto>>,
+    /// Each upvalue as `(true, register)` in the enclosing function or `(false, upvalue)`.
+    pub upvals: Vec<(bool, u16)>,
+    pub upval_names: Vec<Bytes>,
+    pub locvars: Vec<LocVar>,
+    /// `locvars` index of each active local, then of those declared but not yet active.
+    pub actvar: Vec<u16>,
+    pub nactvar: u8,
+    pub freereg: u8,
+    pub maxstack: u8,
+    /// The last pc marked as a jump target (`luaK_getlabel`), in 5.1's count, or -1.
+    lasttarget: i64,
+    /// `LoadNil`s at the head of the function that 5.1 leaves out (see [`Parser::nil`]).
+    silent_nils: usize,
+    /// Jumps pending to the next instruction.
+    jpc: i32,
+    pub bl: Vec<BlockCnt>,
+    pub linedefined: u32,
+    pub nparams: u8,
+    pub vararg: bool,
+    pub source: Bytes,
+    pub key: Bytes,
+    child_names: HashMap<Vec<u8>, u32>,
+}
+
+impl FuncState {
+    pub fn new(source: Bytes, linedefined: u32, key: Bytes) -> FuncState {
+        FuncState {
             code: Vec::new(),
             lines: Vec::new(),
+            cpc: Vec::new(),
+            cpc_next: 0,
             consts: Vec::new(),
             kmap: HashMap::new(),
             protos: Vec::new(),
-            reg_of: vec![u8::MAX; f.locals.len()],
-            nactive: 0,
+            upvals: Vec::new(),
+            upval_names: Vec::new(),
+            locvars: Vec::new(),
+            actvar: Vec::new(),
+            nactvar: 0,
             freereg: 0,
             maxstack: 2,
-            scopes: Vec::new(),
-            line: f.line_defined.max(1),
-            locvars: Vec::new(),
-            active_vars: Vec::new(),
-            upvals,
+            lasttarget: -1,
+            silent_nils: 0,
+            jpc: NO_JUMP,
+            bl: Vec::new(),
+            linedefined,
+            nparams: 0,
+            vararg: false,
+            source,
             key,
             child_names: HashMap::new(),
         }
     }
 
-    /// A child's key: this one's, then the child's name, numbered when it repeats.
-    fn child_key(&mut self, name: Option<Vec<u8>>) -> Bytes {
+    pub fn pc(&self) -> usize {
+        self.code.len()
+    }
+
+    /// A child's key: this function's, then the child's name, numbered when it repeats. Hot
+    /// reload matches functions across an edit by it.
+    pub fn child_key(&mut self, name: Option<Vec<u8>>) -> Bytes {
         let base = name.unwrap_or_else(|| b"anon".to_vec());
         let n = self.child_names.entry(base.clone()).or_insert(0);
         *n += 1;
@@ -173,1003 +246,980 @@ impl<'a> Fc<'a> {
         Rc::from(k)
     }
 
-    fn run(mut self) -> R<Rc<Proto>> {
-        let f = self.f;
-        // Parameters, then `arg`, are the first registers.
-        let nparams = f.nparams as usize + f.vararg.is_some() as usize;
-        for id in 0..nparams {
-            self.activate(id as LocalId)?;
-        }
-        self.enter_scope(false);
-        self.stats(&f.body.stats)?;
-        self.leave_scope();
-        self.emit(Op::Return(0, 1));
-        let end = self.code.len() as u32;
-        for &i in &self.active_vars {
-            self.locvars[i].endpc = end;
-        }
-        Ok(Rc::new(Proto {
+    /// The finished prototype (`close_func`, after its final return).
+    pub fn into_proto(mut self, heap: &mut Heap) -> Proto {
+        // Instructions 5.1 does not have take the line of the first one it does, so a line hook
+        // sees 5.1's lines.
+        let n = self.silent_nils;
+        let line = self.lines[n];
+        self.lines[..n].fill(line);
+        debug_assert!(!self
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::TestSet(NO_REG, ..))));
+        Proto {
             code: self.code,
             lines: self.lines,
             consts: self.consts,
             protos: self.protos,
             upvals: self.upvals,
-            upval_names: f.upvals.iter().map(|u| u.name.clone()).collect(),
-            nparams: f.nparams,
-            vararg: f.vararg.is_some(),
+            upval_names: self.upval_names,
+            nparams: self.nparams,
+            vararg: self.vararg,
             maxstack: self.maxstack as u16 + 1,
-            source: f.source.clone(),
-            line_defined: f.line_defined,
+            source_id: heap.source_id(&self.source),
+            source: self.source,
+            line_defined: self.linedefined,
             locvars: self.locvars,
             key: self.key,
-            source_id: self.heap.source_id(&f.source),
             gc_mark: Default::default(),
-        }))
+        }
+    }
+}
+
+/// The jump offset an instruction carries, if it is a jump.
+fn jump_of(op: &Op) -> Option<i32> {
+    match *op {
+        Op::Jmp(o)
+        | Op::JmpCmp(_, _, _, o)
+        | Op::JmpCmpK(_, _, _, o)
+        | Op::JmpCmpKR(_, _, _, o)
+        | Op::JmpIf(_, _, o)
+        | Op::TestSet(_, _, _, o)
+        | Op::ForPrep(_, o)
+        | Op::ForLoop(_, o)
+        | Op::ForLoopUp(_, o)
+        | Op::TForPrep(_, o) => Some(o),
+        _ => None,
+    }
+}
+
+fn set_jump(op: &mut Op, off: i32) {
+    match op {
+        Op::Jmp(o)
+        | Op::JmpCmp(_, _, _, o)
+        | Op::JmpCmpK(_, _, _, o)
+        | Op::JmpCmpKR(_, _, _, o)
+        | Op::JmpIf(_, _, o)
+        | Op::TestSet(_, _, _, o)
+        | Op::ForPrep(_, o)
+        | Op::ForLoop(_, o)
+        | Op::ForLoopUp(_, o)
+        | Op::TForPrep(_, o) => *o = off,
+        op => unreachable!("not a jump: {op:?}"),
+    }
+}
+
+/// A test fused with its `JMP`: 5.1's jump word is the second of its two.
+fn is_fused_test(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::JmpCmp(..) | Op::JmpCmpK(..) | Op::JmpCmpKR(..) | Op::JmpIf(..) | Op::TestSet(..)
+    )
+}
+
+/// `SETARG_A` on an instruction whose destination was left open.
+fn set_a(op: &mut Op, r: Reg) {
+    match op {
+        Op::Move(a, _)
+        | Op::LoadK(a, _)
+        | Op::LoadBool(a, _)
+        | Op::GetUpval(a, _)
+        | Op::GetGlobal(a, _)
+        | Op::GetTable(a, ..)
+        | Op::GetField(a, ..)
+        | Op::NewTable(a, ..)
+        | Op::Add(a, ..)
+        | Op::Sub(a, ..)
+        | Op::Mul(a, ..)
+        | Op::Div(a, ..)
+        | Op::Pow(a, ..)
+        | Op::AddK(a, ..)
+        | Op::SubK(a, ..)
+        | Op::MulK(a, ..)
+        | Op::DivK(a, ..)
+        | Op::AddKR(a, ..)
+        | Op::SubKR(a, ..)
+        | Op::MulKR(a, ..)
+        | Op::DivKR(a, ..)
+        | Op::Unm(a, _)
+        | Op::Not(a, _)
+        | Op::Concat(a, ..)
+        | Op::Closure(a, _) => *a = r,
+        op => unreachable!("not relocatable: {op:?}"),
+    }
+}
+
+fn is_k(x: Rk) -> bool {
+    x >= RK_CONST
+}
+
+/// 5.1's `constfolding`: two numerals fold unless the result would be a NaN or a division by
+/// zero is asked for.
+fn fold(op: BinOpr, a: f64, b: f64) -> Option<f64> {
+    let r = match op {
+        BinOpr::Add => a + b,
+        BinOpr::Sub => a - b,
+        BinOpr::Mul => a * b,
+        BinOpr::Div => {
+            if b == 0.0 {
+                return None;
+            }
+            a / b
+        }
+        // `luai_numpow`: C's `pow`, as the VM computes it.
+        BinOpr::Pow => a.powf(b),
+        _ => return None,
+    };
+    (!r.is_nan()).then_some(r)
+}
+
+impl<'a> Parser<'a> {
+    pub(crate) fn fs(&mut self) -> &mut FuncState {
+        self.fs.last_mut().unwrap()
+    }
+
+    pub(crate) fn fsr(&self) -> &FuncState {
+        self.fs.last().unwrap()
     }
 
     // ── emission ─────────────────────────────────────────────────────────────────────────────
 
-    fn emit(&mut self, op: Op) -> usize {
-        self.code.push(op);
-        self.lines.push(self.line);
-        self.code.len() - 1
+    /// `luaK_code`: pending jumps land here, then the instruction, at the last token's line.
+    /// `words` is the instruction's size in 5.1's code.
+    pub(crate) fn code(&mut self, op: Op, words: u32) -> R<usize> {
+        self.dischargejpc()?;
+        Ok(self.code_raw(op, words))
     }
 
-    fn here(&self) -> usize {
-        self.code.len()
+    fn code_raw(&mut self, op: Op, words: u32) -> usize {
+        let line = self.lx.lastline;
+        let fs = self.fs();
+        fs.code.push(op);
+        fs.lines.push(line);
+        fs.cpc.push(fs.cpc_next);
+        fs.cpc_next += words;
+        fs.code.len() - 1
     }
 
-    fn jump(&mut self) -> usize {
-        self.emit(Op::Jmp(0))
-    }
-
-    /// Point the jumps at `pos` to `target`.
-    fn patch_to(&mut self, jumps: &[usize], target: usize) {
-        for &pos in jumps {
-            let off = target as i32 - (pos as i32 + 1);
-            match &mut self.code[pos] {
-                Op::Jmp(o)
-                | Op::JmpCmp(_, _, _, o)
-                | Op::JmpCmpK(_, _, _, o)
-                | Op::JmpCmpKR(_, _, _, o)
-                | Op::JmpIf(_, _, o)
-                | Op::ForPrep(_, o)
-                | Op::ForLoop(_, o)
-                | Op::ForLoopUp(_, o)
-                | Op::TForPrep(_, o) => *o = off,
-                op => unreachable!("not a jump: {op:?}"),
+    /// `luaK_fixline`: the last instruction's line. After a closure with upvalues 5.1's last
+    /// instruction is the closure's last pseudo-instruction, which benilla has not: the
+    /// closure keeps its own line.
+    pub(crate) fn fixline(&mut self, line: u32) {
+        let fs = self.fs();
+        if let Some(&Op::Closure(_, px)) = fs.code.last() {
+            if !fs.protos[px as usize].upvals.is_empty() {
+                return;
             }
         }
+        *fs.lines.last_mut().unwrap() = line;
     }
 
-    fn patch_here(&mut self, jumps: &[usize]) {
-        let h = self.here();
-        self.patch_to(jumps, h);
+    /// `luaK_getlabel`: the current pc, marked as a jump target.
+    pub(crate) fn getlabel(&mut self) -> usize {
+        let fs = self.fs();
+        fs.lasttarget = fs.cpc_next as i64;
+        fs.pc()
     }
 
-    fn too_complex(&self) -> SyntaxError {
-        let mut m = crate::chunkid(&self.f.source);
-        m.extend_from_slice(
-            format!(":{}: function or expression too complex", self.line).as_bytes(),
-        );
-        SyntaxError(m)
-    }
-
-    fn reserve(&mut self, n: u8) -> R<u8> {
-        let r = self.freereg;
-        let top = self.freereg as usize + n as usize;
-        if top > MAXSTACK {
-            return Err(self.too_complex());
+    fn getjump(&self, pc: usize) -> i32 {
+        let off = jump_of(&self.fsr().code[pc]).unwrap();
+        if off == NO_JUMP {
+            NO_JUMP
+        } else {
+            pc as i32 + 1 + off
         }
-        self.freereg = top as u8;
-        self.maxstack = self.maxstack.max(self.freereg);
-        Ok(r)
     }
 
-    /// The stack must hold `top` registers (a generic for's call frame).
-    fn need(&mut self, top: usize) -> R<()> {
-        if top > MAXSTACK {
-            return Err(self.too_complex());
+    /// `fixjump`, with 5.1's range check made on 5.1's own instruction positions.
+    fn fixjump(&mut self, pc: usize, dest: usize) -> R<()> {
+        let fs = self.fsr();
+        let cjump = fs.cpc[pc] + is_fused_test(&fs.code[pc]) as u32;
+        let cdest = fs.cpc.get(dest).copied().unwrap_or(fs.cpc_next);
+        if (cdest as i64 - (cjump as i64 + 1)).abs() > MAXARG_SBX {
+            return Err(self.lx.error("control structure too long"));
         }
-        self.maxstack = self.maxstack.max(top as u8);
+        let off = dest as i32 - (pc as i32 + 1);
+        set_jump(&mut self.fs().code[pc], off);
         Ok(())
     }
 
-    fn konst(&mut self, k: KKey, v: Value) -> u32 {
-        if let Some(&i) = self.kmap.get(&k) {
-            return i;
+    /// `luaK_concat`: list `l2` appended to list `l1`.
+    pub(crate) fn concat(&mut self, l1: &mut i32, l2: i32) -> R<()> {
+        if l2 == NO_JUMP {
+            return Ok(());
         }
-        self.consts.push(v);
-        let i = (self.consts.len() - 1) as u32;
-        self.kmap.insert(k, i);
-        i
+        if *l1 == NO_JUMP {
+            *l1 = l2;
+            return Ok(());
+        }
+        let mut list = *l1 as usize;
+        loop {
+            let next = self.getjump(list);
+            if next == NO_JUMP {
+                break;
+            }
+            list = next as usize;
+        }
+        self.fixjump(list, l2 as usize)
     }
 
-    fn kstr(&mut self, s: &[u8]) -> u32 {
-        let r = self.heap.intern(s);
-        self.konst(KKey::Str(r.id), Value::Str(r))
+    /// `luaK_jump`: an unconditional jump, which takes over the jumps pending to here.
+    pub(crate) fn jump(&mut self) -> R<i32> {
+        let jpc = std::mem::replace(&mut self.fs().jpc, NO_JUMP);
+        let mut j = self.code(Op::Jmp(NO_JUMP), 1)? as i32;
+        self.concat(&mut j, jpc)?;
+        Ok(j)
     }
 
-    fn knum(&mut self, n: f64) -> u32 {
-        self.konst(KKey::Num(n.to_bits()), Value::Num(n))
-    }
-
-    /// A constant as an RK operand, if its index fits.
-    fn rk_const(&mut self, e: &Expr) -> Option<Rk> {
-        let k = match e {
-            Expr::Nil => self.konst(KKey::Nil, Value::Nil),
-            Expr::True => self.konst(KKey::Bool(true), Value::Bool(true)),
-            Expr::False => self.konst(KKey::Bool(false), Value::Bool(false)),
-            Expr::Num(n) => self.knum(*n),
-            Expr::Str(s) => self.kstr(s),
-            _ => return None,
+    /// `luaK_ret`.
+    pub(crate) fn ret(&mut self, first: Reg, nret: i32) -> R<()> {
+        let op = if nret == 1 {
+            Op::Return1(first)
+        } else {
+            Op::Return(first, (nret + 1) as u8)
         };
-        if k + (RK_CONST as u32) < u16::MAX as u32 {
-            Some(k as u16 + RK_CONST)
+        self.code(op, 1)?;
+        Ok(())
+    }
+
+    /// `patchtestreg`: a `TESTSET` gets its destination, or becomes a `TEST` when there is none
+    /// or the value is already there. Answers whether `node` is a test that produces a value.
+    fn patchtestreg(&mut self, node: usize, reg: Reg) -> bool {
+        let fs = self.fs();
+        let Op::TestSet(_, b, c, off) = fs.code[node] else {
+            return false;
+        };
+        fs.code[node] = if reg != NO_REG && reg != b {
+            Op::TestSet(reg, b, c, off)
         } else {
-            None
+            Op::JmpIf(b, c, off)
+        };
+        true
+    }
+
+    /// `need_value`: a jump in the list that is not a value-producing test.
+    fn need_value(&self, mut list: i32) -> bool {
+        while list != NO_JUMP {
+            if !matches!(self.fsr().code[list as usize], Op::TestSet(..)) {
+                return true;
+            }
+            list = self.getjump(list as usize);
+        }
+        false
+    }
+
+    fn removevalues(&mut self, mut list: i32) {
+        while list != NO_JUMP {
+            self.patchtestreg(list as usize, NO_REG);
+            list = self.getjump(list as usize);
         }
     }
 
-    // ── scopes ───────────────────────────────────────────────────────────────────────────────
-
-    fn activate(&mut self, id: LocalId) -> R<()> {
-        let reg = self.nactive;
-        self.reg_of[id as usize] = reg;
-        self.nactive += 1;
-        if self.freereg < self.nactive {
-            self.reserve(self.nactive - self.freereg)?;
-        }
-        self.locvars.push(LocVar {
-            name: self.f.locals[id as usize].name.clone(),
-            reg,
-            startpc: self.here() as u32,
-            endpc: 0,
-        });
-        self.active_vars.push(self.locvars.len() - 1);
-        if self.f.locals[id as usize].captured {
-            if let Some(s) = self.scopes.last_mut() {
-                s.captured = true;
-            }
-        }
-        Ok(())
-    }
-
-    fn enter_scope(&mut self, is_loop: bool) {
-        self.scopes.push(Scope {
-            nactive: self.nactive,
-            captured: false,
-            is_loop,
-            breaks: Vec::new(),
-        });
-    }
-
-    /// 5.0's `leaveblock`: the scope's locals end, its open upvalues close; answers its breaks.
-    fn leave_scope(&mut self) -> Vec<usize> {
-        let s = self.scopes.pop().unwrap();
-        let end = self.here() as u32;
-        while self.active_vars.len() > s.nactive as usize {
-            let i = self.active_vars.pop().unwrap();
-            self.locvars[i].endpc = end;
-        }
-        if s.captured {
-            self.emit(Op::Close(s.nactive));
-        }
-        self.nactive = s.nactive;
-        self.freereg = s.nactive;
-        s.breaks
-    }
-
-    /// `block`: statements in a scope of their own.
-    fn block(&mut self, b: &Block) -> R<()> {
-        self.enter_scope(false);
-        self.stats(&b.stats)?;
-        self.leave_scope();
-        Ok(())
-    }
-
-    // ── statements ───────────────────────────────────────────────────────────────────────────
-
-    fn stats(&mut self, stats: &[Stat]) -> R<()> {
-        for s in stats {
-            self.stat(s)?;
-            debug_assert_eq!(self.freereg, self.nactive);
-        }
-        Ok(())
-    }
-
-    fn stat(&mut self, s: &Stat) -> R<()> {
-        match s {
-            Stat::Call(e) => {
-                self.call(e, 0)?;
-                self.freereg = self.nactive;
-            }
-            Stat::Local { vars, exprs } => {
-                self.explist_adjust(exprs, vars.len())?;
-                for &v in vars {
-                    self.activate(v)?;
-                }
-                self.freereg = self.nactive;
-            }
-            Stat::LocalFunction { var, func } => {
-                self.activate(*var)?;
-                let reg = self.reg_of[*var as usize];
-                let mut name = b"local ".to_vec();
-                name.extend_from_slice(&self.f.locals[*var as usize].name);
-                self.named_closure(func, reg, Some(name))?;
-            }
-            Stat::Assign {
-                targets,
-                exprs,
-                line,
-            } => self.assign(targets, exprs, *line)?,
-            Stat::Do(b) => self.block(b)?,
-            Stat::While { cond, body } => {
-                let start = self.here();
-                let exits = self.cond(cond, false)?;
-                self.enter_scope(true);
-                self.block(body)?;
-                let j = self.jump();
-                self.patch_to(&[j], start);
-                let breaks = self.leave_scope();
-                self.patch_here(&exits);
-                self.patch_here(&breaks);
-            }
-            Stat::Repeat { body, cond } => {
-                // 5.1's `repeatstat`: the condition is compiled inside the body's scope.
-                let start = self.here();
-                self.enter_scope(true);
-                self.enter_scope(false);
-                self.stats(&body.stats)?;
-                if !self.scopes.last().unwrap().captured {
-                    let back = self.cond(cond, false)?;
-                    self.leave_scope();
-                    self.patch_to(&back, start);
-                } else {
-                    // A captured body local: a true condition breaks out closing it, a false one
-                    // closes it and loops.
-                    let again = self.cond(cond, false)?;
-                    let loop_scope = self.scopes.len() - 2;
-                    let n = self.scopes[loop_scope].nactive;
-                    self.emit(Op::Close(n));
-                    let j = self.jump();
-                    self.scopes[loop_scope].breaks.push(j);
-                    self.patch_here(&again);
-                    self.leave_scope();
-                    let back = self.jump();
-                    self.patch_to(&[back], start);
-                }
-                let breaks = self.leave_scope();
-                self.patch_here(&breaks);
-            }
-            Stat::If { arms, orelse } => {
-                let mut ends = Vec::new();
-                for (i, (c, b)) in arms.iter().enumerate() {
-                    let skip = self.cond(c, false)?;
-                    self.block(b)?;
-                    if i + 1 < arms.len() || orelse.is_some() {
-                        ends.push(self.jump());
-                    }
-                    self.patch_here(&skip);
-                }
-                if let Some(b) = orelse {
-                    self.block(b)?;
-                }
-                self.patch_here(&ends);
-            }
-            Stat::NumFor {
-                index,
-                limit,
-                step,
-                var,
-                start_e,
-                limit_e,
-                step_e,
-                body,
-                line,
-            } => {
-                // 5.1's `forstat`, `fornum` and `forbody`: the loop's scope holds the three
-                // control variables, and the declared variable lives in a scope of its own, closed
-                // at the end of each pass.
-                self.enter_scope(true);
-                let base = self.freereg;
-                let r = self.reserve(1)?;
-                self.exp2reg(start_e, r)?;
-                let r = self.reserve(1)?;
-                self.exp2reg(limit_e, r)?;
-                let r = self.reserve(1)?;
-                match step_e {
-                    Some(e) => self.exp2reg(e, r)?,
-                    None => {
-                        let k = self.knum(1.0);
-                        self.emit(Op::LoadK(r, k));
-                    }
-                }
-                self.activate(*index)?;
-                self.activate(*limit)?;
-                self.activate(*step)?;
-                self.line = *line;
-                let prep = self.emit(Op::ForPrep(base, 0));
-                self.enter_scope(false);
-                self.activate(*var)?;
-                let body_start = self.here();
-                self.block(body)?;
-                self.leave_scope();
-                self.patch_here(&[prep]);
-                self.line = *line;
-                // A missing step is 1; a positive literal one tests `<=` alone.
-                let up = match step_e {
-                    None => true,
-                    Some(Expr::Num(n)) => *n > 0.0,
-                    _ => false,
-                };
-                let l = self.emit(if up {
-                    Op::ForLoopUp(base, 0)
-                } else {
-                    Op::ForLoop(base, 0)
-                });
-                self.patch_to(&[l], body_start);
-                let breaks = self.leave_scope();
-                self.patch_here(&breaks);
-            }
-            Stat::GenFor {
-                generator,
-                state,
-                control,
-                vars,
-                exprs,
-                body,
-                line,
-            } => {
-                self.enter_scope(true);
-                let base = self.freereg;
-                self.line = *line;
-                self.explist_adjust(exprs, 3)?;
-                self.activate(*generator)?;
-                self.activate(*state)?;
-                self.activate(*control)?;
-                // The call frame at `R(a+3)`: generator, state and control, then the results.
-                self.need(base as usize + 3 + vars.len().max(3))?;
-                // 5.0's table-for substitution, kept by the script host's patched `TFORLOOP`,
-                // then the jump to the loop's `TForLoop`.
-                let prep = self.emit(Op::TForPrep(base, 0));
-                self.enter_scope(false);
-                for &v in vars {
-                    self.activate(v)?;
-                }
-                let body_start = self.here();
-                self.block(body)?;
-                self.leave_scope();
-                self.patch_here(&[prep]);
-                self.line = *line;
-                self.emit(Op::TForLoop(base, vars.len() as u8));
-                let back = self.jump();
-                self.patch_to(&[back], body_start);
-                let breaks = self.leave_scope();
-                self.patch_here(&breaks);
-            }
-            Stat::Function { target, func, line } => {
-                self.line = *line;
-                let name = match target {
-                    Expr::Local(id) => Some(self.f.locals[*id as usize].name.to_vec()),
-                    Expr::Upval(i) => Some(self.f.upvals[*i as usize].name.to_vec()),
-                    _ => def_name(target),
-                };
-                match target {
-                    Expr::Local(id) => {
-                        let reg = self.reg_of[*id as usize];
-                        self.named_closure(func, reg, name)?;
-                    }
-                    Expr::Upval(i) => {
-                        let r = self.reserve(1)?;
-                        self.named_closure(func, r, name)?;
-                        self.emit(Op::SetUpval(r, *i));
-                    }
-                    Expr::Global(n) => {
-                        let r = self.reserve(1)?;
-                        self.named_closure(func, r, name)?;
-                        let k = self.kstr(n);
-                        self.emit(Op::SetGlobal(r, k));
-                    }
-                    Expr::Index(o, k, _) => {
-                        let ro = self.exp2anyreg(o)?;
-                        let rk = self.exp2rk(k)?;
-                        let r = self.reserve(1)?;
-                        self.named_closure(func, r, name)?;
-                        self.line = *line;
-                        self.emit_set((ro, rk, r as Rk));
-                    }
-                    _ => unreachable!("funcname is a variable"),
-                }
-                self.freereg = self.nactive;
-            }
-            Stat::Return { exprs } => {
-                self.ret(exprs)?;
-                self.freereg = self.nactive;
-            }
-            Stat::Break => {
-                // 5.0's `breakstat`: close every scope's upvalues up to the loop's.
-                let mut upval = false;
-                let mut loop_idx = None;
-                for (i, s) in self.scopes.iter().enumerate().rev() {
-                    upval |= s.captured;
-                    if s.is_loop {
-                        loop_idx = Some(i);
-                        break;
-                    }
-                }
-                let i = loop_idx.expect("the parser checked for a loop");
-                if upval {
-                    let n = self.scopes[i].nactive;
-                    self.emit(Op::Close(n));
-                }
-                let j = self.jump();
-                self.scopes[i].breaks.push(j);
-            }
-        }
-        Ok(())
-    }
-
-    fn ret(&mut self, exprs: &[Expr]) -> R<()> {
-        if exprs.len() == 1 && exprs[0].is_multi() {
-            // `return f(x)`: a tail call.
-            let base = self.call(&exprs[0], -1)?;
-            let last = self.code.len() - 1;
-            if let Op::Call(a, b, _) = self.code[last] {
-                self.code[last] = Op::TailCall(a, b);
-            }
-            self.emit(Op::Return(base, 0));
-            return Ok(());
-        }
-        if exprs.len() == 1 {
-            if let Expr::Local(id) = &exprs[0] {
-                let r = self.reg_of[*id as usize];
-                self.emit(Op::Return1(r));
-                return Ok(());
-            }
-        }
-        let base = self.freereg;
-        let multi = self.explist(exprs)?;
-        if !multi && exprs.len() == 1 {
-            self.emit(Op::Return1(base));
-        } else {
-            let b = if multi { 0 } else { exprs.len() as u8 + 1 };
-            self.emit(Op::Return(base, b));
-        }
-        Ok(())
-    }
-
-    fn assign(&mut self, targets: &[Expr], exprs: &[Expr], line: u32) -> R<()> {
-        if targets.len() == 1 && exprs.len() == 1 {
-            let e = &exprs[0];
-            match &targets[0] {
-                Expr::Local(id) => {
-                    let reg = self.reg_of[*id as usize];
-                    if writes_early(e) {
-                        let r = self.reserve(1)?;
-                        self.exp2reg(e, r)?;
-                        self.emit(Op::Move(reg, r));
-                    } else {
-                        self.exp2reg(e, reg)?;
-                    }
-                }
-                Expr::Upval(i) => {
-                    let r = self.exp2anyreg(e)?;
-                    self.emit(Op::SetUpval(r, *i));
-                }
-                Expr::Global(n) => {
-                    let r = self.exp2anyreg(e)?;
-                    let k = self.kstr(n);
-                    self.emit(Op::SetGlobal(r, k));
-                }
-                Expr::Index(o, k, _) => {
-                    let ro = self.exp2anyreg(o)?;
-                    let rk = self.exp2rk(k)?;
-                    let rv = self.exp2rk(e)?;
-                    self.line = line;
-                    self.emit_set((ro, rk, rv));
-                }
-                _ => unreachable!("the parser checked the target"),
-            }
-            self.freereg = self.nactive;
-            return Ok(());
-        }
-        // 5.0's `check_conflict`: a local assigned here and read by an indexed target's table
-        // or key is copied first, since the stores run right to left.
-        let assigned: Vec<LocalId> = targets
-            .iter()
-            .filter_map(|t| match t {
-                Expr::Local(id) => Some(*id),
-                _ => None,
-            })
-            .collect();
-        let mut slots = Vec::new();
-        for t in targets {
-            slots.push(match t {
-                Expr::Local(id) => Target::Local(self.reg_of[*id as usize]),
-                Expr::Upval(i) => Target::Upval(*i),
-                Expr::Global(n) => Target::Global(self.kstr(n)),
-                Expr::Index(o, k, _) => {
-                    let conflict = |e: &Expr| matches!(e, Expr::Local(id) if assigned.contains(id));
-                    let ro = if conflict(o) {
-                        let r = self.reserve(1)?;
-                        self.exp2reg(o, r)?;
-                        r
-                    } else {
-                        self.exp2anyreg(o)?
-                    };
-                    let rk = if conflict(k) {
-                        let r = self.reserve(1)?;
-                        self.exp2reg(k, r)?;
-                        r as Rk
-                    } else {
-                        self.exp2rk(k)?
-                    };
-                    Target::Index(ro, rk)
-                }
-                _ => unreachable!("the parser checked the target"),
-            });
-        }
-        let base = self.freereg;
-        self.explist_adjust(exprs, targets.len())?;
-        self.line = line;
-        for (i, t) in slots.iter().enumerate().rev() {
-            let r = base + i as u8;
-            match *t {
-                Target::Local(reg) => {
-                    self.emit(Op::Move(reg, r));
-                }
-                Target::Upval(u) => {
-                    self.emit(Op::SetUpval(r, u));
-                }
-                Target::Global(k) => {
-                    self.emit(Op::SetGlobal(r, k));
-                }
-                Target::Index(ro, rk) => {
-                    self.emit_set((ro, rk, r as Rk));
-                }
-            }
-        }
-        self.freereg = self.nactive;
-        Ok(())
-    }
-
-    // ── expression lists ─────────────────────────────────────────────────────────────────────
-
-    /// Every expression into consecutive registers from `freereg`, a trailing call keeping all
-    /// its values. Answers whether it did (the count is then "up to the top").
-    fn explist(&mut self, exprs: &[Expr]) -> R<bool> {
-        for (i, e) in exprs.iter().enumerate() {
-            if i + 1 == exprs.len() && e.is_multi() {
-                self.call(e, -1)?;
-                return Ok(true);
-            }
-            let r = self.reserve(1)?;
-            self.exp2reg(e, r)?;
-        }
-        Ok(false)
-    }
-
-    /// 5.0's `adjust_assign`: exactly `n` values from `freereg` on, extras evaluated and dropped,
-    /// missing ones nil.
-    fn explist_adjust(&mut self, exprs: &[Expr], n: usize) -> R<()> {
-        let base = self.freereg;
-        for (i, e) in exprs.iter().enumerate() {
-            if i + 1 == exprs.len() && e.is_multi() {
-                let want = (n as i32 - i as i32).max(0);
-                self.call(e, want)?;
-                self.freereg = base + i as u8 + want as u8;
+    fn patchlistaux(&mut self, mut list: i32, vtarget: usize, reg: Reg, dtarget: usize) -> R<()> {
+        while list != NO_JUMP {
+            let next = self.getjump(list as usize);
+            if self.patchtestreg(list as usize, reg) {
+                self.fixjump(list as usize, vtarget)?;
             } else {
-                let r = self.reserve(1)?;
-                self.exp2reg(e, r)?;
+                self.fixjump(list as usize, dtarget)?;
             }
+            list = next;
         }
-        let have = self.freereg as usize - base as usize;
-        if have < n {
-            let first = self.reserve((n - have) as u8)?;
-            self.emit(Op::LoadNil(first, base + n as u8 - 1));
-        }
-        self.freereg = base + n as u8;
-        self.maxstack = self.maxstack.max(self.freereg);
         Ok(())
     }
 
-    // ── calls ────────────────────────────────────────────────────────────────────────────────
+    fn dischargejpc(&mut self) -> R<()> {
+        let fs = self.fs();
+        let jpc = std::mem::replace(&mut fs.jpc, NO_JUMP);
+        let pc = fs.pc();
+        self.patchlistaux(jpc, pc, NO_REG, pc)
+    }
 
-    /// A call with its function at `freereg`, keeping `nres` results there (-1: all, up to the
-    /// top). Answers the base register; `freereg` ends just past the kept results.
-    fn call(&mut self, e: &Expr, nres: i32) -> R<u8> {
-        let base = self.freereg;
-        let (args, line, nfixed) = match e {
-            Expr::Call(f, args, line) => {
-                let r = self.reserve(1)?;
-                self.exp2reg(f, r)?;
-                (args, *line, 1)
-            }
-            Expr::Method(obj, name, args, line) => {
-                let o = self.exp2anyreg(obj)?;
-                self.freereg = base;
-                self.reserve(2)?;
-                let k = self.kstr(name);
-                let rk = if (k as usize) + (RK_CONST as usize) < u16::MAX as usize {
-                    k as u16 + RK_CONST
-                } else {
-                    let r = self.reserve(1)?;
-                    self.emit(Op::LoadK(r, k));
-                    self.freereg -= 1;
-                    r as Rk
-                };
-                self.line = *line;
-                match self.str_const(rk) {
-                    Some(k) => self.emit(Op::SelfField(base, o, k)),
-                    None => self.emit(Op::SelfOp(base, o, rk)),
-                };
-                (args, *line, 2)
-            }
-            _ => unreachable!("a call"),
-        };
-        let multi = self.explist(args)?;
-        let b = if multi {
-            0
+    /// `luaK_patchlist`.
+    pub(crate) fn patchlist(&mut self, list: i32, target: usize) -> R<()> {
+        if target == self.fsr().pc() {
+            self.patchtohere(list)
         } else {
-            (args.len() + nfixed) as u8
-        };
-        self.line = line;
-        self.emit(Op::Call(base, b, (nres + 1) as u8));
-        self.freereg = base;
-        if nres > 0 {
-            self.reserve(nres as u8)?;
+            self.patchlistaux(list, target, NO_REG, target)
         }
-        Ok(base)
+    }
+
+    /// `luaK_patchtohere`.
+    pub(crate) fn patchtohere(&mut self, list: i32) -> R<()> {
+        self.getlabel();
+        let mut jpc = self.fsr().jpc;
+        self.concat(&mut jpc, list)?;
+        self.fs().jpc = jpc;
+        Ok(())
+    }
+
+    // ── registers ────────────────────────────────────────────────────────────────────────────
+
+    /// `luaK_checkstack`: a function keeps below `MAXSTACK` registers.
+    pub(crate) fn checkstack(&mut self, n: u32) -> R<()> {
+        let fs = self.fsr();
+        let newstack = fs.freereg as u32 + n;
+        if newstack > fs.maxstack as u32 {
+            if newstack >= MAXSTACK as u32 {
+                return Err(self.lx.error("function or expression too complex"));
+            }
+            self.fs().maxstack = newstack as u8;
+        }
+        Ok(())
+    }
+
+    /// `luaK_reserveregs`.
+    pub(crate) fn reserveregs(&mut self, n: u32) -> R<()> {
+        self.checkstack(n)?;
+        self.fs().freereg += n as u8;
+        Ok(())
+    }
+
+    /// A register past the live ones for a constant 5.1 reads straight from its operand field,
+    /// which benilla's op for that shape cannot: written and read by the next instruction alone.
+    fn scratch(&mut self) -> Reg {
+        let fs = self.fs();
+        let r = fs.freereg;
+        fs.maxstack = fs.maxstack.max(r + 1);
+        r
+    }
+
+    /// `freereg`: a temporary on top of the stack is released.
+    fn freereg(&mut self, reg: Rk) {
+        let fs = self.fs();
+        if !is_k(reg) && reg >= fs.nactvar as Rk {
+            fs.freereg -= 1;
+            debug_assert_eq!(reg, fs.freereg as Rk);
+        }
+    }
+
+    fn freeexp(&mut self, e: &Exp) {
+        if let Kind::NonReloc(r) = e.k {
+            self.freereg(r as Rk);
+        }
+    }
+
+    // ── constants ────────────────────────────────────────────────────────────────────────────
+
+    /// `addk`: a value's index in the constant table, added when new. Its keys are values, so
+    /// `-0` and `0` are one constant, the first seen.
+    fn addk(&mut self, key: KKey, v: Value) -> R<u32> {
+        if let Some(&i) = self.fsr().kmap.get(&key) {
+            return Ok(i);
+        }
+        if self.fsr().consts.len() >= MAXARG_BX {
+            // `luaM_growvector`'s `luaG_runerror`, which names no position from the compiler.
+            return Err(SyntaxError(b"constant table overflow".to_vec()));
+        }
+        let fs = self.fs();
+        fs.consts.push(v);
+        let i = (fs.consts.len() - 1) as u32;
+        fs.kmap.insert(key, i);
+        Ok(i)
+    }
+
+    pub(crate) fn string_k(&mut self, s: &[u8]) -> R<u32> {
+        let r = self.heap.intern(s);
+        self.addk(KKey::Str(r.id), Value::Str(r))
+    }
+
+    pub(crate) fn number_k(&mut self, n: f64) -> R<u32> {
+        let bits = if n == 0.0 { 0 } else { n.to_bits() };
+        self.addk(KKey::Num(bits), Value::Num(n))
+    }
+
+    fn bool_k(&mut self, b: bool) -> R<u32> {
+        self.addk(KKey::Bool(b), Value::Bool(b))
+    }
+
+    fn nil_k(&mut self) -> R<u32> {
+        self.addk(KKey::Nil, Value::Nil)
+    }
+
+    /// The constant `x` names, when it is a string: a field name, for the string-key ops.
+    fn str_k(&self, x: Rk) -> Option<u16> {
+        let fs = self.fsr();
+        (is_k(x) && fs.consts[(x - RK_CONST) as usize].as_str().is_some()).then(|| x - RK_CONST)
     }
 
     // ── expressions ──────────────────────────────────────────────────────────────────────────
 
-    /// The constant `x` names, when it is a string: a field name.
-    fn str_const(&self, x: Rk) -> Option<u16> {
-        (x >= RK_CONST && self.consts[(x - RK_CONST) as usize].as_str().is_some())
-            .then(|| x - RK_CONST)
-    }
-
-    /// `R(dst) = R(t)[RK(key)]`, as `GetField` when the key is a field name.
-    fn emit_get(&mut self, (dst, t, key): (Reg, Reg, Rk)) -> usize {
-        match self.str_const(key) {
-            Some(k) => self.emit(Op::GetField(dst, t, k)),
-            None => self.emit(Op::GetTable(dst, t, key)),
+    /// `luaK_nil`: registers `from..from + n` become nil, merged into a `LOADNIL` just before
+    /// when no jump lands between them.
+    ///
+    /// At the start of a function 5.1 emits nothing for registers no local holds yet, which
+    /// `luaD_precall` cleared. benilla's frames are not cleared, so the instruction is emitted
+    /// all the same, sized as no 5.1 instruction and given the next one's line: positions,
+    /// jumps and line hooks stay 5.1's.
+    pub(crate) fn nil(&mut self, from: Reg, n: u32) -> R<()> {
+        let to = (from as u32 + n - 1) as u8;
+        let fs = self.fsr();
+        if fs.cpc_next as i64 > fs.lasttarget {
+            if fs.cpc_next == 0 {
+                if from >= fs.nactvar {
+                    self.code(Op::LoadNil(from, to), 0)?;
+                    self.fs().silent_nils += 1;
+                    return Ok(());
+                }
+            } else if let Some(&Op::LoadNil(pfrom, pto)) = fs.code.last() {
+                if pfrom <= from && from as u32 <= pto as u32 + 1 {
+                    if to > pto {
+                        *self.fs().code.last_mut().unwrap() = Op::LoadNil(pfrom, to);
+                    }
+                    return Ok(());
+                }
+            }
         }
+        self.code(Op::LoadNil(from, to), 1)?;
+        Ok(())
     }
 
-    /// `R(t)[RK(key)] = RK(v)`, as `SetField` when the key is a field name.
-    fn emit_set(&mut self, (t, key, v): (Reg, Rk, Rk)) -> usize {
-        match self.str_const(key) {
-            Some(k) => self.emit(Op::SetField(t, k, v)),
-            None => self.emit(Op::SetTable(t, key, v)),
-        }
-    }
-
-    /// `x` in a register: a constant is loaded into a fresh one.
-    fn rk2reg(&mut self, x: Rk) -> R<Reg> {
-        if x < RK_CONST {
-            return Ok(x as Reg);
-        }
-        let r = self.reserve(1)?;
-        self.emit(Op::LoadK(r, (x - RK_CONST) as u32));
-        Ok(r)
-    }
-
-    fn exp2anyreg(&mut self, e: &Expr) -> R<u8> {
-        match e {
-            Expr::Local(id) => Ok(self.reg_of[*id as usize]),
-            Expr::Paren(inner) if matches!(**inner, Expr::Local(_)) => self.exp2anyreg(inner),
-            _ => {
-                let r = self.reserve(1)?;
-                self.exp2reg(e, r)?;
-                Ok(r)
+    /// `luaK_setreturns`: an open call keeps `nresults` values (-1: all).
+    pub(crate) fn setreturns(&mut self, e: &Exp, nresults: i32) {
+        if let Kind::Call(pc) = e.k {
+            if let Op::Call(_, _, c) = &mut self.fs().code[pc] {
+                *c = (nresults + 1) as u8;
             }
         }
     }
 
-    fn exp2rk(&mut self, e: &Expr) -> R<Rk> {
-        if let Some(k) = self.rk_const(e) {
-            return Ok(k);
+    pub(crate) fn setmultret(&mut self, e: &Exp) {
+        self.setreturns(e, -1);
+    }
+
+    /// `luaK_setoneret`: an open call's single value, in its base register.
+    pub(crate) fn setoneret(&mut self, e: &mut Exp) {
+        if let Kind::Call(pc) = e.k {
+            let Op::Call(a, ..) = self.fsr().code[pc] else {
+                unreachable!()
+            };
+            e.k = Kind::NonReloc(a);
+        }
+    }
+
+    /// `luaK_dischargevars`: a variable's value read into an instruction.
+    pub(crate) fn dischargevars(&mut self, e: &mut Exp) -> R<()> {
+        match e.k {
+            Kind::Local(r) => e.k = Kind::NonReloc(r),
+            Kind::Upval(u) => e.k = Kind::Reloc(self.code(Op::GetUpval(0, u), 1)?),
+            Kind::Global(k) => e.k = Kind::Reloc(self.code(Op::GetGlobal(0, k), 1)?),
+            Kind::Indexed(t, key) => {
+                self.freereg(key);
+                self.freereg(t as Rk);
+                let op = match self.str_k(key) {
+                    Some(k) => Op::GetField(0, t, k),
+                    None => Op::GetTable(0, t, key),
+                };
+                e.k = Kind::Reloc(self.code(op, 1)?);
+            }
+            Kind::Call(_) => self.setoneret(e),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn discharge2reg(&mut self, e: &mut Exp, reg: Reg) -> R<()> {
+        self.dischargevars(e)?;
+        match e.k {
+            Kind::Nil => self.nil(reg, 1)?,
+            Kind::False | Kind::True => {
+                self.code(Op::LoadBool(reg, e.k == Kind::True), 1)?;
+            }
+            Kind::K(k) => {
+                self.code(Op::LoadK(reg, k), 1)?;
+            }
+            Kind::KNum(n) => {
+                let k = self.number_k(n)?;
+                self.code(Op::LoadK(reg, k), 1)?;
+            }
+            Kind::Reloc(pc) => set_a(&mut self.fs().code[pc], reg),
+            Kind::NonReloc(r) => {
+                if r != reg {
+                    self.code(Op::Move(reg, r), 1)?;
+                }
+            }
+            _ => {
+                debug_assert!(matches!(e.k, Kind::Void | Kind::Jmp(_)));
+                return Ok(());
+            }
+        }
+        e.k = Kind::NonReloc(reg);
+        Ok(())
+    }
+
+    fn discharge2anyreg(&mut self, e: &mut Exp) -> R<()> {
+        if !matches!(e.k, Kind::NonReloc(_)) {
+            self.reserveregs(1)?;
+            let r = self.fsr().freereg - 1;
+            self.discharge2reg(e, r)?;
+        }
+        Ok(())
+    }
+
+    /// `code_label`: a `LOADBOOL`, which may be a jump target. 5.1's skip of the next
+    /// instruction is a jump of its own here, counted in 5.1's single word.
+    fn code_label(&mut self, a: Reg, b: bool, skip: bool) -> R<usize> {
+        self.getlabel();
+        let pc = self.code(Op::LoadBool(a, b), 1)?;
+        if skip {
+            self.code_raw(Op::Jmp(1), 0);
+        }
+        Ok(pc)
+    }
+
+    /// `exp2reg`: the value in `reg`, its true and false jumps resolved into it.
+    fn exp2reg(&mut self, e: &mut Exp, reg: Reg) -> R<()> {
+        self.discharge2reg(e, reg)?;
+        if let Kind::Jmp(pc) = e.k {
+            let mut t = e.t;
+            self.concat(&mut t, pc as i32)?;
+            e.t = t;
+        }
+        if e.has_jumps() {
+            let mut p_f = NO_JUMP as usize;
+            let mut p_t = NO_JUMP as usize;
+            if self.need_value(e.t) || self.need_value(e.f) {
+                let fj = if matches!(e.k, Kind::Jmp(_)) {
+                    NO_JUMP
+                } else {
+                    self.jump()?
+                };
+                p_f = self.code_label(reg, false, true)?;
+                p_t = self.code_label(reg, true, false)?;
+                self.patchtohere(fj)?;
+            }
+            let fin = self.getlabel();
+            self.patchlistaux(e.f, fin, reg, p_f)?;
+            self.patchlistaux(e.t, fin, reg, p_t)?;
+        }
+        e.f = NO_JUMP;
+        e.t = NO_JUMP;
+        e.k = Kind::NonReloc(reg);
+        Ok(())
+    }
+
+    /// `luaK_exp2nextreg`.
+    pub(crate) fn exp2nextreg(&mut self, e: &mut Exp) -> R<()> {
+        self.dischargevars(e)?;
+        self.freeexp(e);
+        self.reserveregs(1)?;
+        let r = self.fsr().freereg - 1;
+        self.exp2reg(e, r)
+    }
+
+    /// `luaK_exp2anyreg`.
+    pub(crate) fn exp2anyreg(&mut self, e: &mut Exp) -> R<Reg> {
+        self.dischargevars(e)?;
+        if let Kind::NonReloc(r) = e.k {
+            if !e.has_jumps() {
+                return Ok(r);
+            }
+            if r >= self.fsr().nactvar {
+                self.exp2reg(e, r)?;
+                return Ok(r);
+            }
+        }
+        self.exp2nextreg(e)?;
+        let Kind::NonReloc(r) = e.k else {
+            unreachable!()
+        };
+        Ok(r)
+    }
+
+    /// `luaK_exp2val`.
+    pub(crate) fn exp2val(&mut self, e: &mut Exp) -> R<()> {
+        if e.has_jumps() {
+            self.exp2anyreg(e)?;
+            Ok(())
+        } else {
+            self.dischargevars(e)
+        }
+    }
+
+    /// `luaK_exp2RK`: a constant among the first 256 as itself, anything else in a register.
+    pub(crate) fn exp2rk(&mut self, e: &mut Exp) -> R<Rk> {
+        self.exp2val(e)?;
+        match e.k {
+            Kind::KNum(_) | Kind::True | Kind::False | Kind::Nil => {
+                if self.fsr().consts.len() as u32 <= MAXINDEXRK {
+                    let k = match e.k {
+                        Kind::Nil => self.nil_k()?,
+                        Kind::KNum(n) => self.number_k(n)?,
+                        k => self.bool_k(k == Kind::True)?,
+                    };
+                    e.k = Kind::K(k);
+                    return Ok(k as Rk + RK_CONST);
+                }
+            }
+            Kind::K(k) if k <= MAXINDEXRK => return Ok(k as Rk + RK_CONST),
+            _ => {}
         }
         Ok(self.exp2anyreg(e)? as Rk)
     }
 
-    /// `e`'s value into `dst`; temporaries above `freereg` are freed again.
-    fn exp2reg(&mut self, e: &Expr, dst: u8) -> R<()> {
-        let save = self.freereg;
-        match e {
-            Expr::Nil => {
-                self.emit(Op::LoadNil(dst, dst));
+    /// `luaK_storevar`: `ex` stored into the variable `var`.
+    pub(crate) fn storevar(&mut self, var: &Exp, ex: &mut Exp) -> R<()> {
+        match var.k {
+            Kind::Local(r) => {
+                self.freeexp(ex);
+                return self.exp2reg(ex, r);
             }
-            Expr::True => {
-                self.emit(Op::LoadBool(dst, true));
+            Kind::Upval(u) => {
+                let e = self.exp2anyreg(ex)?;
+                self.code(Op::SetUpval(e, u), 1)?;
             }
-            Expr::False => {
-                self.emit(Op::LoadBool(dst, false));
+            Kind::Global(k) => {
+                let e = self.exp2anyreg(ex)?;
+                self.code(Op::SetGlobal(e, k), 1)?;
             }
-            Expr::Num(n) => {
-                let k = self.knum(*n);
-                self.emit(Op::LoadK(dst, k));
+            Kind::Indexed(t, key) => {
+                let e = self.exp2rk(ex)?;
+                self.code_settable(t, key, e)?;
             }
-            Expr::Str(s) => {
-                let k = self.kstr(s);
-                self.emit(Op::LoadK(dst, k));
-            }
-            Expr::Local(id) => {
-                let r = self.reg_of[*id as usize];
-                if r != dst {
-                    self.emit(Op::Move(dst, r));
-                }
-            }
-            Expr::Upval(i) => {
-                self.emit(Op::GetUpval(dst, *i));
-            }
-            Expr::Global(n) => {
-                let k = self.kstr(n);
-                self.emit(Op::GetGlobal(dst, k));
-            }
-            Expr::Index(o, k, line) => {
-                let ro = self.exp2anyreg(o)?;
-                let rk = self.exp2rk(k)?;
-                self.line = *line;
-                self.emit_get((dst, ro, rk));
-            }
-            Expr::Call(..) | Expr::Method(..) => {
-                // The top temporary is the call's own base: no move.
-                if dst + 1 == self.freereg && dst >= self.nactive {
-                    self.freereg = dst;
-                    self.call(e, 1)?;
-                } else {
-                    let base = self.call(e, 1)?;
-                    self.emit(Op::Move(dst, base));
-                }
-            }
-            Expr::Function(f) => self.closure(f, dst)?,
-            Expr::Table(fields) => self.constructor(fields, dst)?,
-            Expr::Paren(inner) => self.exp2reg(inner, dst)?,
-            Expr::Un(UnOp::Neg, inner, line) => {
-                if let Expr::Num(n) = **inner {
-                    // 5.0's `luaK_prefix` folds a negated numeral.
-                    let k = self.knum(-n);
-                    self.emit(Op::LoadK(dst, k));
-                } else {
-                    let r = self.exp2anyreg(inner)?;
-                    self.line = *line;
-                    self.emit(Op::Unm(dst, r));
-                }
-            }
-            Expr::Un(UnOp::Not, inner, line) => {
-                let r = self.exp2anyreg(inner)?;
-                self.line = *line;
-                self.emit(Op::Not(dst, r));
-            }
-            Expr::Bin(op, l, r, line) => match op {
-                BinOp::And | BinOp::Or => {
-                    self.exp2reg(l, dst)?;
-                    let j = self.emit(Op::JmpIf(dst, *op == BinOp::Or, 0));
-                    self.exp2reg(r, dst)?;
-                    self.patch_here(&[j]);
-                }
-                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                    let t = self.cond(e, true)?;
-                    self.emit(Op::LoadBool(dst, false));
-                    let j = self.jump();
-                    self.patch_here(&t);
-                    self.emit(Op::LoadBool(dst, true));
-                    self.patch_here(&[j]);
-                }
-                BinOp::Concat => {
-                    let mut parts = vec![&**l];
-                    let mut rest = &**r;
-                    while let Expr::Bin(BinOp::Concat, a, b, _) = rest {
-                        parts.push(a);
-                        rest = b;
-                    }
-                    parts.push(rest);
-                    let first = self.freereg;
-                    for p in parts {
-                        let reg = self.reserve(1)?;
-                        self.exp2reg(p, reg)?;
-                    }
-                    self.line = *line;
-                    self.emit(Op::Concat(dst, first, self.freereg - 1));
-                }
-                _ => {
-                    let rb = self.exp2rk(l)?;
-                    let rc = self.exp2rk(r)?;
-                    self.line = *line;
-                    let op = if *op == BinOp::Pow {
-                        Op::Pow(dst, rb, rc)
-                    } else {
-                        let k = |x: Rk| x - RK_CONST;
-                        let (kb, kc) = (rb >= RK_CONST, rc >= RK_CONST);
-                        let (rr, rk, kr): ArithOps = match op {
-                            BinOp::Add => (Op::Add, Op::AddK, Op::AddKR),
-                            BinOp::Sub => (Op::Sub, Op::SubK, Op::SubKR),
-                            BinOp::Mul => (Op::Mul, Op::MulK, Op::MulKR),
-                            _ => (Op::Div, Op::DivK, Op::DivKR),
-                        };
-                        match (kb, kc) {
-                            (false, false) => rr(dst, rb as Reg, rc as Reg),
-                            (false, true) => rk(dst, rb as Reg, k(rc)),
-                            (true, false) => kr(dst, k(rb), rc as Reg),
-                            // Two constants (5.0 folds none): the left one in a register.
-                            (true, true) => {
-                                let b = self.rk2reg(rb)?;
-                                rk(dst, b, k(rc))
-                            }
-                        }
-                    };
-                    self.emit(op);
-                }
-            },
+            _ => unreachable!("not a variable"),
         }
-        self.freereg = save;
+        self.freeexp(ex);
         Ok(())
     }
 
-    /// Code that jumps when `e`'s truth is `jump_when` and falls through otherwise; answers the
-    /// jumps to patch.
-    fn cond(&mut self, e: &Expr, jump_when: bool) -> R<Vec<usize>> {
-        match e {
-            Expr::Nil | Expr::False => Ok(if jump_when { vec![] } else { vec![self.jump()] }),
-            Expr::True | Expr::Num(_) | Expr::Str(_) => {
-                Ok(if jump_when { vec![self.jump()] } else { vec![] })
+    /// `OP_SETTABLE`, as `SetField` for a string constant key.
+    pub(crate) fn code_settable(&mut self, t: Reg, key: Rk, v: Rk) -> R<usize> {
+        let op = match self.str_k(key) {
+            Some(k) => Op::SetField(t, k, v),
+            None => Op::SetTable(t, key, v),
+        };
+        self.code(op, 1)
+    }
+
+    /// `luaK_self`: the method and its object in two fresh registers.
+    pub(crate) fn self_(&mut self, e: &mut Exp, key: &mut Exp) -> R<()> {
+        self.exp2anyreg(e)?;
+        self.freeexp(e);
+        let func = self.fsr().freereg;
+        self.reserveregs(2)?;
+        let Kind::NonReloc(obj) = e.k else {
+            unreachable!()
+        };
+        let rk = self.exp2rk(key)?;
+        let op = match self.str_k(rk) {
+            Some(k) => Op::SelfField(func, obj, k),
+            None => Op::SelfOp(func, obj, rk),
+        };
+        self.code(op, 1)?;
+        self.freeexp(key);
+        e.k = Kind::NonReloc(func);
+        Ok(())
+    }
+
+    /// `invertjump`: a comparison's sense flipped.
+    fn invertjump(&mut self, pc: usize) {
+        let op = &mut self.fs().code[pc];
+        *op = match *op {
+            Op::JmpCmp(cj, b, c, o) => Op::JmpCmp(CmpJ::new(cj.cmp(), !cj.cond()), b, c, o),
+            Op::JmpCmpK(cj, b, c, o) => Op::JmpCmpK(CmpJ::new(cj.cmp(), !cj.cond()), b, c, o),
+            Op::JmpCmpKR(cj, b, c, o) => Op::JmpCmpKR(CmpJ::new(cj.cmp(), !cj.cond()), b, c, o),
+            op => unreachable!("not a comparison: {op:?}"),
+        };
+    }
+
+    /// `jumponcond`: a jump taken when `e`'s truth is `cond`. A `not` just emitted is dropped
+    /// and its operand tested the other way.
+    fn jumponcond(&mut self, e: &mut Exp, cond: bool) -> R<i32> {
+        if let Kind::Reloc(pc) = e.k {
+            if let Op::Not(_, b) = self.fsr().code[pc] {
+                let fs = self.fs();
+                fs.code.pop();
+                fs.lines.pop();
+                fs.cpc_next = fs.cpc.pop().unwrap();
+                return Ok(self.code(Op::JmpIf(b, !cond, NO_JUMP), 2)? as i32);
             }
-            Expr::Un(UnOp::Not, inner, _) => self.cond(inner, !jump_when),
-            Expr::Paren(inner) => self.cond(inner, jump_when),
-            Expr::Bin(BinOp::And, a, b, _) => {
-                if jump_when {
-                    let skip = self.cond(a, false)?;
-                    let j = self.cond(b, true)?;
-                    self.patch_here(&skip);
-                    Ok(j)
-                } else {
-                    let mut j = self.cond(a, false)?;
-                    j.extend(self.cond(b, false)?);
-                    Ok(j)
-                }
+        }
+        self.discharge2anyreg(e)?;
+        self.freeexp(e);
+        let Kind::NonReloc(r) = e.k else {
+            unreachable!()
+        };
+        Ok(self.code(Op::TestSet(NO_REG, r, cond, NO_JUMP), 2)? as i32)
+    }
+
+    /// `luaK_goiftrue`: falls through when `e` is true, its false jumps kept.
+    pub(crate) fn goiftrue(&mut self, e: &mut Exp) -> R<()> {
+        self.dischargevars(e)?;
+        let pc = match e.k {
+            Kind::K(_) | Kind::KNum(_) | Kind::True => NO_JUMP,
+            Kind::Jmp(pc) => {
+                self.invertjump(pc);
+                pc as i32
             }
-            Expr::Bin(BinOp::Or, a, b, _) => {
-                if jump_when {
-                    let mut j = self.cond(a, true)?;
-                    j.extend(self.cond(b, true)?);
-                    Ok(j)
-                } else {
-                    let skip = self.cond(a, true)?;
-                    let j = self.cond(b, false)?;
-                    self.patch_here(&skip);
-                    Ok(j)
-                }
-            }
-            Expr::Bin(
-                op @ (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge),
-                l,
-                r,
-                line,
-            ) => {
-                let save = self.freereg;
-                let rb = self.exp2rk(l)?;
-                let rc = self.exp2rk(r)?;
-                let (cmp, swap, neg) = match op {
-                    BinOp::Eq => (Cmp::Eq, false, false),
-                    BinOp::Ne => (Cmp::Eq, false, true),
-                    BinOp::Lt => (Cmp::Lt, false, false),
-                    BinOp::Le => (Cmp::Le, false, false),
-                    BinOp::Gt => (Cmp::Lt, true, false),
-                    _ => (Cmp::Le, true, false),
+            _ => self.jumponcond(e, false)?,
+        };
+        let mut f = e.f;
+        self.concat(&mut f, pc)?;
+        e.f = f;
+        self.patchtohere(e.t)?;
+        e.t = NO_JUMP;
+        Ok(())
+    }
+
+    /// `luaK_goiffalse`.
+    fn goiffalse(&mut self, e: &mut Exp) -> R<()> {
+        self.dischargevars(e)?;
+        let pc = match e.k {
+            Kind::Nil | Kind::False => NO_JUMP,
+            Kind::Jmp(pc) => pc as i32,
+            _ => self.jumponcond(e, true)?,
+        };
+        let mut t = e.t;
+        self.concat(&mut t, pc)?;
+        e.t = t;
+        self.patchtohere(e.f)?;
+        e.f = NO_JUMP;
+        Ok(())
+    }
+
+    fn codenot(&mut self, e: &mut Exp) -> R<()> {
+        self.dischargevars(e)?;
+        match e.k {
+            Kind::Nil | Kind::False => e.k = Kind::True,
+            Kind::K(_) | Kind::KNum(_) | Kind::True => e.k = Kind::False,
+            Kind::Jmp(pc) => self.invertjump(pc),
+            Kind::Reloc(_) | Kind::NonReloc(_) => {
+                self.discharge2anyreg(e)?;
+                self.freeexp(e);
+                let Kind::NonReloc(r) = e.k else {
+                    unreachable!()
                 };
-                let (b, c) = if swap { (rc, rb) } else { (rb, rc) };
-                self.line = *line;
-                let cj = CmpJ::new(cmp, jump_when != neg);
-                let small = |x: Rk| x >= RK_CONST && x - RK_CONST < 256;
-                let op = match (b < RK_CONST, c < RK_CONST) {
-                    (true, false) if small(c) => Op::JmpCmpK(cj, b as Reg, (c - RK_CONST) as u8, 0),
-                    (false, true) if small(b) => {
-                        Op::JmpCmpKR(cj, (b - RK_CONST) as u8, c as Reg, 0)
-                    }
-                    _ => {
-                        let b = self.rk2reg(b)?;
-                        let c = self.rk2reg(c)?;
-                        Op::JmpCmp(cj, b, c, 0)
-                    }
-                };
-                let j = self.emit(op);
-                self.freereg = save;
-                Ok(vec![j])
+                e.k = Kind::Reloc(self.code(Op::Not(0, r), 1)?);
+            }
+            _ => unreachable!("cannot happen"),
+        }
+        std::mem::swap(&mut e.f, &mut e.t);
+        self.removevalues(e.f);
+        self.removevalues(e.t);
+        Ok(())
+    }
+
+    /// `luaK_indexed`: `t[k]`, `t` already in a register.
+    pub(crate) fn indexed(&mut self, t: &mut Exp, k: &mut Exp) -> R<()> {
+        let Kind::NonReloc(r) = t.k else {
+            unreachable!("the table is in a register")
+        };
+        let key = self.exp2rk(k)?;
+        t.k = Kind::Indexed(r, key);
+        Ok(())
+    }
+
+    /// `codearith`: folded when both are numerals, else the op for the operands' shapes.
+    fn codearith(&mut self, op: BinOpr, e1: &mut Exp, e2: &mut Exp) -> R<()> {
+        if let (Some(a), Some(b)) = (e1.is_numeral(), e2.is_numeral()) {
+            if let Some(r) = fold(op, a, b) {
+                e1.k = Kind::KNum(r);
+                return Ok(());
+            }
+        }
+        let o2 = self.exp2rk(e2)?;
+        let o1 = self.exp2rk(e1)?;
+        if o1 > o2 {
+            self.freeexp(e1);
+            self.freeexp(e2);
+        } else {
+            self.freeexp(e2);
+            self.freeexp(e1);
+        }
+        if op == BinOpr::Pow {
+            e1.k = Kind::Reloc(self.code(Op::Pow(0, o1, o2), 1)?);
+            return Ok(());
+        }
+        if op == BinOpr::Concat {
+            e1.k = Kind::Reloc(self.code(Op::Concat(0, o1 as Reg, o2 as Reg), 1)?);
+            return Ok(());
+        }
+        type Ops = (
+            fn(Reg, Reg, Reg) -> Op,
+            fn(Reg, Reg, u16) -> Op,
+            fn(Reg, u16, Reg) -> Op,
+        );
+        let (rr, rk, kr): Ops = match op {
+            BinOpr::Add => (Op::Add, Op::AddK, Op::AddKR),
+            BinOpr::Sub => (Op::Sub, Op::SubK, Op::SubKR),
+            BinOpr::Mul => (Op::Mul, Op::MulK, Op::MulKR),
+            _ => (Op::Div, Op::DivK, Op::DivKR),
+        };
+        let k = |x: Rk| x - RK_CONST;
+        let ins = match (is_k(o1), is_k(o2)) {
+            (false, false) => rr(0, o1 as Reg, o2 as Reg),
+            (false, true) => rk(0, o1 as Reg, k(o2)),
+            (true, false) => kr(0, k(o1), o2 as Reg),
+            (true, true) => {
+                let s = self.scratch();
+                self.code(Op::LoadK(s, k(o1) as u32), 0)?;
+                rk(0, s, k(o2))
+            }
+        };
+        e1.k = Kind::Reloc(self.code(ins, 1)?);
+        Ok(())
+    }
+
+    /// `codecomp`: a fused comparison and jump, `>` and `>=` swapped into `<` and `<=`.
+    fn codecomp(&mut self, cmp: Cmp, cond: bool, e1: &mut Exp, e2: &mut Exp) -> R<()> {
+        let mut o1 = self.exp2rk(e1)?;
+        let mut o2 = self.exp2rk(e2)?;
+        self.freeexp(e2);
+        self.freeexp(e1);
+        let mut cond = cond;
+        if !cond && cmp != Cmp::Eq {
+            std::mem::swap(&mut o1, &mut o2);
+            cond = true;
+        }
+        let cj = CmpJ::new(cmp, cond);
+        let k = |x: Rk| (x - RK_CONST) as u8;
+        let ins = match (is_k(o1), is_k(o2)) {
+            (false, false) => Op::JmpCmp(cj, o1 as Reg, o2 as Reg, NO_JUMP),
+            (false, true) => Op::JmpCmpK(cj, o1 as Reg, k(o2), NO_JUMP),
+            (true, false) => Op::JmpCmpKR(cj, k(o1), o2 as Reg, NO_JUMP),
+            (true, true) => {
+                let s = self.scratch();
+                self.code(Op::LoadK(s, k(o1) as u32), 0)?;
+                Op::JmpCmpK(cj, s, k(o2), NO_JUMP)
+            }
+        };
+        e1.k = Kind::Jmp(self.code(ins, 2)?);
+        Ok(())
+    }
+
+    /// `luaK_prefix`.
+    pub(crate) fn prefix(&mut self, op: UnOpr, e: &mut Exp) -> R<()> {
+        match op {
+            UnOpr::Minus => {
+                if let Some(n) = e.is_numeral() {
+                    e.k = Kind::KNum(-n);
+                    return Ok(());
+                }
+                let r = self.exp2anyreg(e)?;
+                self.freeexp(e);
+                e.k = Kind::Reloc(self.code(Op::Unm(0, r), 1)?);
+                Ok(())
+            }
+            UnOpr::Not => self.codenot(e),
+        }
+    }
+
+    /// `luaK_infix`: the left operand made ready before the right one is read.
+    pub(crate) fn infix(&mut self, op: BinOpr, v: &mut Exp) -> R<()> {
+        match op {
+            BinOpr::And => self.goiftrue(v),
+            BinOpr::Or => self.goiffalse(v),
+            BinOpr::Concat => self.exp2nextreg(v),
+            BinOpr::Add | BinOpr::Sub | BinOpr::Mul | BinOpr::Div | BinOpr::Pow => {
+                if v.is_numeral().is_none() {
+                    self.exp2rk(v)?;
+                }
+                Ok(())
             }
             _ => {
-                let save = self.freereg;
-                let r = self.exp2anyreg(e)?;
-                let j = self.emit(Op::JmpIf(r, jump_when, 0));
-                self.freereg = save;
-                Ok(vec![j])
+                self.exp2rk(v)?;
+                Ok(())
             }
         }
     }
 
-    fn closure(&mut self, f: &Func, dst: u8) -> R<()> {
-        self.named_closure(f, dst, None)
-    }
-
-    fn named_closure(&mut self, f: &Func, dst: u8, name: Option<Vec<u8>>) -> R<()> {
-        let key = self.child_key(name);
-        let proto = Fc::new(f, self.heap, &self.reg_of, key).run()?;
-        self.protos.push(proto);
-        self.emit(Op::Closure(dst, (self.protos.len() - 1) as u32));
-        Ok(())
-    }
-
-    /// 5.0's `constructor`: `NEWTABLE` sized by the hints, named fields stored as they come,
-    /// list items flushed every 32, in place, by `SETLIST`.
-    fn constructor(&mut self, fields: &[Field], dst: u8) -> R<()> {
-        // The table must sit below its pending items.
-        if dst >= self.freereg {
-            self.freereg = dst + 1;
-            self.maxstack = self.maxstack.max(self.freereg);
-        }
-        let na = fields
-            .iter()
-            .filter(|f| matches!(f, Field::Item(_)))
-            .count() as u32;
-        let nh = fields
-            .iter()
-            .filter(|f| matches!(f, Field::Named(..)))
-            .count() as u32;
-        let pc = self.emit(Op::NewTable(dst, 0, 0));
-        let items_base = self.freereg;
-        let mut pending = 0u32;
-        let mut stored = 0u32;
-        for (i, f) in fields.iter().enumerate() {
-            if pending as usize == FIELDS_PER_FLUSH {
-                self.emit(Op::SetList(dst, stored, pending as u16));
-                stored += pending;
-                pending = 0;
-                self.freereg = items_base;
+    /// `luaK_posfix`.
+    pub(crate) fn posfix(&mut self, op: BinOpr, e1: &mut Exp, e2: &mut Exp) -> R<()> {
+        match op {
+            BinOpr::And => {
+                debug_assert_eq!(e1.t, NO_JUMP);
+                self.dischargevars(e2)?;
+                let mut f = e2.f;
+                self.concat(&mut f, e1.f)?;
+                e2.f = f;
+                *e1 = *e2;
             }
-            match f {
-                Field::Item(e) => {
-                    if i + 1 == fields.len() && e.is_multi() {
-                        self.call(e, -1)?;
-                        self.emit(Op::SetListTop(dst, stored));
-                        self.freereg = items_base;
-                        pending = 0;
-                        continue;
+            BinOpr::Or => {
+                debug_assert_eq!(e1.f, NO_JUMP);
+                self.dischargevars(e2)?;
+                let mut t = e2.t;
+                self.concat(&mut t, e1.t)?;
+                e2.t = t;
+                *e1 = *e2;
+            }
+            BinOpr::Concat => {
+                self.exp2val(e2)?;
+                if let Kind::Reloc(pc) = e2.k {
+                    if let Op::Concat(_, b, _) = &mut self.fs().code[pc] {
+                        let Kind::NonReloc(r) = e1.k else {
+                            unreachable!()
+                        };
+                        debug_assert_eq!(r + 1, *b);
+                        *b = r;
+                        self.freeexp(e1);
+                        e1.k = Kind::Reloc(pc);
+                        return Ok(());
                     }
-                    let r = self.reserve(1)?;
-                    self.exp2reg(e, r)?;
-                    pending += 1;
                 }
-                Field::Named(k, v) => {
-                    let save = self.freereg;
-                    let kk = self.kstr(k);
-                    let rk = if (kk as usize) + (RK_CONST as usize) < u16::MAX as usize {
-                        kk as u16 + RK_CONST
-                    } else {
-                        self.exp2anyreg(&Expr::Str(k.clone()))? as Rk
-                    };
-                    let rv = self.exp2rk(v)?;
-                    self.emit_set((dst, rk, rv));
-                    self.freereg = save;
-                }
-                Field::Pair(k, v) => {
-                    let save = self.freereg;
-                    let rk = self.exp2rk(k)?;
-                    let rv = self.exp2rk(v)?;
-                    self.emit_set((dst, rk, rv));
-                    self.freereg = save;
-                }
+                self.exp2nextreg(e2)?;
+                self.codearith(op, e1, e2)?;
             }
+            BinOpr::Add | BinOpr::Sub | BinOpr::Mul | BinOpr::Div | BinOpr::Pow => {
+                self.codearith(op, e1, e2)?
+            }
+            BinOpr::Eq => self.codecomp(Cmp::Eq, true, e1, e2)?,
+            BinOpr::Ne => self.codecomp(Cmp::Eq, false, e1, e2)?,
+            BinOpr::Lt => self.codecomp(Cmp::Lt, true, e1, e2)?,
+            BinOpr::Le => self.codecomp(Cmp::Le, true, e1, e2)?,
+            BinOpr::Gt => self.codecomp(Cmp::Lt, false, e1, e2)?,
+            BinOpr::Ge => self.codecomp(Cmp::Le, false, e1, e2)?,
         }
-        if pending > 0 {
-            self.emit(Op::SetList(dst, stored, pending as u16));
-        }
-        self.freereg = items_base;
-        // 5.1's `OP_NEWTABLE`: both hints as floating point bytes; the array one is kept decoded.
-        self.code[pc] = Op::NewTable(dst, fb2int(int2fb(na)), int2fb(nh) as u8);
         Ok(())
+    }
+
+    /// `luaK_setlist`: list items `base + 1..` stored into the table at `base`, `nelems` of them
+    /// so far, the last `tostore` pending (-1: up to the top).
+    pub(crate) fn setlist(&mut self, base: Reg, nelems: u32, tostore: i32) -> R<()> {
+        let c = (nelems - 1) / FIELDS_PER_FLUSH + 1;
+        let first = (c - 1) * FIELDS_PER_FLUSH;
+        let words = if c <= MAXARG_C { 1 } else { 2 };
+        let op = if tostore < 0 {
+            Op::SetListTop(base, first)
+        } else {
+            Op::SetList(base, first, tostore as u16)
+        };
+        self.code(op, words)?;
+        self.fs().freereg = base + 1;
+        Ok(())
+    }
+
+    // ── functions ────────────────────────────────────────────────────────────────────────────
+
+    /// `registerlocalvar`: a declaration, not yet in scope.
+    pub(crate) fn registerlocalvar(&mut self, name: &[u8]) -> R<u16> {
+        if self.fsr().locvars.len() >= MAX_LOCVARS {
+            // `luaM_growvector`'s `luaG_runerror`.
+            return Err(SyntaxError(b"too many local variables".to_vec()));
+        }
+        let fs = self.fs();
+        fs.locvars.push(LocVar {
+            name: Rc::from(name),
+            reg: 0,
+            startpc: 0,
+            endpc: 0,
+        });
+        Ok((fs.locvars.len() - 1) as u16)
+    }
+
+    /// `pushclosure`: the finished function as a closure of this one.
+    pub(crate) fn pushclosure(&mut self, p: Proto) -> R<Exp> {
+        if self.fsr().protos.len() >= MAXARG_BX {
+            return Err(SyntaxError(b"constant table overflow".to_vec()));
+        }
+        // 5.1 follows `CLOSURE` with a pseudo-instruction per upvalue.
+        let words = 1 + p.upvals.len() as u32;
+        let fs = self.fs();
+        fs.protos.push(Rc::new(p));
+        let idx = (fs.protos.len() - 1) as u32;
+        Ok(Exp::new(Kind::Reloc(
+            self.code(Op::Closure(0, idx), words)?,
+        )))
     }
 }
 

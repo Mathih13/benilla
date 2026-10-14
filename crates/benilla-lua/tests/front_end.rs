@@ -1,6 +1,8 @@
-//! The front end against the VM benilla runs today: every Lua chunk in the addon corpus and the
-//! install's interface files, compiled by both. The fork is 5.1's lexer under a 5.0 grammar, so
-//! the two may disagree only where 5.0's lexer differs; every disagreement is printed.
+//! The front end against the script host's C Lua: every Lua chunk in the addon corpus and the
+//! install's interface files, compiled by both. A chunk compiles in both or fails in both with
+//! the same message, and a compiled chunk has, function by function, the C build's constants in
+//! its order, its register count, parameters, locals, upvalues and line numbers: the code
+//! generator allocated as 5.1's does. Every disagreement is printed.
 
 use std::path::{Path, PathBuf};
 
@@ -117,6 +119,165 @@ fn chain_chunks(out: &mut Vec<Chunk>) -> bool {
     true
 }
 
+/// One function of a 5.1 `string.dump`, the parts benilla's compiler must match.
+#[derive(Debug, PartialEq)]
+struct Shape {
+    linedefined: u32,
+    nups: u8,
+    numparams: u8,
+    vararg: bool,
+    maxstack: u8,
+    /// Each instruction's line, runs of one line taken as one: 5.1 spends two instructions on
+    /// a test benilla fuses into one.
+    lines: Vec<u32>,
+    consts: Vec<String>,
+    locals: Vec<String>,
+    upvals: Vec<String>,
+    protos: Vec<Shape>,
+}
+
+/// 5.1's `lundump.c` over a dump from this platform (little-endian, 4-byte int, 8-byte size_t).
+struct Undump<'a>(&'a [u8]);
+
+impl Undump<'_> {
+    fn take(&mut self, n: usize) -> &[u8] {
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        a
+    }
+    fn byte(&mut self) -> u8 {
+        self.take(1)[0]
+    }
+    fn int(&mut self) -> u32 {
+        u32::from_le_bytes(self.take(4).try_into().unwrap())
+    }
+    fn string(&mut self) -> String {
+        let n = u64::from_le_bytes(self.take(8).try_into().unwrap()) as usize;
+        let b = self.take(n);
+        String::from_utf8_lossy(&b[..n.saturating_sub(1)]).into_owned()
+    }
+    fn function(&mut self) -> Shape {
+        self.string();
+        let linedefined = self.int();
+        self.int();
+        let (nups, numparams, vararg, maxstack) =
+            (self.byte(), self.byte(), self.byte(), self.byte());
+        let ncode = self.int() as usize;
+        let code: Vec<u32> = (0..ncode).map(|_| self.int()).collect();
+        let consts = (0..self.int())
+            .map(|_| match self.byte() {
+                0 => "nil".to_string(),
+                1 => format!("{}", self.byte() != 0),
+                3 => format!("{:?}", f64::from_le_bytes(self.take(8).try_into().unwrap())),
+                _ => format!("{:?}", self.string()),
+            })
+            .collect();
+        let protos: Vec<Shape> = (0..self.int()).map(|_| self.function()).collect();
+        let nlines = self.int() as usize;
+        let all: Vec<u32> = (0..nlines).map(|_| self.int()).collect();
+        // `CLOSURE`'s pseudo-instructions, one per upvalue, are not instructions here.
+        let mut lines = Vec::new();
+        let mut pc = 0;
+        while pc < nlines {
+            lines.push(all[pc]);
+            let i = code[pc];
+            pc += 1;
+            if i & 0x3F == 36 {
+                pc += protos[(i >> 14) as usize].nups as usize;
+            }
+        }
+        lines.dedup();
+        let locals = (0..self.int())
+            .map(|_| {
+                let n = self.string();
+                self.int();
+                self.int();
+                n
+            })
+            .collect();
+        let upvals = (0..self.int()).map(|_| self.string()).collect();
+        Shape {
+            linedefined,
+            nups,
+            numparams,
+            // `VARARG_HASARG`: the function declares `arg`.
+            vararg: vararg & 1 != 0,
+            maxstack,
+            lines,
+            consts,
+            locals,
+            upvals,
+            protos,
+        }
+    }
+}
+
+fn c_shape(dump: &[u8]) -> Shape {
+    let mut u = Undump(dump);
+    u.take(12);
+    u.function()
+}
+
+fn our_shape(p: &benilla_lua::proto::Proto, heap: &benilla_lua::heap::Heap) -> Shape {
+    use benilla_lua::value::V;
+    Shape {
+        linedefined: p.line_defined,
+        nups: p.upvals.len() as u8,
+        numparams: p.nparams,
+        vararg: p.vararg,
+        maxstack: (p.maxstack - 1) as u8,
+        lines: {
+            let mut l = p.lines.clone();
+            l.dedup();
+            l
+        },
+        consts: p
+            .consts
+            .iter()
+            .map(|v| match v.unpack() {
+                V::Nil => "nil".to_string(),
+                V::Bool(b) => format!("{b}"),
+                V::Num(n) => format!("{n:?}"),
+                V::Str(s) => format!("{:?}", String::from_utf8_lossy(heap.str(s))),
+                v => panic!("constant {v:?}"),
+            })
+            .collect(),
+        locals: p
+            .locvars
+            .iter()
+            .map(|l| String::from_utf8_lossy(&l.name).into_owned())
+            .collect(),
+        upvals: p
+            .upval_names
+            .iter()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect(),
+        protos: p.protos.iter().map(|q| our_shape(q, heap)).collect(),
+    }
+}
+
+/// The first difference between two shapes, by path.
+fn shape_diff(a: &Shape, b: &Shape, path: &str) -> Option<String> {
+    if a.protos.len() == b.protos.len() {
+        for (i, (x, y)) in a.protos.iter().zip(&b.protos).enumerate() {
+            if let Some(d) = shape_diff(x, y, &format!("{path}/{i}")) {
+                return Some(d);
+            }
+        }
+    }
+    let strip = |s: &Shape| Shape {
+        protos: Vec::new(),
+        lines: s.lines.clone(),
+        consts: s.consts.clone(),
+        locals: s.locals.clone(),
+        upvals: s.upvals.clone(),
+        ..*s
+    };
+    let (x, y) = (strip(a), strip(b));
+    (x != y || a.protos.len() != b.protos.len())
+        .then(|| format!("function {path}\n    ours: {x:?}\n    fork: {y:?}"))
+}
+
 #[test]
 fn every_chunk_compiles_as_the_fork_compiles_it() {
     let mut chunks = Vec::new();
@@ -129,12 +290,22 @@ fn every_chunk_compiles_as_the_fork_compiles_it() {
     let lua = mlua::Lua::new();
     let (mut both_ok, mut both_err, mut ours_only, mut fork_only) = (0, 0, Vec::new(), Vec::new());
     let mut msg_diff = Vec::new();
+    let mut shape_diff_list = Vec::new();
+    let mut heap = benilla_lua::heap::Heap::default();
     for c in &chunks {
         let chunkname = format!("@{}", c.name);
-        let ours = benilla_lua::parse(&c.bytes, chunkname.as_bytes());
+        let ours = benilla_lua::check(&c.bytes, chunkname.as_bytes());
         let fork = lua.load(&c.bytes[..]).set_name(&chunkname).into_function();
         match (ours, fork) {
-            (Ok(_), Ok(_)) => both_ok += 1,
+            (Ok(_), Ok(f)) => {
+                both_ok += 1;
+                let p = benilla_lua::compile::compile(&c.bytes, chunkname.as_bytes(), &mut heap, 0)
+                    .unwrap();
+                let fork_shape = c_shape(&f.dump(false));
+                if let Some(d) = shape_diff(&our_shape(&p, &heap), &fork_shape, "") {
+                    shape_diff_list.push(format!("{}: {d}", c.name));
+                }
+            }
             (Err(a), Err(b)) => {
                 both_err += 1;
                 let b = match b {
@@ -164,8 +335,15 @@ fn every_chunk_compiles_as_the_fork_compiles_it() {
     for l in msg_diff.iter().take(40) {
         println!("MESSAGE  {l}");
     }
+    println!("{} compiled chunks differ in shape", shape_diff_list.len());
+    for l in shape_diff_list.iter().take(20) {
+        println!("SHAPE  {l}");
+    }
     assert!(
-        ours_only.is_empty() && fork_only.is_empty(),
+        ours_only.is_empty()
+            && fork_only.is_empty()
+            && msg_diff.is_empty()
+            && shape_diff_list.is_empty(),
         "the two front ends disagree"
     );
 }

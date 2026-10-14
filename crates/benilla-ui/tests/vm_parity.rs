@@ -280,6 +280,81 @@ b]])"#),
           else table.insert(o, lib .. "=" .. type(t)) end
         end
         return table.concat(o, " ")"#),
+    // ── fix-front: the single-pass front end, 5.1.5's `lparser.c` and `lcode.c` ──
+    ("fix-front_register_reuse", r#"local function L(src) local f, e = loadstring(src) if not f then return e end local ok, r = pcall(f) return tostring(r) end
+        local p = {} for i = 1, 250 do p[i] = "x" end
+        local q = {} for i = 1, 400 do q[i] = "a*0.25" end
+        local locs = {} for i = 1, 190 do locs[i] = "l" .. i end
+        return S(L("local x = 1 return " .. table.concat(p, "+")),
+          L("local t = {} t.a = t return t" .. string.rep(".a", 300) .. " == t"),
+          L("local a = 4 local x = " .. table.concat(q, " + ") .. " return x"),
+          L("local " .. table.concat(locs, ",") .. " local t = {} t.x = t return t" .. string.rep(".x", 59) .. " == t"),
+          L("local x = 1 return " .. string.rep("(x+", 150) .. "x" .. string.rep(")", 150)),
+          L("local x = 1 return " .. string.rep("(x+", 245) .. "x" .. string.rep(")", 245)),
+          L("return " .. string.rep("1 .. ", 190) .. "1"))"#),
+    ("fix-front_local_limits", r#"local function L(src) local f, e = loadstring(src) if f then return "ok" end return e end
+        local function names(p, n) local o = {} for i = 1, n do o[i] = p .. i end return table.concat(o, ",") end
+        return S(L("local " .. names("a", 200)), L("local " .. names("a", 201)),
+          L("\nfunction f(" .. names("p", 200) .. ") end"), L("function f(" .. names("p", 201) .. ") end"),
+          L("function f(" .. names("p", 199) .. ", ...) end"), L("function f(" .. names("p", 200) .. ", ...) end"),
+          L("function f(a) local " .. names("b", 199) .. " end"), L("\n\nlocal x = function(a) local " .. names("b", 200) .. " end"),
+          L("for " .. names("k", 197) .. " in x do end"), L("for " .. names("k", 198) .. " in x do end"),
+          L("local function g() " .. string.rep("do local a end ", 10) .. "end"))"#),
+    ("fix-front_upvalue_limits", r#"local function L(src) local f, e = loadstring(src) if f then return "ok" end return e end
+        local function names(n) local o = {} for i = 1, n do o[i] = "u" .. i end return table.concat(o, ",") end
+        return S(L("local " .. names(60) .. "\nreturn function() return " .. names(60) .. " end"),
+          L("local " .. names(61) .. "\nreturn function() return " .. names(61) .. " end"),
+          L("local " .. names(61) .. " return function() return function() return " .. names(61) .. " end end"))"#),
+    ("fix-front_syntax_levels", r#"local function first_failing(make)
+          for n = 1, 400 do
+            local f, e = loadstring(make(n))
+            if not f then return n .. " " .. e end
+          end
+          return "none"
+        end
+        local parens = function(n) return "return " .. string.rep("(", n) .. "1" .. string.rep(")", n) end
+        local nots = function(n) return "return " .. string.rep("not ", n) .. "1" end
+        local concat = function(n) return "return " .. string.rep("1 .. ", n) .. "1" end
+        local blocks = function(n) return string.rep("do ", n) .. string.rep("end ", n) end
+        local funcs = function(n) return string.rep("function f() ", n) .. string.rep("end ", n) end
+        local tables = function(n) return "return " .. string.rep("{", n) .. string.rep("}", n) end
+        local assign = function(n) local o = {} for i = 1, n do o[i] = "a" .. i end return table.concat(o, ",") .. " = 1" end
+        local nested = {}
+        pcall(function() nested[1] = first_failing(parens) end)
+        return S(first_failing(parens), first_failing(nots), first_failing(concat), first_failing(blocks),
+          first_failing(funcs), first_failing(tables), first_failing(assign), nested[1])"#),
+    ("fix-front_register_limits", r#"local function first_failing(make)
+          for n = 200, 260 do
+            local f, e = loadstring(make(n))
+            if not f then return n .. " " .. e end
+          end
+          return "none"
+        end
+        local function args(n) local o = {} for i = 1, n do o[i] = "1" end return table.concat(o, ",") end
+        return S(first_failing(function(n) return "f(" .. args(n) .. ")" end),
+          first_failing(function(n) return "local a, b, c = 1\nreturn f(" .. args(n) .. ")" end),
+          first_failing(function(n) return "return {" .. args(n) .. "}" end),
+          first_failing(function(n) return "local t = {" .. args(n) .. "}" end),
+          first_failing(function(n) return "x = f(" .. args(n) .. ") $" end))"#),
+    ("fix-front_code_limits", r#"local function L(src) local f, e = loadstring(src) if f then return "ok" end return e end
+        local function list(n) local o = {} for i = 1, n do o[i] = i end return table.concat(o, ",") end
+        local function stats(n) return "local a if a then\n" .. string.rep("a=1 ", n) .. "\nend" end
+        return S(L("local t = {" .. list(262143) .. "}"), L("local t = {" .. list(262144) .. "}"),
+          L(stats(131070)), L(stats(131071)), L(stats(131072)),
+          L("local a while a do\n" .. string.rep("a=1 ", 131072) .. "\nend"))"#),
+    ("fix-front_negative_zero", r#"local function R(src) return S(loadstring(src)()) end
+        return table.concat({R("return -0, 1/0"), R("local x = 1/0 return -0, x, 1/0"), R("local a = 0 local b = -0 return 1/b"),
+          R("return -0, 5, 1/0, 0"), R("return 1/0, -0"),
+          R("return 0 * -1, 1/(0 * -1), -0 == 0"), R("local x = -0 return x, 1/x"),
+          R("return 2^0.5, 2 - 3, 1/3, 0/0 ~= 0/0, 1e308 * 10")}, " | ")"#),
+    ("fix-front_negative_zero_main", "return S(-0, 1/0)"),
+    ("fix-front_negative_zero_local", "local x = 1/0 return S(-0, x, 1/0)"),
+    ("fix-front_constants_and_folding", r#"local function R(src) return S(loadstring(src)()) end
+        return table.concat({R("return 1 + 2 * 3 - 4 / 2, 2^10, -(-3), - - 2, 10 / 0 > 1, 3 .. 4"),
+          R("local a = 5 return a + 1 * 2, 2 * a, a / 2, 1 - a, a ^ 2, -a"),
+          R("local a = {} return (1 < 2), (2 <= 1), (1 == 1), not nil, not 1, nil and 1, false or nil, 1 and 2 or 3"),
+          R("local t = {} t[1], t[2] = 1, 2 local a, b = t[1], t[2] a, b = b, a return a, b"),
+          R("local a, b, c = (function() return 1, 2, 3 end)() return a, b, c")}, " | ")"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

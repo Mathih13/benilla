@@ -111,3 +111,26 @@ fn a_reload_then_a_snapshot_restore_goes_back_to_the_old_code() {
     vm = before;
     assert_eq!(run(&mut vm, "return MyAddon.Double(1)"), "2");
 }
+
+#[test]
+fn an_edit_above_a_function_moves_its_lines_and_keeps_its_key() {
+    let mut vm = benilla_lua::new_state();
+    vm.exec(V1.as_bytes(), NAME).unwrap();
+    let moved = format!("-- a header\n-- grown by three lines\n\n{V2}");
+    let report = vm.hot_reload(NAME, moved.as_bytes()).unwrap();
+    assert!(
+        report.reshaped.is_empty() && report.added.is_empty() && report.removed.is_empty(),
+        "{report:#?}"
+    );
+    assert_eq!(report.swapped.len(), 4, "{report:#?}");
+    assert_eq!(run(&mut vm, "return Handlers[1]('A')"), "NEW v1:A:1");
+    assert_eq!(run(&mut vm, "return MyAddon.Double(5)"), "15");
+    // The swapped code reports its new lines.
+    let line = moved
+        .lines()
+        .position(|l| l.contains("self.count = self.count + 1"))
+        .unwrap()
+        + 1;
+    let err = run(&mut vm, "return MyAddon.OnEvent(nil, 'B')");
+    assert!(err.contains(&format!("MyAddon.lua:{line}:")), "{err}");
+}

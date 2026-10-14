@@ -98,7 +98,7 @@ pub struct Token {
     pub num: f64,
 }
 
-/// A compile error, rendered as 5.0's `luaX_errorline` does: `chunkid:line: msg near `tok'`.
+/// A compile error, rendered as 5.1's `luaX_lexerror` does: `chunkid:line: msg near `tok'`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyntaxError(pub Vec<u8>);
 
@@ -178,13 +178,16 @@ impl<'a> Lexer<'a> {
         Ok(self.ahead.as_ref().unwrap().tok)
     }
 
-    fn error_at(&self, msg: &[u8], near: &[u8]) -> SyntaxError {
+    /// `luaX_lexerror`: `chunkid:line: msg`, then ` near `tok'` unless `near` is `None`.
+    fn error_at(&self, msg: &[u8], near: Option<&[u8]>) -> SyntaxError {
         let mut out = self.chunk.clone();
         out.extend_from_slice(format!(":{}: ", self.line).as_bytes());
         out.extend_from_slice(msg);
-        out.extend_from_slice(b" near `");
-        out.extend_from_slice(near);
-        out.push(b'\'');
+        if let Some(near) = near {
+            out.extend_from_slice(b" near `");
+            out.extend_from_slice(near);
+            out.push(b'\'');
+        }
         SyntaxError(out)
     }
 
@@ -195,15 +198,20 @@ impl<'a> Lexer<'a> {
             Tok::String | Tok::Number => self.buff.clone(),
             t => t.text(),
         };
-        self.error_at(msg.as_bytes(), &near)
+        self.error_at(msg.as_bytes(), Some(&near))
+    }
+
+    /// `luaX_lexerror(ls, msg, 0)`: the position and the message, no token.
+    pub fn error_plain(&self, msg: &str) -> SyntaxError {
+        self.error_at(msg.as_bytes(), None)
     }
 
     /// `luaX_lexerror`: an end of input names `<eof>`, anything else quotes the buffer.
     fn lex_error(&self, msg: &str, eof: bool) -> SyntaxError {
         if eof {
-            self.error_at(msg.as_bytes(), b"<eof>")
+            self.error_at(msg.as_bytes(), Some(b"<eof>"))
         } else {
-            self.error_at(msg.as_bytes(), &self.buff)
+            self.error_at(msg.as_bytes(), Some(&self.buff))
         }
     }
 

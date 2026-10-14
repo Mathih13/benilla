@@ -299,9 +299,9 @@ pub fn chunkid(source: &[u8]) -> Vec<u8> {
     chunkid_n(source, 80)
 }
 
-/// Parse a chunk, or answer the client's own syntax error.
-pub fn parse(src: &[u8], chunkname: &[u8]) -> Result<ast::Func, SyntaxError> {
-    parse::parse(src, chunkname)
+/// Compile a chunk and drop it, or answer the client's own syntax error.
+pub fn check(src: &[u8], chunkname: &[u8]) -> Result<(), SyntaxError> {
+    compile::compile(src, chunkname, &mut heap::Heap::default(), 0).map(|_| ())
 }
 
 #[cfg(test)]
@@ -309,7 +309,7 @@ mod tests {
     use super::*;
 
     fn err(src: &str) -> String {
-        parse(src.as_bytes(), b"=t").unwrap_err().to_string()
+        check(src.as_bytes(), b"=t").unwrap_err().to_string()
     }
 
     /// The lexer's and parser's messages, as `tests/vm_parity.golden` in benilla-ui records them.
@@ -353,15 +353,14 @@ mod tests {
     /// 5.1's lexer with level-0 nesting: `\r` ends lines, `[=[` has levels, `0x10` is sixteen.
     #[test]
     fn the_lexer_is_the_script_hosts() {
+        // The string constant a chunk returns.
         let one = |src: &[u8]| -> Vec<u8> {
-            let f = parse(src, b"=t").unwrap();
-            match &f.body.stats[0] {
-                ast::Stat::Return { exprs } => match &exprs[0] {
-                    ast::Expr::Str(s) => s.to_vec(),
-                    e => panic!("{e:?}"),
-                },
-                s => panic!("{s:?}"),
-            }
+            let mut heap = heap::Heap::default();
+            let p = compile::compile(src, b"=t", &mut heap, 0).unwrap();
+            let value::V::Str(s) = p.consts[0].unpack() else {
+                panic!("{:?}", p.consts)
+            };
+            heap.str(s).to_vec()
         };
         assert_eq!(
             one(b"return [[a\r\nb]]"),
@@ -371,7 +370,7 @@ mod tests {
         assert_eq!(one(b"return [[a [[b]] c]]"), b"a [[b]] c");
         assert_eq!(one(b"return [=[a]]b]=]"), b"a]]b");
         assert_eq!(err("x = 'a\rb'"), "t:1: unfinished string near `'a'");
-        assert!(parse(b"x = 0x10", b"=t").is_ok());
+        assert!(check(b"x = 0x10", b"=t").is_ok());
         assert_eq!(err("x = 1\ry = +"), "t:2: unexpected symbol near `+'");
         assert_eq!(err("x = 1\r\ny = +"), "t:2: unexpected symbol near `+'");
     }

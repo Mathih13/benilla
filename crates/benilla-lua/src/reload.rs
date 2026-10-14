@@ -42,8 +42,7 @@ impl Vm {
     /// Compile `src` as the chunk `chunkname` and swap each of its functions into the live
     /// closures of the same function. A syntax error leaves everything as it was.
     pub fn hot_reload(&mut self, chunkname: &[u8], src: &[u8]) -> Result<Report, SyntaxError> {
-        let ast = crate::parse::parse(src, chunkname)?;
-        let root = crate::compile::compile(&ast, &mut self.heap)?;
+        let root = crate::compile::compile(src, chunkname, &mut self.heap, 0)?;
         let mut fresh = HashMap::new();
         walk(&root, &mut fresh);
         let mut report = Report::default();

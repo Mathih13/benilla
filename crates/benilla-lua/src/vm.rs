@@ -375,8 +375,7 @@ impl Vm {
 
     /// Compile a chunk into a function over the globals.
     pub fn load(&mut self, src: &[u8], chunkname: &[u8]) -> Result<Value, crate::SyntaxError> {
-        let ast = crate::parse::parse(src, chunkname)?;
-        let proto = crate::compile::compile(&ast, &mut self.heap)?;
+        let proto = crate::compile::compile(src, chunkname, &mut self.heap, self.c_depth)?;
         let env = self.globals;
         let shape = crate::heap::Shape::of(&proto);
         Ok(Value::Func(self.heap.new_func(FuncObj::Lua {
@@ -2060,6 +2059,14 @@ impl Vm {
                     Op::JmpIf(a, cond, off) => {
                         if r!(a).truthy() == cond {
                             jump!(off);
+                        }
+                    }
+                    Op::TestSet(a, b, cond, off) => {
+                        let v = r!(b);
+                        if v.truthy() == cond {
+                            r!(a) = v;
+                            // SAFETY: as `jump!`; a value's test jumps forward, never a back edge.
+                            ip = unsafe { ip.offset(off as isize) };
                         }
                     }
                     Op::Call(a, b, c) => {
