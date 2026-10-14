@@ -377,6 +377,7 @@ b]])"#),
     // ── fix-libs: the library fixes, each blessed on the C build ──
     ("fix-libs bit_mod_overflow", "return S(E(bit.mod, -2^31, -1), E(bit.mod, 2^31, -1), E(bit.mod, 7, -1), E(bit.mod, -7, 2), E(bit.mod, 0/0, -1), E(bit.mod, 1/0, -1), E(bit.lshift, 1, 31), E(bit.arshift, -2^31, 31))"),
     ("fix-libs rep_format_sizes", r#"return S(string.rep("ab", 3), string.rep("", 1000000), string.rep("x", -1), string.rep("x", 0/0), E(string.format, "%123d", 1), E(string.format, "%1.123f", 1), string.format("%99d", 1) == string.rep(" ", 98) .. "1", string.len(string.format("%.99f", 1)), string.format("%-5c|%5s|%.1q", 65, "ab", "x"), table.concat({"a", 1, "b"}, string.rep("-", 3)), (gsub("abc", "%w", "%0%0%0")))"#),
+    ("fix-libs deep_match", r#"local n = 3000 local s, p = string.rep("a", n), string.rep("a?", n) local t = {} for w in string.gfind(s, string.rep("(a)?", 30)) do table.insert(t, w) end return S(E(string.find, s, p), E(string.gsub, s, p, "x"), table.getn(t), E(string.find, s, string.rep("a-", 500) .. "$"))"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

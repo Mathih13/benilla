@@ -348,6 +348,13 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
 // ── the matcher ──────────────────────────────────────────────────────────────────────────────
 
 const MAX_CAPTURES: usize = 32;
+
+/// The matcher's recursion bound: a level per pattern item (a quantified single, a capture) the
+/// match is inside, so a real pattern stays far below it. Deviation: 5.1's `match` recurses
+/// without a bound and overflows the C stack (near 32000 levels on 8 MB); this raises 5.2's
+/// `pattern too complex` instead. A dev build overflows a 2 MB thread near 14500 levels under
+/// the deepest native nesting the VM allows; this keeps a third of that spare.
+const MAX_MATCH_DEPTH: u32 = 10_000;
 const CAP_UNFINISHED: isize = -1;
 const CAP_POSITION: isize = -2;
 const SPECIALS: &[u8] = b"^$*+?.([%-";
@@ -358,6 +365,8 @@ struct MatchState<'a> {
     pat: &'a [u8],
     level: usize,
     capture: [(usize, isize); MAX_CAPTURES],
+    /// Recursion left before `pattern too complex`.
+    depth: u32,
 }
 
 /// A matcher error: the message `luaL_error` raises.
@@ -464,7 +473,18 @@ impl MatchState<'_> {
         }
     }
 
+    /// `do_match` within the recursion bound.
     fn do_match(&mut self, s: usize, p: usize) -> M<Option<usize>> {
+        if self.depth == 0 {
+            return Err(PatErr("pattern too complex"));
+        }
+        self.depth -= 1;
+        let r = self.match_level(s, p);
+        self.depth += 1;
+        r
+    }
+
+    fn match_level(&mut self, s: usize, p: usize) -> M<Option<usize>> {
         let (mut s, mut p) = (s, p);
         loop {
             match self.p(p) {
@@ -704,6 +724,7 @@ fn new_state<'a>(src: &'a [u8], pat: &'a [u8]) -> MatchState<'a> {
         pat,
         level: 0,
         capture: [(0, 0); MAX_CAPTURES],
+        depth: MAX_MATCH_DEPTH,
     }
 }
 
