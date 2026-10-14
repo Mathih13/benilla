@@ -472,6 +472,22 @@ impl Table {
         self.resize(n as usize, (totaluse - na) as usize);
     }
 
+    /// `OP_SETLIST`'s growth: an array part short of `last` slots is resized to `last` by 5.1's
+    /// `luaH_resizearray`, the hash part kept at its size and rebuilt.
+    #[inline]
+    pub fn grow_array(&mut self, last: usize) {
+        if last > self.array.len() {
+            self.resize_array(last);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn resize_array(&mut self, nasize: usize) {
+        let nsize = if self.dummy { 0 } else { self.sizenode() };
+        self.resize(nasize, nsize);
+    }
+
     /// 5.1's `resize`.
     fn resize(&mut self, nasize: usize, nhsize: usize) {
         self.hint_key.set(Value::Nil);

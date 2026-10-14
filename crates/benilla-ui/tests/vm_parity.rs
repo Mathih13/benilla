@@ -281,6 +281,14 @@ b]])"#),
         end
         return table.concat(o, " ")"#),
     // ── fix-front: the single-pass front end, 5.1.5's `lparser.c` and `lcode.c` ──
+    ("fix-front_setlist_order", r#"local function K(t) local o = {} for k in pairs(t) do table.insert(o, tostring(k)) end return table.concat(o, " ") end
+        local function list(n) local o = {} for i = 1, n do o[i] = i end return table.concat(o, ",") end
+        local function f() return 1, 2, 3 end
+        local big = loadstring("return {" .. list(31) .. ",[1.5]=1,[-1]=2}")()
+        local big60 = loadstring("return {x=1," .. list(60) .. ",[1.5]=1,y=2,[-1]=2}")()
+        local big120 = loadstring("return {[0.5]=0," .. list(120) .. ",[-2]=1,a=1,b=2}")()
+        return S(K({["x"]=4,["y"]=4,["z"]=4,5}), K({0,1,[true]=2,[2]=4,5}), K({0,["x"]=4,["y"]=4,5}),
+          K(big), K(big60), K(big120), K({x = 1, f()}), K({f(), x = 1, y = 2, z = 3}), K({[1]=1, [2]=2, 3, f()}))"#),
     ("fix-front_register_reuse", r#"local function L(src) local f, e = loadstring(src) if not f then return e end local ok, r = pcall(f) return tostring(r) end
         local p = {} for i = 1, 250 do p[i] = "x" end
         local q = {} for i = 1, 400 do q[i] = "a*0.25" end

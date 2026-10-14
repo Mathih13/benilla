@@ -2306,11 +2306,15 @@ impl Vm {
                             jump!(1 + back);
                         }
                     }
+                    // 5.1's `OP_SETLIST`: the array part grows to hold the batch first
+                    // (`luaH_resizearray`), then the items are stored from the last down.
                     Op::SetList(a, first, n) => {
                         let V::Table(t) = (r!(a)).unpack() else {
                             unreachable!()
                         };
-                        // 5.0 stores the batch from its last item down.
+                        self.heap
+                            .table_mut(t)
+                            .grow_array(first as usize + n as usize);
                         for i in (1..=n as usize).rev() {
                             let v = r!(a as usize + i);
                             self.heap
@@ -2323,6 +2327,7 @@ impl Vm {
                             unreachable!()
                         };
                         let n = self.top - (base!() + a as usize) - 1;
+                        self.heap.table_mut(t).grow_array(first as usize + n);
                         for i in (1..=n).rev() {
                             let v = self.stack[base!() + a as usize + i];
                             self.heap

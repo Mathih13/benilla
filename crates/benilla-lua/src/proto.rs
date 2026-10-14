@@ -136,7 +136,8 @@ pub enum Op {
     /// the first is nil it becomes the control `R(a+2)`, else the next instruction, the jump back
     /// to the body, is skipped.
     TForLoop(Reg, u8),
-    /// `R(a)[base + i] = R(a + i)` for `i` in `1..=n`: the pending list items.
+    /// 5.1's `SETLIST`: `R(a)[base + i] = R(a + i)` for `i` in `1..=n`, the array part grown
+    /// first to hold them all.
     SetList(Reg, u32, u16),
     /// The same, items up to the top (the last item was a call).
     SetListTop(Reg, u32),
