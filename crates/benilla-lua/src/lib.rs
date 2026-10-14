@@ -37,9 +37,9 @@ pub fn new_state() -> Vm {
     vm
 }
 
-/// The state benilla's script host starts from: Lua 5.1's standard libraries as mlua's
-/// `Lua::new()` opened them (`luaopen_base`, then table, io, os, string, math and package), each
-/// table sized and filled in its C registration order. The script host's sandbox then deletes
+/// The state benilla's script host starts from: Lua 5.1's standard libraries as the C build's
+/// mlua `Lua::new()` opened them (`luaopen_base`, then table, io, os, string, math and package),
+/// each table sized and filled in its C registration order. The script host's sandbox then deletes
 /// what 1.12 lacks, and the deleted keys stay in the tables as 5.1 leaves them, so every table
 /// lays out, and iterates, as it did. A function 5.1 has and benilla does not is a placeholder
 /// that raises: the sandbox deletes every one.

@@ -153,7 +153,7 @@ fn install_bit(lua: &Lua) -> mlua::Result<()> {
 /// answers `(count_KB, threshold_KB)` (`lua_getgccount 0x6f43f0`, `lua_getgcthreshold
 /// 0x6f43e0`); `collectgarbage` (`0x703250`) takes an optional number, sets the threshold to that
 /// many KB (`lua_setgcthreshold 0x6f4400`) and answers nothing, so 5.1's string options raise.
-/// 5.1's collector has no threshold, so it is kept here by 5.0's rules against mlua's heap: a
+/// 5.1's collector has no threshold, so it is kept here by 5.0's rules against the VM's heap: a
 /// live count that reaches it collects, and a collection resets it to twice the live count.
 fn install_gc(lua: &Lua) -> mlua::Result<()> {
     /// 5.0's `GCthreshold` (`[G+0x24]`), in bytes.

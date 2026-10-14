@@ -1,6 +1,7 @@
 //! The Lua scripting host: the engine-free VM that runs FrameXML and addons over the frame arena,
-//! the anchor resolver and the draw order. It embeds mlua's Lua 5.1, reshaped by [`lua50`] to
-//! answer as the 1.12 client's Lua 5.0.
+//! the anchor resolver and the draw order. It embeds benilla-lua through benilla-mlua's
+//! mlua-shaped API: 5.1.5's runtime under the 1.12 grammar, reshaped by [`lua50`] to answer as
+//! the 1.12 client's Lua 5.0.
 //!
 //! A frame's Lua value is a table whose `T[0]` lightuserdata (`0x701bd0`) holds a `u32` id where
 //! the reference holds the `CScriptObject*`, with an `__index` metatable (`0x7020b0`). A handler
@@ -342,7 +343,7 @@ use crate::layout::Rect;
 use crate::order::ZTarget;
 use crate::widget::{FrameHandle, KindState};
 
-// Registry keys, the only roots of Lua-side state (the `LUAI_MAXCSTACK` discipline).
+// Registry keys, the only roots of Lua-side state.
 const REG_FRAME_META: &str = "__benilla_frame_meta";
 const REG_REGION_META: &str = "__benilla_region_meta";
 const REG_FRAME_METHODS: &str = "__benilla_frame_methods";
