@@ -1,0 +1,51 @@
+# The grammar benilla-lua parses
+
+benilla's script host runs Lua 5.1.5 with eight changes, so that it accepts exactly the grammar
+the 1.12.1 client's Lua accepts, no more and no less. Until benilla-lua replaced it, that language
+was a patched copy of the C Lua (`third_party/lua-src`, in the git history); benilla-lua implements
+the same language directly. A grammar difference in either direction is invisible to every
+instrument until an addon trips over it, and the addon corpus asks about the difference directly.
+
+The 1.12 addon corpus is Lua 5.0 code. It uses the iterator-less generic-for:
+
+```lua
+for k, v in someTable do ... end        -- no pairs(), no iterator function
+```
+
+183 of 218 corpus addons are reached by it (118 carry it, 65 inherit it through a declared
+dependency), across 1,163 sites. On stock Lua 5.1 it raises `attempt to call a table value`, the
+first session-start error for 60 of the 218.
+
+## The eight changes
+
+Five restore what 5.1 changed or removed:
+
+| where in 5.1 | change | why |
+|---|---|---|
+| `lvm.c` | 5.0's `OP_TFORPREP` table-to-`next` substitution, at the top of `OP_TFORLOOP` | `for k, v in someTable do` raised "attempt to call a table value" |
+| `luaconf.h` | `LUA_COMPAT_LSTR` `1` to `2` | 5.1 kept 5.0's `[[...]]` nesting machinery and put an advisory error in front of it; two corpus addons died on "nesting of `[[...]]` is deprecated" |
+| `luaconf.h` | `LUA_QL(x)` back to 5.0's `` `x' `` from 5.1's `'x'` | every Lua error message quotes a program element, and `WoW.exe`'s own `.rdata` carries all five formats in the 5.0 spelling |
+| `lparser.c` | 5.0's compat-semicolon skip at the top of `constructor()`'s field loop | one extra `;` after a field separator inside a table constructor (`Back_Title = AL["Factions"];;`, which AtlasLoot writes) is accepted by the client |
+| `lparser.c` | `recfield`'s `cc->nh++` inside its `TK_NAME` arm, 5.0's placement | a `[expr] = value` constructor field credits neither `OP_NEWTABLE` size hint in 5.0, so the table is born on the dummy node |
+
+Three delete what 5.1 added, all in `lparser.c`, all byte-read out of the client's own parser
+(`simpleexp 0x6fd240`, `getunopr 0x6fe0a0`, `getbinopr 0x6fe0c0`), all landing on 5.0's own
+`unexpected symbol` at `prefixexp 0x6fde40`:
+
+| change | why |
+|---|---|
+| `...` is not an expression (`simpleexp`'s `case TK_DOTS`) | the Ace2 corpus asks which interpreter it is on by compiling `return function(...) return ... end`; 170 `loadstring` sites in the corpus are that question, and 92 library files in 24 folders branch on the answer |
+| no length operator (`getunopr`'s `case '#'`) | the client's `getunopr` tests exactly two tokens (`-`, `not`) and its `OPR_NOUNOPR` is 2, a three-member enum; 5.0 asks a table with `table.getn` and a string with `string.len` |
+| no modulo operator (`getbinopr`'s `case '%'`) | the client's `getbinopr` switch is based at `'*'` (0x2A), so `%` (0x25) is below its range and reaches `OPR_NOBINOPR` = 14, a fifteen-member `BinOpr`; 5.0 spells it `math.mod` |
+
+The deletions are safe because nothing the reference runs uses those constructs: a comment- and
+string-stripping scan of the 1.12 FrameXML (177 files), GlueXML, Blizzard's own addons and the
+corpus finds zero sites of all three. No chunk of benilla's own Lua may use a construct the client's
+parser rejects.
+
+## The generic-for, in detail
+
+Three details are the client's own, each byte-read there: the substitution test is a bare type-tag
+equality that never consults a metatable (a table carrying `__call` still gets `next`); the callee
+is the global `next`, read raw and fetched fresh at every loop entry (an addon assigning
+`next = myfn` changes every later generic-for in the session); and userdata is not substituted.

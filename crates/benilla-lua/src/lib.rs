@@ -1,5 +1,5 @@
 //! benilla-lua: an interpreter for the Lua benilla's script host runs, Lua 5.1.5 patched to the
-//! 1.12 grammar (`third_party/lua-src/BENILLA.md`). The state is plain Rust data, so it can be
+//! 1.12 grammar (`GRAMMAR.md`). The state is plain Rust data, so it can be
 //! cloned, inspected and restored.
 
 pub mod api;

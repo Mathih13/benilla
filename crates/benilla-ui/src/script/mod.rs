@@ -7,8 +7,8 @@
 //! is `pcall`ed with `this`, `event` and `arg1..argN` set as globals and restored after
 //! (`0x704d50`); it also gets `(self, event, ...)` as arguments, which 1.12 does not pass.
 //!
-//! The `LUAI_MAXCSTACK` discipline: Rust holds no persistent Lua handle, since each owned `Table`
-//! or `Function` takes a slot on mlua's reference thread, capped at the vendored 8000. Lua-side
+//! The handle discipline: Rust holds no persistent Lua handle, since each owned `Table` or
+//! `Function` is a collector root that keeps everything it reaches alive. Lua-side
 //! state lives in the registry under named keys, fetched per call; [`Model`] is plain data in
 //! `lua.app_data`, borrowed briefly and released before re-entering Lua.
 
