@@ -94,3 +94,26 @@ fn forks_sharing_code_each_keep_its_constants() {
     assert_eq!(run(&mut a, "return f()"), want);
     assert_eq!(run(&mut b, "return f()"), want);
 }
+
+/// The built-in `next` stays a root with no global naming it: a generic `for` steps a table in
+/// place when its iterator is that function, so a new function taking its freed id would be
+/// stepped as `next` instead of called.
+#[test]
+fn the_builtin_next_outlives_its_globals() {
+    for mut vm in [
+        benilla_lua::new_state(),
+        benilla_lua::new_script_host_state(),
+    ] {
+        run(&mut vm, "next = nil pairs = nil ipairs = nil foreach = nil");
+        vm.full_gc();
+        assert_eq!(
+            run(
+                &mut vm,
+                "local stubs = {} for i = 1, 2000 do stubs[i] = function(t, k) return nil end end \
+                 local n = 0 for i = 1, 2000 do for k in stubs[i], {1, 2, 3} do n = n + 1 end end \
+                 return n",
+            ),
+            "0"
+        );
+    }
+}

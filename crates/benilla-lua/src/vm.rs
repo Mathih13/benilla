@@ -1500,6 +1500,9 @@ impl Vm {
         }
         roots.extend(self.handlers.iter().flatten().copied());
         roots.extend(self.roots.iter().filter(|r| r.1 > 0).map(|r| r.0));
+        // The generic `for` fast path compares against it by identity: a freed `next` whose id
+        // a new function took would step a table without calling that function.
+        roots.push(self.builtin_next);
         let open: Vec<u32> = self.open.iter().map(|&(_, u)| u).collect();
         // Names live forever.
         let n = &self.names;
@@ -1526,7 +1529,14 @@ impl Vm {
         ] {
             roots.push(Value::Str(s));
         }
-        let live = self.heap.collect(&roots, &open, self.names.mode);
+        // A frame running code a hot reload replaced reads that code's constants and upvalues;
+        // with no frame left, nothing runs it.
+        if self.frames.is_empty() {
+            self.retired.clear();
+        }
+        let live = self
+            .heap
+            .collect(&roots, &open, &self.retired, self.names.mode);
         self.heap.threshold = 2 * live;
     }
 

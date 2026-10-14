@@ -134,3 +134,41 @@ fn an_edit_above_a_function_moves_its_lines_and_keeps_its_key() {
     let err = run(&mut vm, "return MyAddon.OnEvent(nil, 'B')");
     assert!(err.contains(&format!("MyAddon.lua:{line}:")), "{err}");
 }
+
+/// A frame still running replaced code keeps that code's constants and upvalues alive through a
+/// collection: only the retired copy holds them once the closure runs the new code.
+#[test]
+fn a_running_frame_keeps_its_replaced_code_alive_through_a_collection() {
+    use std::rc::Rc;
+    let mut vm = benilla_lua::new_state();
+    let reload: benilla_lua::heap::HostFn = Rc::new(|vm: &mut benilla_lua::Vm, _| {
+        vm.hot_reload(b"=mod", b"local u = {} function F() return 1 end")
+            .unwrap();
+        vm.full_gc();
+        // Fill any freed slot with other objects.
+        for i in 0..64 {
+            let s = format!("filler {i}");
+            let v = vm.str(s.as_bytes());
+            let t = vm.heap.new_table(0, 0);
+            vm.heap
+                .table_mut(t)
+                .set(v, benilla_lua::Value::Num(i as f64))
+                .unwrap();
+        }
+        Ok(0)
+    });
+    let f = vm.new_host("reload", reload);
+    vm.set_global("reload", f);
+    vm.exec(
+        b"local u = { tag = 'kept' }
+          function F() reload() return 'old constant', u.tag end",
+        b"=mod",
+    )
+    .unwrap();
+    assert_eq!(
+        run(&mut vm, "local a, b = F() return a .. '/' .. b"),
+        "old constant/kept"
+    );
+    // The next call runs the new code.
+    assert_eq!(run(&mut vm, "return F()"), "1");
+}

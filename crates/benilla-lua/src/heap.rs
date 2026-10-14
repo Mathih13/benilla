@@ -467,16 +467,27 @@ impl Heap {
         ]
     }
 
-    /// Mark from `roots` (and `extra_upvals`, the open upvalues), clear weak entries, sweep.
+    /// Mark from `roots` (and `extra_upvals`, the open upvalues, and `code`, prototypes and
+    /// upvalue lists no closure holds but a running frame does), clear weak entries, sweep.
     /// Answers the live byte estimate, which 5.0's `luaC_collectgarbage` doubles into the next
     /// threshold.
-    pub fn collect(&mut self, roots: &[Value], extra_upvals: &[u32], mode_key: StrRef) -> usize {
+    pub fn collect(
+        &mut self,
+        roots: &[Value],
+        extra_upvals: &[u32],
+        code: &[(Rc<Proto>, Box<[u32]>)],
+        mode_key: StrRef,
+    ) -> usize {
         let mut gray: Vec<Value> = roots.to_vec();
         let mut gray_upvals: Vec<u32> = extra_upvals.to_vec();
         let mut weak_tables: Vec<u32> = Vec::new();
         // Constants of every reached prototype, once each.
         // A number no other collection, in any VM, has used: prototypes are shared by forks.
         let epoch = GC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        for (p, ups) in code {
+            mark_proto(p, &mut gray, epoch);
+            gray_upvals.extend_from_slice(ups);
+        }
         loop {
             if let Some(u) = gray_upvals.pop() {
                 if !self.upvals.marks[u as usize] {
