@@ -374,6 +374,8 @@ b]])"#),
           R("local a = {} return (1 < 2), (2 <= 1), (1 == 1), not nil, not 1, nil and 1, false or nil, 1 and 2 or 3"),
           R("local t = {} t[1], t[2] = 1, 2 local a, b = t[1], t[2] a, b = b, a return a, b"),
           R("local a, b, c = (function() return 1, 2, 3 end)() return a, b, c")}, " | ")"#),
+    // ── fix-libs: the library fixes, each blessed on the C build ──
+    ("fix-libs bit_mod_overflow", "return S(E(bit.mod, -2^31, -1), E(bit.mod, 2^31, -1), E(bit.mod, 7, -1), E(bit.mod, -7, 2), E(bit.mod, 0/0, -1), E(bit.mod, 1/0, -1), E(bit.lshift, 1, 31), E(bit.arshift, -2^31, 31))"),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.
