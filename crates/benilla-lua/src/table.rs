@@ -22,7 +22,10 @@ const EMPTY: Node = Node {
 /// 5.1's `MAXBITS`: `2^MAXBITS` (`MAXASIZE`) is the largest array index kept in the array part.
 const MAXBITS: u32 = 26;
 
+/// Aligned to a cache line, which makes it two lines long: the heap reaches a table by index,
+/// and a power-of-two size turns that index into a shift instead of a multiply.
 #[derive(Clone, Debug)]
+#[repr(align(64))]
 pub struct Table {
     pub array: Vec<Value>,
     /// The hash part: `2^lsizenode` nodes. A size of zero is 5.0's shared `dummynode`, kept

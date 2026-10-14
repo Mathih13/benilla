@@ -138,6 +138,9 @@ pub struct Vm {
     /// first overflow comes at 16384 frames and, the array cut back to 20000, later ones at
     /// 20000; the doubled array leaves the error's handler room to run.
     ci_size: usize,
+    /// `ci_size - 1`: a call is made while `frames.len()` is below it, one compare on the call
+    /// path.
+    ci_limit: usize,
     /// Error handlers running (`throw`): only they may use the margin past `MAX_RUST_STACK`.
     in_handler: u32,
     /// The Rust stack address where the outermost host-level call entered (`MAX_RUST_STACK`).
@@ -359,6 +362,7 @@ impl Vm {
             names,
             c_depth: 0,
             ci_size: BASIC_CI_SIZE,
+            ci_limit: BASIC_CI_SIZE - 1,
             stack_base: 0,
             in_handler: 0,
             handlers: Vec::new(),
@@ -1236,7 +1240,7 @@ impl Vm {
                 }
             }
         };
-        if self.frames.len() + 1 >= self.ci_size {
+        if self.frames.len() >= self.ci_limit {
             self.grow_ci()?;
         }
         match self.heap.func(fref) {
@@ -1342,18 +1346,23 @@ impl Vm {
         if self.ci_size > MAXCALLS {
             return Err(self.errerr());
         }
-        self.ci_size *= 2;
+        self.set_ci_size(self.ci_size * 2);
         if self.ci_size > MAXCALLS {
             return Err(self.rt_error("stack overflow"));
         }
         Ok(())
     }
 
+    fn set_ci_size(&mut self, n: usize) {
+        self.ci_size = n;
+        self.ci_limit = n - 1;
+    }
+
     /// 5.1.5's `restore_stack_limit`, after a protected call unwinds: an array an overflow grew
     /// past the limit goes back to it, if the frames still in use leave room.
     fn restore_stack_limit(&mut self) {
         if self.ci_size > MAXCALLS && self.frames.len() + 1 < MAXCALLS {
-            self.ci_size = MAXCALLS;
+            self.set_ci_size(MAXCALLS);
         }
     }
 
@@ -1705,7 +1714,7 @@ impl Vm {
                 && 4 * self.frames.len() < self.ci_size
                 && 2 * BASIC_CI_SIZE < self.ci_size
             {
-                self.ci_size /= 2;
+                self.set_ci_size(self.ci_size / 2);
             }
         }
     }
@@ -2280,7 +2289,7 @@ impl Vm {
                             {
                                 // `fi + 1` frames are live: the depth without reading the
                                 // frame list.
-                                if !shape.vararg && self.frames.len() + 1 < self.ci_size {
+                                if !shape.vararg && self.frames.len() < self.ci_limit {
                                     let np = shape.nparams as usize;
                                     let consts = shape.consts;
                                     let nbase = func_idx + 1;
