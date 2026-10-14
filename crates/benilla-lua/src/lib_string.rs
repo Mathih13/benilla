@@ -354,12 +354,6 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
 
 const MAX_CAPTURES: usize = 32;
 
-/// The matcher's recursion bound: a level per pattern item (a quantified single, a capture) the
-/// match is inside, so a real pattern stays far below it. Deviation: 5.1's `match` recurses
-/// without a bound and overflows the C stack (near 32000 levels on 8 MB); this raises 5.2's
-/// `pattern too complex` instead. A dev build overflows a 2 MB thread near 11200 levels under
-/// the deepest native nesting the VM allows; this keeps a third of that spare.
-const MAX_MATCH_DEPTH: u32 = 7_500;
 const CAP_UNFINISHED: isize = -1;
 const CAP_POSITION: isize = -2;
 const SPECIALS: &[u8] = b"^$*+?.([%-";
@@ -370,8 +364,8 @@ struct MatchState<'a> {
     pat: &'a [u8],
     level: usize,
     capture: [(usize, isize); MAX_CAPTURES],
-    /// Recursion left before `pattern too complex`.
-    depth: u32,
+    /// The Rust stack address past which a nested match raises `pattern too complex`.
+    stack_limit: usize,
 }
 
 /// A matcher error: the message `luaL_error` raises.
@@ -478,17 +472,19 @@ impl MatchState<'_> {
         }
     }
 
-    /// A nested `do_match`, within the recursion bound. The first level, which `find`, `gsub`
-    /// and `gfind` call, is not counted, so a pattern that never nests pays nothing.
+    /// A nested `do_match`, within the Rust stack the VM allows its calls. The first level,
+    /// which `find`, `gsub` and `gfind` call, is not checked, so a pattern that never nests pays
+    /// nothing. Deviation: 5.1's `match` recurses without a bound and overflows the C stack
+    /// (near 32000 levels on 8 MB); this raises 5.2's `pattern too complex` instead. The bound
+    /// is stack measured, not levels counted, so it holds at any optimisation level: a level
+    /// takes about 110 bytes at opt-level 1 and about 1.5 KB at opt-level 0.
     #[inline(never)]
     fn sub_match(&mut self, s: usize, p: usize) -> M<Option<usize>> {
-        if self.depth == 0 {
+        let marker = 0u8;
+        if (std::ptr::addr_of!(marker) as usize) < self.stack_limit {
             return Err(PatErr("pattern too complex"));
         }
-        self.depth -= 1;
-        let r = self.do_match(s, p);
-        self.depth += 1;
-        r
+        self.do_match(s, p)
     }
 
     fn do_match(&mut self, s: usize, p: usize) -> M<Option<usize>> {
@@ -747,13 +743,13 @@ fn c_pattern(p: &[u8], out: &mut Vec<u8>) {
     out.push(0);
 }
 
-fn new_state<'a>(src: &'a [u8], pat: &'a [u8]) -> MatchState<'a> {
+fn new_state<'a>(vm: &Vm, src: &'a [u8], pat: &'a [u8]) -> MatchState<'a> {
     MatchState {
         src,
         pat,
         level: 0,
         capture: [(0, 0); MAX_CAPTURES],
-        depth: MAX_MATCH_DEPTH,
+        stack_limit: vm.rust_stack_limit(),
     }
 }
 
@@ -804,7 +800,7 @@ fn find_in(vm: &mut Vm, nargs: usize, [src, pat, cpat]: &mut [Vec<u8>; 3]) -> R<
     } else {
         (false, 0)
     };
-    let mut ms = new_state(src, cpat);
+    let mut ms = new_state(vm, src, cpat);
     let mut s1 = init;
     loop {
         ms.level = 0;
@@ -859,7 +855,7 @@ fn gfind_in(vm: &mut Vm, _nargs: usize, [src, cpat]: &mut [Vec<u8>; 2]) -> R<usi
     src.extend_from_slice(vm.heap.str(s));
     c_pattern(vm.heap.str(p), cpat);
     let (src, cpat) = (&src[..], &cpat[..]);
-    let mut ms = new_state(src, cpat);
+    let mut ms = new_state(vm, src, cpat);
     let mut at = pos;
     while at <= src.len() {
         ms.level = 0;
@@ -922,7 +918,7 @@ fn gsub_in(vm: &mut Vm, nargs: usize, [src, cpat, out, repl_buf]: &mut [Vec<u8>;
     } else {
         (false, 0)
     };
-    let mut ms = new_state(src, cpat);
+    let mut ms = new_state(vm, src, cpat);
     let mut at = 0usize;
     let mut n = 0;
     let lit = if anchor {

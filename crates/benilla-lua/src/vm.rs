@@ -654,6 +654,13 @@ impl Vm {
         self.frames.is_empty()
     }
 
+    /// The lowest Rust stack address a native's own recursion may reach: what the nested calls
+    /// under the outermost host-level call may use (`MAX_RUST_STACK`), below where it entered.
+    /// The stack grows down on every platform benilla builds for.
+    pub(crate) fn rust_stack_limit(&self) -> usize {
+        self.stack_base.saturating_sub(MAX_RUST_STACK)
+    }
+
     pub(crate) fn native_base(&self) -> usize {
         self.frames.last().unwrap().base()
     }
