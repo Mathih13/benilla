@@ -1,12 +1,49 @@
-//! The base library as 1.12 opens it: 5.0's `lbaselib.c` without `print`, `_VERSION`,
-//! `loadfile`, `dofile`, `require` or coroutines, with 5.0's `assert`, `gcinfo` and
-//! `collectgarbage` shapes.
+//! The base library: 5.1's `lbaselib.c`, whose messages the script host carries, with 1.12's
+//! `collectgarbage` and `gcinfo` shapes.
 
 use crate::api::{c_int, R};
 use crate::heap::FuncObj;
 use crate::number::fmt_g14;
 use crate::value::{Value, V};
 use crate::vm::Vm;
+
+/// The base function benilla has under `name`, for a state that registers its own list.
+pub(crate) fn native(name: &str) -> Option<crate::heap::NativeFn> {
+    Some(match name {
+        "error" => error,
+        "getmetatable" => getmetatable,
+        "setmetatable" => setmetatable,
+        "getfenv" => getfenv,
+        "setfenv" => setfenv,
+        "next" => next,
+        "pairs" => pairs,
+        "tonumber" => tonumber,
+        "tostring" => tostring,
+        "type" => type_,
+        "assert" => assert,
+        "unpack" => unpack,
+        "rawequal" => rawequal,
+        "rawget" => rawget,
+        "rawset" => rawset,
+        "pcall" => pcall,
+        "xpcall" => xpcall,
+        "collectgarbage" => collectgarbage,
+        "gcinfo" => gcinfo,
+        "loadstring" => loadstring,
+        _ => return None,
+    })
+}
+
+/// 5.1's `pairs`, whose `next` is the one it was opened with (its upvalue), not the global's
+/// value now.
+pub(crate) fn pairs_51(vm: &mut Vm, nargs: usize) -> R<usize> {
+    let t = vm.check_table(nargs, 1)?;
+    let next = vm.upvalue(0);
+    vm.push(next);
+    vm.push(Value::Table(t));
+    vm.push(Value::Nil);
+    Ok(3)
+}
 
 pub fn open(vm: &mut Vm) {
     vm.register("error", error);
@@ -16,7 +53,9 @@ pub fn open(vm: &mut Vm) {
     vm.register("setfenv", setfenv);
     vm.register("next", next);
     vm.builtin_next = vm.get_global("next");
-    vm.register("ipairs", ipairs);
+    let aux = vm.new_native("ipairs_aux", ipairs_aux);
+    let ip = vm.new_closure("ipairs", ipairs, vec![aux]);
+    vm.set_global("ipairs", ip);
     vm.register("pairs", pairs);
     vm.register("tonumber", tonumber);
     vm.register("tostring", tostring);
@@ -36,9 +75,10 @@ pub fn open(vm: &mut Vm) {
 }
 
 /// `luaB_error`: a string message gets the position `level` up (default 1).
+/// 5.1's `error`: no value raises nil.
 fn error(vm: &mut Vm, nargs: usize) -> R<usize> {
     let level = vm.opt_int(nargs, 2, 1)?;
-    let msg = vm.check_any(nargs, 1)?;
+    let msg = vm.arg(nargs, 0);
     if vm.is_string(msg) && level > 0 {
         let mut out = vm.where_(level as usize);
         let s = vm.tostr(msg).unwrap();
@@ -66,7 +106,8 @@ fn setmetatable(vm: &mut Vm, nargs: usize) -> R<usize> {
     let mt = vm.arg(nargs, 1);
     let t = vm.check_table(nargs, 1)?;
     let mt = match mt.unpack() {
-        V::Nil => None,
+        // No second argument is neither nil nor a table.
+        V::Nil if nargs >= 2 => None,
         V::Table(m) if nargs >= 2 => Some(m),
         _ => return Err(vm.arg_error(2, "nil or table expected")),
     };
@@ -159,7 +200,7 @@ fn next(vm: &mut Vm, nargs: usize) -> R<usize> {
             Ok(2)
         }
         Ok(None) => Ok(vm.ret1(Value::Nil)),
-        Err(crate::table::InvalidKey) => Err(vm.rt_error("invalid key for `next'")),
+        Err(crate::table::InvalidKey) => Err(vm.rt_error("invalid key to `next'")),
     }
 }
 
@@ -173,24 +214,26 @@ fn pairs(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(3)
 }
 
-/// 5.0's `ipairs` is its own iterator: called with one argument it starts, with two it steps.
-fn ipairs(vm: &mut Vm, nargs: usize) -> R<usize> {
-    let i = vm.tonumber(vm.arg(nargs, 1)).unwrap_or(0.0);
+/// 5.1's `ipairs`: its iterator, the table and 0.
+pub(crate) fn ipairs(vm: &mut Vm, nargs: usize) -> R<usize> {
     let t = vm.check_table(nargs, 1)?;
-    if i == 0.0 && nargs < 2 {
-        let k = vm.str(b"ipairs");
-        let g = vm.heap.table(vm.globals).get(k);
-        vm.push(g);
-        vm.push(Value::Table(t));
-        vm.push(Value::Num(0.0));
-        return Ok(3);
-    }
-    let i = i + 1.0;
-    let v = vm.heap.table(t).get_int(i as i32);
+    let aux = vm.upvalue(0);
+    vm.push(aux);
+    vm.push(Value::Table(t));
+    vm.push(Value::Num(0.0));
+    Ok(3)
+}
+
+/// 5.1's `ipairsaux`: the next index and its value, or nothing at the first nil.
+pub(crate) fn ipairs_aux(vm: &mut Vm, nargs: usize) -> R<usize> {
+    let i = vm.check_int(nargs, 2)?;
+    let t = vm.check_table(nargs, 1)?;
+    let i = i.wrapping_add(1);
+    let v = vm.heap.table(t).get_int(i);
     if v.is_nil() {
         return Ok(0);
     }
-    vm.push(Value::Num(i));
+    vm.push(Value::Num(i as f64));
     vm.push(v);
     Ok(2)
 }
@@ -214,51 +257,12 @@ fn tonumber(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(vm.ret1(Value::Nil))
 }
 
-/// C's `strtoul` then 5.0's trailing-space check: `None` unless the whole string is read.
-fn strtoul(s: &[u8], base: u32) -> Option<u32> {
+/// 5.1's `tonumber` with a base: glibc's `strtoul` must read a digit, then only spaces may
+/// follow, up to the C string's end.
+fn strtoul(s: &[u8], base: u32) -> Option<u64> {
     let s = &s[..s.iter().position(|&b| b == 0).unwrap_or(s.len())];
-    let mut i = 0;
-    while i < s.len() && matches!(s[i], 0x20 | 0x09..=0x0D) {
-        i += 1;
-    }
-    let mut neg = false;
-    if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
-        neg = s[i] == b'-';
-        i += 1;
-    }
-    if base == 16 && s[i..].len() >= 2 && s[i] == b'0' && (s[i + 1] | 0x20) == b'x' {
-        i += 2;
-    }
-    let start = i;
-    let mut n: u64 = 0;
-    let mut overflow = false;
-    while i < s.len() {
-        let d = match s[i] {
-            c @ b'0'..=b'9' => (c - b'0') as u32,
-            c @ b'a'..=b'z' => (c - b'a') as u32 + 10,
-            c @ b'A'..=b'Z' => (c - b'A') as u32 + 10,
-            _ => break,
-        };
-        if d >= base {
-            break;
-        }
-        n = n * base as u64 + d as u64;
-        if n > u32::MAX as u64 {
-            overflow = true;
-        }
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    while i < s.len() && matches!(s[i], 0x20 | 0x09..=0x0D) {
-        i += 1;
-    }
-    if i != s.len() {
-        return None;
-    }
-    let v = if overflow { u32::MAX } else { n as u32 };
-    Some(if neg { v.wrapping_neg() } else { v })
+    let (n, end) = crate::number::strtoul(s, base);
+    (end > 0 && s[end..].iter().all(|&b| matches!(b, 0x20 | 0x09..=0x0D))).then_some(n)
 }
 
 /// A synthetic address for `tostring`: stable per object, in MSVC's `%p` shape.
@@ -403,6 +407,7 @@ fn pcall(vm: &mut Vm, nargs: usize) -> R<usize> {
 }
 
 fn xpcall(vm: &mut Vm, nargs: usize) -> R<usize> {
+    vm.check_any(nargs, 2)?;
     let f = vm.arg(nargs, 0);
     let h = vm.arg(nargs, 1);
     let func_idx = vm.top - nargs;

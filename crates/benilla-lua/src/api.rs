@@ -1,4 +1,4 @@
-//! What a native function sees: 5.0's `lauxlib` checks and results, over [`Vm`].
+//! What a native function sees: 5.1's `lauxlib` checks and results, over [`Vm`].
 
 use crate::heap::{FuncObj, NativeFn};
 use crate::value::{StrRef, TableRef, Value, V};
@@ -6,10 +6,41 @@ use crate::vm::{LuaError, Vm};
 
 pub type R<T> = Result<T, LuaError>;
 
-/// C's `(int)` cast of a double on the client: x87 truncation through a 64-bit integer, low 32
-/// bits kept.
+/// 2^63, where a C conversion to a 64-bit integer runs out.
+const TWO63: f64 = (1u64 << 63) as f64;
+
+/// 5.1's `lua_number2integer` on x86-64: C's `(ptrdiff_t)` cast, `cvttsd2si`, which truncates
+/// toward zero and answers `INT64_MIN` for a NaN or an out-of-range value.
+pub fn c_integer(n: f64) -> i64 {
+    if n.is_nan() || !(-TWO63..TWO63).contains(&n) {
+        i64::MIN
+    } else {
+        n as i64
+    }
+}
+
+/// 5.1's `luaL_checkint`: `(int)` of [`c_integer`], its low 32 bits.
 pub fn c_int(n: f64) -> i32 {
-    n as i64 as i32
+    c_integer(n) as i32
+}
+
+/// C's `(int)` cast of a `double` straight, as `string.format`'s `%c` does: `cvttsd2si` on 32
+/// bits, `INT32_MIN` out of range.
+pub fn c_int_direct(n: f64) -> i32 {
+    if n.is_nan() || !(-2_147_483_648.0..2_147_483_648.0).contains(&n) {
+        i32::MIN
+    } else {
+        n as i32
+    }
+}
+
+/// C's `(unsigned long)` cast of a `double` on x86-64, as `string.format`'s `%x` does.
+pub fn c_ulong(n: f64) -> u64 {
+    if (TWO63..2.0 * TWO63).contains(&n) {
+        c_integer(n - TWO63) as u64 ^ (1 << 63)
+    } else {
+        c_integer(n) as u64
+    }
 }
 
 impl Vm {
@@ -65,6 +96,20 @@ impl Vm {
             Ok(def)
         } else {
             self.check_int(nargs, n)
+        }
+    }
+
+    /// `luaL_checkinteger`: a `ptrdiff_t`.
+    pub fn check_integer(&mut self, nargs: usize, n: usize) -> R<i64> {
+        Ok(c_integer(self.check_number(nargs, n)?))
+    }
+
+    /// `luaL_optinteger`.
+    pub fn opt_integer(&mut self, nargs: usize, n: usize, def: i64) -> R<i64> {
+        if self.arg(nargs, n - 1).is_nil() {
+            Ok(def)
+        } else {
+            self.check_integer(nargs, n)
         }
     }
 

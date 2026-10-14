@@ -1,6 +1,6 @@
-//! benilla-lua: an experimental interpreter for the 1.12.1 client's Lua, which is Lua 5.0 with the
-//! client's own library set. The state is plain Rust data, so it can be cloned, inspected and
-//! restored; that is the experiment. Not wired into the client.
+//! benilla-lua: an interpreter for the Lua benilla's script host runs, Lua 5.1.5 patched to the
+//! 1.12 grammar (`third_party/lua-src/BENILLA.md`). The state is plain Rust data, so it can be
+//! cloned, inspected and restored.
 
 pub mod api;
 pub mod ast;
@@ -35,6 +35,199 @@ pub fn new_state() -> Vm {
     vm.exec(COMPAT, b"=[benilla-lua compat]")
         .expect("the compat chunk runs");
     vm
+}
+
+/// The state benilla's script host starts from: Lua 5.1's standard libraries as mlua's
+/// `Lua::new()` opened them (`luaopen_base`, then table, io, os, string, math and package), each
+/// table sized and filled in its C registration order. The script host's sandbox then deletes
+/// what 1.12 lacks, and the deleted keys stay in the tables as 5.1 leaves them, so every table
+/// lays out, and iterates, as it did. A function 5.1 has and benilla does not is a placeholder
+/// that raises: the sandbox deletes every one.
+pub fn new_script_host_state() -> Vm {
+    let mut vm = Vm::new();
+    let g = Value::Table(vm.globals);
+    // `base_open`.
+    vm.set_global("_G", g);
+    for name in [
+        "assert",
+        "collectgarbage",
+        "dofile",
+        "error",
+        "gcinfo",
+        "getfenv",
+        "getmetatable",
+        "loadfile",
+        "load",
+        "loadstring",
+        "next",
+        "pcall",
+        "print",
+        "rawequal",
+        "rawget",
+        "rawset",
+        "select",
+        "setfenv",
+        "setmetatable",
+        "tonumber",
+        "tostring",
+        "type",
+        "unpack",
+        "xpcall",
+    ] {
+        let f = vm.new_native(name, lib_base::native(name).unwrap_or(not_in_the_host));
+        vm.set_global(name, f);
+    }
+    let version = vm.str(b"Lua 5.1");
+    vm.set_global("_VERSION", version);
+    let aux = vm.new_native("ipairs_aux", lib_base::ipairs_aux);
+    let ipairs = vm.new_closure("ipairs", lib_base::ipairs, vec![aux]);
+    vm.set_global("ipairs", ipairs);
+    let next = vm.get_global("next");
+    vm.builtin_next = next;
+    let pairs = vm.new_closure("pairs", lib_base::pairs_51, vec![next]);
+    vm.set_global("pairs", pairs);
+    let newproxy = vm.new_native("newproxy", not_in_the_host);
+    vm.set_global("newproxy", newproxy);
+    register_51(
+        &mut vm,
+        "coroutine",
+        &["create", "resume", "running", "status", "wrap", "yield"],
+        |_| None,
+    );
+    register_51(
+        &mut vm,
+        "table",
+        &[
+            "concat", "foreach", "foreachi", "getn", "maxn", "insert", "remove", "setn", "sort",
+        ],
+        lib_table::native,
+    );
+    register_51(
+        &mut vm,
+        "io",
+        &[
+            "close", "flush", "input", "lines", "open", "output", "popen", "read", "tmpfile",
+            "type", "write",
+        ],
+        |_| None,
+    );
+    register_51(
+        &mut vm,
+        "os",
+        &[
+            "clock",
+            "date",
+            "difftime",
+            "execute",
+            "exit",
+            "getenv",
+            "remove",
+            "rename",
+            "setlocale",
+            "time",
+            "tmpname",
+        ],
+        |_| None,
+    );
+    // `luaopen_string`, with `LUA_COMPAT_GFIND`'s `gfind` the same function as `gmatch`.
+    let string = register_51(
+        &mut vm,
+        "string",
+        &[
+            "byte", "char", "dump", "find", "format", "gfind", "gmatch", "gsub", "len", "lower",
+            "match", "rep", "reverse", "sub", "upper",
+        ],
+        |name| lib_string::native(if name == "gmatch" { "gfind" } else { name }),
+    );
+    set_field(&mut vm, string, b"gfind", |vm, t| {
+        get_field(vm, t, b"gmatch")
+    });
+    // `luaopen_math`, with `pi`, `huge` and `LUA_COMPAT_MOD`'s `mod` the same function as `fmod`.
+    let math = register_51(
+        &mut vm,
+        "math",
+        &[
+            "abs",
+            "acos",
+            "asin",
+            "atan2",
+            "atan",
+            "ceil",
+            "cosh",
+            "cos",
+            "deg",
+            "exp",
+            "floor",
+            "fmod",
+            "frexp",
+            "ldexp",
+            "log10",
+            "log",
+            "max",
+            "min",
+            "modf",
+            "pow",
+            "rad",
+            "random",
+            "randomseed",
+            "sinh",
+            "sin",
+            "sqrt",
+            "tanh",
+            "tan",
+        ],
+        lib_math::native,
+    );
+    set_field(&mut vm, math, b"pi", |_, _| {
+        Value::Num(std::f64::consts::PI)
+    });
+    set_field(&mut vm, math, b"huge", |_, _| Value::Num(f64::INFINITY));
+    set_field(&mut vm, math, b"mod", |vm, t| get_field(vm, t, b"fmod"));
+    // `luaopen_package`: its table, then `module` and `require` into the globals.
+    register_51(&mut vm, "package", &["loadlib", "seeall"], |_| None);
+    for name in ["module", "require"] {
+        let f = vm.new_native(name, not_in_the_host);
+        vm.set_global(name, f);
+    }
+    vm
+}
+
+/// A 5.1 function benilla does not implement; the script host deletes each one.
+fn not_in_the_host(vm: &mut Vm, _nargs: usize) -> api::R<usize> {
+    Err(vm.rt_error("not available in the script host"))
+}
+
+/// `luaL_register`: a global table with room for every entry, the entries set in order.
+fn register_51(
+    vm: &mut Vm,
+    lib: &str,
+    names: &[&'static str],
+    native: fn(&str) -> Option<heap::NativeFn>,
+) -> value::TableRef {
+    let t = vm.heap.new_table(0, names.len());
+    vm.set_global(lib, Value::Table(t));
+    for &name in names {
+        let f = vm.new_native(name, native(name).unwrap_or(not_in_the_host));
+        let k = vm.str(name.as_bytes());
+        vm.heap.table_mut(t).set(k, f).unwrap();
+    }
+    t
+}
+
+fn get_field(vm: &mut Vm, t: value::TableRef, k: &[u8]) -> Value {
+    let k = vm.str(k);
+    vm.heap.table(t).get(k)
+}
+
+fn set_field(
+    vm: &mut Vm,
+    t: value::TableRef,
+    k: &[u8],
+    v: impl FnOnce(&mut Vm, value::TableRef) -> Value,
+) {
+    let v = v(vm, t);
+    let k = vm.str(k);
+    vm.heap.table_mut(t).set(k, v).unwrap();
 }
 
 /// The bare globals the client's start-up chunk publishes (its `.rdata` at `0x8722e8`): aliases
@@ -119,11 +312,11 @@ mod tests {
         parse(src.as_bytes(), b"=t").unwrap_err().to_string()
     }
 
-    /// The client's `.rdata` strings: 5.0's lexer and parser, not 5.1's.
+    /// The lexer's and parser's messages, as `tests/vm_parity.golden` in benilla-ui records them.
     #[test]
-    fn syntax_errors_are_5_0_s() {
+    fn syntax_errors_are_the_script_hosts() {
         assert_eq!(err("x = 1 +"), "t:1: unexpected symbol near `<eof>'");
-        assert_eq!(err("local function"), "t:1: <name> expected near `<eof>'");
+        assert_eq!(err("local function"), "t:1: `<name>' expected near `<eof>'");
         assert_eq!(err("x = #t"), "t:1: unexpected symbol near `#'");
         // `x = a` ends; `%` then opens a statement.
         assert_eq!(err("x = a % b"), "t:1: unexpected symbol near `%'");
@@ -132,30 +325,34 @@ mod tests {
             "t:1: unexpected symbol near `...'"
         );
         assert_eq!(err("for x do end"), "t:1: `=' or `in' expected near `do'");
-        assert_eq!(
-            err("x = 1..2"),
-            "t:1: ambiguous syntax (decimal point x string concatenation) near `1..'"
-        );
+        assert_eq!(err("x = 1..2"), "t:1: malformed number near `1..2'");
         assert_eq!(err("x = \"a\nb\""), "t:1: unfinished string near `\"a'");
         assert_eq!(err("x = [[a"), "t:1: unfinished long string near `<eof>'");
-        assert_eq!(err("x = 1\x01"), "t:1: invalid control char near `char(1)'");
+        assert_eq!(err("x = 1\x01"), "t:1: unexpected symbol near `char(1)'");
         assert_eq!(
             err("f()\n(g)()"),
             "t:2: ambiguous syntax (function call x new statement) near `('"
         );
         assert_eq!(err("break"), "t:1: no loop to break near `<eof>'");
         assert_eq!(err("(a) = 1"), "t:1: syntax error near `='");
-        assert_eq!(err("if x then\nend end"), "t:2: <eof> expected near `end'");
+        assert_eq!(
+            err("if x then\nend end"),
+            "t:2: `<eof>' expected near `end'"
+        );
         assert_eq!(
             err("do\nx = 1"),
             "t:2: `end' expected (to close `do' at line 1) near `<eof>'"
         );
+        assert_eq!(
+            err("x = [=x"),
+            "t:1: invalid long string delimiter near `[='"
+        );
+        assert_eq!(err("x = 3x"), "t:1: malformed number near `3x'");
     }
 
-    /// 5.0's lexer: `\r` is whitespace, `[[` nests, `[=[` does not exist, a numeral stops at its
-    /// first non-numeric byte.
+    /// 5.1's lexer with level-0 nesting: `\r` ends lines, `[=[` has levels, `0x10` is sixteen.
     #[test]
-    fn the_lexer_is_5_0_s() {
+    fn the_lexer_is_the_script_hosts() {
         let one = |src: &[u8]| -> Vec<u8> {
             let f = parse(src, b"=t").unwrap();
             match &f.body.stats[0] {
@@ -166,18 +363,17 @@ mod tests {
                 s => panic!("{s:?}"),
             }
         };
-        assert_eq!(one(b"return [[a\r\nb]]"), b"a\r\nb", "5.0 keeps the \\r");
-        assert_eq!(one(b"return [[a [[b]] c]]"), b"a [[b]] c");
         assert_eq!(
-            one(b"return 'a\rb'"),
-            b"a\rb",
-            "\\r does not end a short string"
+            one(b"return [[a\r\nb]]"),
+            b"a\nb",
+            "a line ending is one \\n"
         );
-        assert!(parse(b"return [=[x]=]", b"=t").is_err());
-        // `0x10` is `0` then the statement `x10`.
-        assert_eq!(err("x = 0x10"), "t:1: `=' expected near `<eof>'");
-        // A `\r`-only file is one line: line numbers count `\n` alone.
-        assert_eq!(err("x = 1\ry = +"), "t:1: unexpected symbol near `+'");
+        assert_eq!(one(b"return [[a [[b]] c]]"), b"a [[b]] c");
+        assert_eq!(one(b"return [=[a]]b]=]"), b"a]]b");
+        assert_eq!(err("x = 'a\rb'"), "t:1: unfinished string near `'a'");
+        assert!(parse(b"x = 0x10", b"=t").is_ok());
+        assert_eq!(err("x = 1\ry = +"), "t:2: unexpected symbol near `+'");
+        assert_eq!(err("x = 1\r\ny = +"), "t:2: unexpected symbol near `+'");
     }
 
     #[test]

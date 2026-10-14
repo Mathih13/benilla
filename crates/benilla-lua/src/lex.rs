@@ -1,9 +1,7 @@
-//! The lexer: Lua 5.0's `llex.c`, which the 1.12 client embeds. Its `.rdata` carries 5.0's token
-//! names (`*name`, `*number`, `*string`) and 5.0-only messages (`invalid control char`,
-//! `ambiguous syntax (decimal point x string concatenation)`), and lacks 5.1's
-//! `invalid long string delimiter`. So, unlike 5.1: `\n` alone ends a line (`\r` is whitespace and
-//! stays inside a literal), long brackets are `[[` only and nest, a numeral stops at its first
-//! non-numeric byte, and a control byte outside a literal is an error. Source is bytes.
+//! The lexer: Lua 5.1's `llex.c` as benilla's script host has always run it, built with
+//! `LUA_COMPAT_LSTR` 2 (`third_party/lua-src/BENILLA.md`): `\n`, `\r` and their pairs end a line,
+//! long brackets have levels (`[=[ ]=]`) and a level-0 one nests `[[` as 5.0's did, and a numeral
+//! reads every letter after it, so `0x10` is sixteen. Source is bytes.
 
 use crate::chunkid;
 
@@ -73,17 +71,18 @@ impl Tok {
     /// `luaX_token2str`: a token as an error message names it.
     pub fn text(self) -> Vec<u8> {
         let s: &[u8] = match self {
-            Tok::Name => b"*name",
+            Tok::Name => b"<name>",
             Tok::Concat => b"..",
             Tok::Dots => b"...",
             Tok::Eq => b"==",
             Tok::Ge => b">=",
             Tok::Le => b"<=",
             Tok::Ne => b"~=",
-            Tok::Number => b"*number",
-            Tok::String => b"*string",
+            Tok::Number => b"<number>",
+            Tok::String => b"<string>",
             Tok::Eof => b"<eof>",
-            // `%c`: the byte as it is.
+            // 5.1's `luaX_token2str`: a control byte as `char(n)`, any other as itself.
+            Tok::Char(c) if c < 32 || c == 127 => return format!("char({c})").into_bytes(),
             Tok::Char(c) => return vec![c],
             word => RESERVED.iter().find(|r| r.1 == word).unwrap().0,
         };
@@ -208,9 +207,18 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// `inclinenumber`: at a `\n`, which alone ends a line in 5.0.
+    /// 5.1's `currIsNewline`: `\n` or `\r`.
+    fn at_newline(&self) -> bool {
+        matches!(self.ch(), 0x0A | 0x0D)
+    }
+
+    /// 5.1's `inclinenumber`, at a `\n` or `\r`: a `\n\r` or `\r\n` pair is one line.
     fn newline(&mut self) -> Result<(), SyntaxError> {
+        let old = self.ch();
         self.pos += 1;
+        if self.at_newline() && self.ch() != old {
+            self.pos += 1;
+        }
         self.line += 1;
         // `checklimit(LS, ++LS->linenumber, MAX_INT, "lines in a chunk")` never trips here.
         Ok(())
@@ -229,35 +237,38 @@ impl<'a> Lexer<'a> {
             let c = self.ch();
             match c {
                 EOZ => return Ok(Self::tok(Tok::Eof)),
-                0x0A => self.newline()?,
+                0x0A | 0x0D => self.newline()?,
                 0x2D /* - */ => {
                     self.pos += 1;
                     if self.ch() != b'-' as i32 {
                         return Ok(Self::tok(Tok::Char(b'-')));
                     }
                     self.pos += 1;
-                    // `if (current == '[' && (next(LS), current == '['))`: the first `[` is
-                    // consumed either way.
-                    if self.ch() == b'[' as i32 && {
-                        self.pos += 1;
-                        self.ch() == b'[' as i32
-                    } {
-                        self.long_string(false)?;
-                    } else {
-                        while self.ch() != b'\n' as i32 && self.ch() != EOZ {
-                            self.pos += 1;
+                    // A long comment opens at `[`, `=`s and `[`; `skip_sep` consumes what it
+                    // reads either way, and anything else is a short comment from there.
+                    if self.ch() == b'[' as i32 {
+                        let sep = self.skip_sep();
+                        if sep >= 0 {
+                            self.long_string(false, sep as usize)?;
+                            continue;
                         }
+                    }
+                    while !self.at_newline() && self.ch() != EOZ {
+                        self.pos += 1;
                     }
                 }
                 0x5B /* [ */ => {
-                    self.pos += 1;
-                    if self.ch() != b'[' as i32 {
+                    let sep = self.skip_sep();
+                    if sep >= 0 {
+                        let bytes = self.long_string(true, sep as usize)?;
+                        let mut t = Self::tok(Tok::String);
+                        t.bytes = bytes;
+                        return Ok(t);
+                    }
+                    if sep == -1 {
                         return Ok(Self::tok(Tok::Char(b'[')));
                     }
-                    let bytes = self.long_string(true)?;
-                    let mut t = Self::tok(Tok::String);
-                    t.bytes = bytes;
-                    return Ok(t);
+                    return Err(self.lex_error("invalid long string delimiter", false));
                 }
                 0x3D /* = */ => return Ok(self.two(Tok::Eq, b'=')),
                 0x3C /* < */ => return Ok(self.two(Tok::Le, b'<')),
@@ -298,13 +309,8 @@ impl<'a> Lexer<'a> {
                         t.bytes = word.to_vec();
                         return Ok(t);
                     } else {
-                        // C's `iscntrl`: 0-31 and 127.
-                        if c < 32 || c == 127 {
-                            return Err(self.error_at(
-                                b"invalid control char",
-                                format!("char({c})").as_bytes(),
-                            ));
-                        }
+                        // Any other byte, a control one too, is a one-byte token for the parser
+                        // to refuse.
                         self.pos += 1;
                         return Ok(Self::tok(Tok::Char(c as u8)));
                     }
@@ -323,14 +329,49 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// 5.0's `read_long_string`, at the second `[`. `[[` nests and only the matching `]]`
-    /// closes; the buffer keeps both brackets, which an error quotes.
-    fn long_string(&mut self, keep: bool) -> Result<Vec<u8>, SyntaxError> {
-        let mut cont = 0u32;
+    /// 5.1's `skip_sep`, at a `[` or `]`: the `=`s between it and a second one of the same
+    /// bracket, or `-count - 1` when no second bracket follows. The buffer keeps what it read.
+    fn skip_sep(&mut self) -> i32 {
+        let s = self.ch();
         self.buff.clear();
-        self.buff.extend_from_slice(b"[[");
+        self.buff.push(s as u8);
         self.pos += 1;
-        if self.ch() == b'\n' as i32 {
+        let mut count = 0;
+        while self.ch() == b'=' as i32 {
+            self.buff.push(b'=');
+            self.pos += 1;
+            count += 1;
+        }
+        if self.ch() == s {
+            count
+        } else {
+            -count - 1
+        }
+    }
+
+    /// 5.1's `read_long_string` with `LUA_COMPAT_LSTR` 2, at the second `[` of a level-`sep`
+    /// opener. A level-0 string nests `[[` as 5.0's did; a higher level ends at its first
+    /// matching closer. The buffer keeps the brackets, which an error quotes.
+    fn sep_closes(&mut self, sep: usize) -> bool {
+        // At `]` or `[`: `skip_sep` from here appends to the buffer instead of resetting it.
+        let s = self.ch();
+        self.buff.push(s as u8);
+        self.pos += 1;
+        let mut count = 0;
+        while self.ch() == b'=' as i32 {
+            self.buff.push(b'=');
+            self.pos += 1;
+            count += 1;
+        }
+        self.ch() == s && count == sep
+    }
+
+    fn long_string(&mut self, keep: bool, sep: usize) -> Result<Vec<u8>, SyntaxError> {
+        let mut cont = 0i32;
+        // The second `[`.
+        self.buff.push(b'[');
+        self.pos += 1;
+        if self.at_newline() {
             self.newline()?;
         }
         loop {
@@ -344,27 +385,23 @@ impl<'a> Lexer<'a> {
                     return Err(self.lex_error(msg, true));
                 }
                 0x5B => {
-                    self.buff.push(b'[');
-                    self.pos += 1;
-                    if self.ch() == b'[' as i32 {
-                        cont += 1;
+                    if self.sep_closes(sep) {
                         self.buff.push(b'[');
                         self.pos += 1;
+                        cont += 1;
                     }
                 }
                 0x5D => {
-                    self.buff.push(b']');
-                    self.pos += 1;
-                    if self.ch() == b']' as i32 {
-                        if cont == 0 {
-                            break;
-                        }
-                        cont -= 1;
+                    if self.sep_closes(sep) {
                         self.buff.push(b']');
                         self.pos += 1;
+                        cont -= 1;
+                        if !(sep == 0 && cont >= 0) {
+                            break;
+                        }
                     }
                 }
-                0x0A => {
+                0x0A | 0x0D => {
                     self.buff.push(b'\n');
                     self.newline()?;
                     if !keep {
@@ -372,22 +409,24 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 c => {
-                    self.buff.push(c as u8);
+                    if keep {
+                        self.buff.push(c as u8);
+                    }
                     self.pos += 1;
                 }
             }
         }
-        self.buff.push(b']');
-        self.pos += 1;
-        // `luaZ_buffer + 2, l - 5` with `l` counting the terminator: the text between the brackets.
+        // `luaZ_buffer + (2 + sep)`, `bufflen - 2 * (2 + sep)`: the text between the brackets.
         // A comment's buffer was reset at each newline and holds no string.
         if !keep {
             return Ok(Vec::new());
         }
-        Ok(self.buff[2..self.buff.len() - 2].to_vec())
+        let n = 2 + sep;
+        Ok(self.buff[n..self.buff.len() - n].to_vec())
     }
 
-    /// 5.0's `read_string`: `\n` ends it unfinished, `\r` is kept, `\ddd` is up to three digits.
+    /// 5.1's `read_string`: a newline (`\n` or `\r`) ends it unfinished, `\ddd` is up to three
+    /// digits.
     fn string(&mut self, delim: u8) -> Result<Token, SyntaxError> {
         self.buff.clear();
         self.buff.push(delim);
@@ -395,7 +434,7 @@ impl<'a> Lexer<'a> {
         while self.ch() != delim as i32 {
             match self.ch() {
                 EOZ => return Err(self.lex_error("unfinished string", true)),
-                0x0A => return Err(self.lex_error("unfinished string", false)),
+                0x0A | 0x0D => return Err(self.lex_error("unfinished string", false)),
                 0x5C => {
                     self.pos += 1;
                     let e = self.ch();
@@ -412,7 +451,7 @@ impl<'a> Lexer<'a> {
                     if let Some(b) = simple {
                         self.buff.push(b);
                         self.pos += 1;
-                    } else if e == 0x0A {
+                    } else if e == 0x0A || e == 0x0D {
                         self.buff.push(b'\n');
                         self.newline()?;
                     } else if e == EOZ {
@@ -450,30 +489,15 @@ impl<'a> Lexer<'a> {
         Ok(t)
     }
 
-    /// 5.0's `read_numeral`: digits, one `.`, digits, an exponent; it stops at anything else, so
-    /// `0x10` is the number `0` then the name `x10`.
+    /// 5.1's `read_numeral`: digits and points, an exponent sign after an `e`, then any letters,
+    /// digits and underscores, all read by `luaO_str2d`. So `0x10` is sixteen, and `1..2` a
+    /// malformed number.
     fn numeral(&mut self, comma: bool) -> Result<Token, SyntaxError> {
         self.buff.clear();
         if comma {
             self.buff.push(b'.');
         }
-        while is_digit(self.ch()) {
-            self.buff.push(self.ch() as u8);
-            self.pos += 1;
-        }
-        if self.ch() == b'.' as i32 {
-            self.buff.push(b'.');
-            self.pos += 1;
-            if self.ch() == b'.' as i32 {
-                self.buff.push(b'.');
-                self.pos += 1;
-                return Err(self.lex_error(
-                    "ambiguous syntax (decimal point x string concatenation)",
-                    false,
-                ));
-            }
-        }
-        while is_digit(self.ch()) {
+        while is_digit(self.ch()) || self.ch() == b'.' as i32 {
             self.buff.push(self.ch() as u8);
             self.pos += 1;
         }
@@ -484,10 +508,10 @@ impl<'a> Lexer<'a> {
                 self.buff.push(self.ch() as u8);
                 self.pos += 1;
             }
-            while is_digit(self.ch()) {
-                self.buff.push(self.ch() as u8);
-                self.pos += 1;
-            }
+        }
+        while is_alpha(self.ch()) || is_digit(self.ch()) || self.ch() == b'_' as i32 {
+            self.buff.push(self.ch() as u8);
+            self.pos += 1;
         }
         match crate::number::str2d(&self.buff) {
             Some(n) => {

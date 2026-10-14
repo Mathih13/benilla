@@ -1,9 +1,40 @@
-//! The math library (5.0's `lmathlib.c`, radians, with the global `__pow` that `^` calls) and
-//! 1.12's `bit` library (`0x7fadc0`).
+//! The math library (`lmathlib.c`, radians) and 1.12's `bit` library (`0x7fadc0`).
 
 use crate::api::R;
 use crate::value::Value;
 use crate::vm::Vm;
+
+/// The math function benilla has under `name`, for a state that registers its own list.
+pub(crate) fn native(name: &str) -> Option<crate::heap::NativeFn> {
+    Some(match name {
+        "abs" => |vm, n| un(vm, n, f64::abs),
+        "sin" => |vm, n| un(vm, n, f64::sin),
+        "cos" => |vm, n| un(vm, n, f64::cos),
+        "tan" => |vm, n| un(vm, n, f64::tan),
+        "asin" => |vm, n| un(vm, n, f64::asin),
+        "acos" => |vm, n| un(vm, n, f64::acos),
+        "atan" => |vm, n| un(vm, n, f64::atan),
+        "atan2" => |vm, n| bin_rev(vm, n, f64::atan2),
+        "ceil" => |vm, n| un(vm, n, f64::ceil),
+        "floor" => |vm, n| un(vm, n, f64::floor),
+        // C's `fmod`: the sign of the dividend.
+        "fmod" | "mod" => |vm, n| bin_rev(vm, n, |a, b| a % b),
+        "frexp" => frexp,
+        "ldexp" => ldexp,
+        "sqrt" => |vm, n| un(vm, n, f64::sqrt),
+        "min" => min,
+        "max" => max,
+        "log" => |vm, n| un(vm, n, f64::ln),
+        "log10" => |vm, n| un(vm, n, f64::log10),
+        "exp" => |vm, n| un(vm, n, f64::exp),
+        "deg" => |vm, n| un(vm, n, f64::to_degrees),
+        "pow" => |vm, n| bin_rev(vm, n, f64::powf),
+        "rad" => |vm, n| un(vm, n, f64::to_radians),
+        "random" => random,
+        "randomseed" => randomseed,
+        _ => return None,
+    })
+}
 
 pub fn open(vm: &mut Vm) {
     let t = vm.heap.new_table(0, 5);
@@ -15,11 +46,11 @@ pub fn open(vm: &mut Vm) {
         ("asin", |vm, n| un(vm, n, f64::asin)),
         ("acos", |vm, n| un(vm, n, f64::acos)),
         ("atan", |vm, n| un(vm, n, f64::atan)),
-        ("atan2", |vm, n| bin(vm, n, f64::atan2)),
+        ("atan2", |vm, n| bin_rev(vm, n, f64::atan2)),
         ("ceil", |vm, n| un(vm, n, f64::ceil)),
         ("floor", |vm, n| un(vm, n, f64::floor)),
         // C's `fmod`: the sign of the dividend.
-        ("mod", |vm, n| bin(vm, n, |a, b| a % b)),
+        ("mod", |vm, n| bin_rev(vm, n, |a, b| a % b)),
         ("frexp", frexp),
         ("ldexp", ldexp),
         ("sqrt", |vm, n| un(vm, n, f64::sqrt)),
@@ -29,7 +60,7 @@ pub fn open(vm: &mut Vm) {
         ("log10", |vm, n| un(vm, n, f64::log10)),
         ("exp", |vm, n| un(vm, n, f64::exp)),
         ("deg", |vm, n| un(vm, n, f64::to_degrees)),
-        ("pow", |vm, n| bin(vm, n, f64::powf)),
+        ("pow", |vm, n| bin_rev(vm, n, f64::powf)),
         ("rad", |vm, n| un(vm, n, f64::to_radians)),
         ("random", random),
         ("randomseed", randomseed),
@@ -54,6 +85,14 @@ pub fn open(vm: &mut Vm) {
 fn un(vm: &mut Vm, nargs: usize, f: fn(f64) -> f64) -> R<usize> {
     let x = vm.check_number(nargs, 1)?;
     Ok(vm.ret1(Value::Num(f(x))))
+}
+
+/// A two-argument C call such as `fmod(luaL_checknumber(L, 1), luaL_checknumber(L, 2))`: gcc
+/// evaluated the arguments right to left, so the second is checked first.
+fn bin_rev(vm: &mut Vm, nargs: usize, f: fn(f64, f64) -> f64) -> R<usize> {
+    let b = vm.check_number(nargs, 2)?;
+    let a = vm.check_number(nargs, 1)?;
+    Ok(vm.ret1(Value::Num(f(a, b))))
 }
 
 fn bin(vm: &mut Vm, nargs: usize, f: fn(f64, f64) -> f64) -> R<usize> {
@@ -84,9 +123,11 @@ fn frexp(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(2)
 }
 
+/// `ldexp(luaL_checknumber(L, 1), luaL_checkint(L, 2))`: gcc evaluated the arguments right to
+/// left, so the second is checked first.
 fn ldexp(vm: &mut Vm, nargs: usize) -> R<usize> {
-    let x = vm.check_number(nargs, 1)?;
     let e = vm.check_int(nargs, 2)?;
+    let x = vm.check_number(nargs, 1)?;
     Ok(vm.ret1(Value::Num(x * 2f64.powi(e))))
 }
 
@@ -112,13 +153,58 @@ fn max(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(vm.ret1(Value::Num(m)))
 }
 
-/// MSVC's `rand()`: the client's generator, seeded 1 until `randomseed`.
-fn rand(vm: &mut Vm) -> u32 {
-    vm.rand_seed = vm.rand_seed.wrapping_mul(214013).wrapping_add(2531011);
-    (vm.rand_seed >> 16) & 0x7fff
+/// glibc's `rand()`: `random_r`'s additive feedback generator (`TYPE_3`, `r[i] = r[i-3] +
+/// r[i-31]`), as the script host's 5.1 build called it. Its state is the process's in C, shared by
+/// every VM; here it is the thread's, the one the UI's VMs run on.
+struct GlibcRand {
+    r: [i32; 34],
+    i: usize,
 }
 
-const RAND_MAX: u32 = 0x7fff;
+impl GlibcRand {
+    /// `srandom_r`: the 31 words from `seed` by `16807 * w % (2^31 - 1)`, then 310 outputs dropped.
+    fn seeded(seed: u32) -> GlibcRand {
+        let mut r = [0i32; 34];
+        let mut word = if seed == 0 { 1 } else { seed as i32 };
+        r[0] = word;
+        for slot in r.iter_mut().take(31).skip(1) {
+            let (hi, lo) = (word / 127_773, word % 127_773);
+            word = 16807i32
+                .wrapping_mul(lo)
+                .wrapping_sub(2836i32.wrapping_mul(hi));
+            if word < 0 {
+                word = word.wrapping_add(2_147_483_647);
+            }
+            *slot = word;
+        }
+        for k in 31..34 {
+            r[k] = r[k - 31];
+        }
+        let mut g = GlibcRand { r, i: 34 };
+        for _ in 0..310 {
+            g.next();
+        }
+        g
+    }
+
+    fn next(&mut self) -> u32 {
+        let v = self.r[(self.i + 34 - 31) % 34].wrapping_add(self.r[(self.i + 34 - 3) % 34]);
+        self.r[self.i % 34] = v;
+        self.i += 1;
+        (v as u32) >> 1
+    }
+}
+
+thread_local! {
+    static RAND: std::cell::RefCell<GlibcRand> = std::cell::RefCell::new(GlibcRand::seeded(1));
+}
+
+fn rand(_vm: &mut Vm) -> u32 {
+    RAND.with(|g| g.borrow_mut().next())
+}
+
+/// glibc's `RAND_MAX`.
+const RAND_MAX: u32 = 0x7fff_ffff;
 
 fn random(vm: &mut Vm, nargs: usize) -> R<usize> {
     let r = (rand(vm) % RAND_MAX) as f64 / RAND_MAX as f64;
@@ -146,8 +232,31 @@ fn random(vm: &mut Vm, nargs: usize) -> R<usize> {
 
 fn randomseed(vm: &mut Vm, nargs: usize) -> R<usize> {
     let s = vm.check_int(nargs, 1)?;
-    vm.rand_seed = s as u32;
+    RAND.with(|g| *g.borrow_mut() = GlibcRand::seeded(s as u32));
     Ok(0)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::GlibcRand;
+
+    extern "C" {
+        fn srand(seed: u32);
+        fn rand() -> i32;
+    }
+
+    /// The emulation against the C library the build links.
+    #[test]
+    fn rand_is_glibcs() {
+        for seed in [1u32, 0, 42, 7, 123_456_789, u32::MAX, 0x8000_0000] {
+            let mut g = GlibcRand::seeded(seed);
+            // SAFETY: plain libc calls; no other test in this binary uses `rand`.
+            unsafe { srand(seed) };
+            for _ in 0..1000 {
+                assert_eq!(g.next() as i32, unsafe { rand() }, "seed {seed}");
+            }
+        }
+    }
 }
 
 // ── bit ──────────────────────────────────────────────────────────────────────────────────────

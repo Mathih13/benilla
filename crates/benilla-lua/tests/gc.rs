@@ -78,7 +78,10 @@ fn a_freed_string_slot_is_safe_to_reuse_as_a_key() {
 #[test]
 fn forks_sharing_code_each_keep_its_constants() {
     let mut a = benilla_lua::new_state();
-    run(&mut a, "function f() return 'a constant string, longer than inline' .. 1 end");
+    run(
+        &mut a,
+        "function f() return 'a constant string, longer than inline' .. 1 end",
+    );
     let mut b = a.clone();
     for _ in 0..4 {
         a.full_gc();

@@ -64,7 +64,7 @@ pub enum Stat {
         cond: Expr,
         body: Block,
     },
-    /// 5.0's `until` sees none of the body's locals.
+    /// 5.1's `repeat`: the `until` condition sees the body's locals.
     Repeat {
         body: Block,
         cond: Expr,
@@ -73,22 +73,25 @@ pub enum Stat {
         arms: Vec<(Expr, Block)>,
         orelse: Option<Block>,
     },
-    /// 5.0's numeric for: the variable is the counter itself, beside its two hidden locals.
+    /// 5.1's numeric for: three hidden locals count, and the variable is a fresh copy of the
+    /// index each iteration.
     NumFor {
-        var: LocalId,
+        index: LocalId,
         limit: LocalId,
         step: LocalId,
+        var: LocalId,
         start_e: Expr,
         limit_e: Expr,
         step_e: Option<Expr>,
         body: Block,
         line: u32,
     },
-    /// 5.0's generic for: `(for generator)`, `(for state)`, and the first user variable is the
-    /// control.
+    /// 5.1's generic for: `(for generator)`, `(for state)`, `(for control)` hidden, and the
+    /// variables fresh each iteration.
     GenFor {
         generator: LocalId,
         state: LocalId,
+        control: LocalId,
         vars: Vec<LocalId>,
         exprs: Vec<Expr>,
         body: Block,

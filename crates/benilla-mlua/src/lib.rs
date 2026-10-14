@@ -86,10 +86,10 @@ impl Default for Lua {
 }
 
 impl Lua {
-    /// A state with 1.12's libraries open.
+    /// A state with Lua 5.1's standard libraries open, as mlua's `Lua::new()` opens them.
     pub fn new() -> Lua {
         Lua::over(
-            Box::new(benilla_lua::new_state()),
+            Box::new(benilla_lua::new_script_host_state()),
             NEXT_FAMILY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         )
     }
@@ -206,12 +206,8 @@ impl Lua {
     }
 
     pub fn create_table_with_capacity(&self, narr: usize, nrec: usize) -> Result<Table> {
-        let lnh = if nrec == 0 {
-            0
-        } else {
-            (usize::BITS - (nrec - 1).leading_zeros()) as u8
-        };
-        let t = self.vm().heap.new_table(narr, lnh);
+        // `lua_createtable(L, narr, nrec)`.
+        let t = self.vm().heap.new_table(narr, nrec);
         Ok(Table(self.make_ref(benilla_lua::Value::Table(t))))
     }
 
@@ -1531,6 +1527,12 @@ impl<'a> Chunk<'a> {
     }
 
     fn compile(&self, src: &[u8]) -> Result<Function> {
+        // mlua hands the name to C as a C string, which a NUL cannot be in.
+        if let Some(pos) = self.name.bytes().position(|b| b == 0) {
+            return Err(Error::runtime(format!(
+                "invalid name: nul byte found in provided data at position: {pos}"
+            )));
+        }
         if src.first() == Some(&0x1b) {
             return Err(Error::SyntaxError {
                 message: "attempt to load a binary chunk".into(),

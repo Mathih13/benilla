@@ -1,10 +1,26 @@
-//! The table library: 5.0's `ltablib.c`, `n`-based end to end through `luaL_getn`/`luaL_setn`,
-//! and 5.0's own quicksort, so an inconsistent comparator does what it does in the client.
+//! The table library: `ltablib.c` as the script host runs it, `n`-based through
+//! `luaL_getn`/`luaL_setn`, and its own quicksort, so an inconsistent comparator does what it
+//! does in the client.
 
 use crate::api::R;
 use crate::lib_base::{getn, setn};
 use crate::value::{TableRef, Value, V};
 use crate::vm::Vm;
+
+/// The table function benilla has under `name`, for a state that registers its own list.
+pub(crate) fn native(name: &str) -> Option<crate::heap::NativeFn> {
+    Some(match name {
+        "concat" => concat,
+        "foreach" => foreach,
+        "foreachi" => foreachi,
+        "getn" => getn_,
+        "setn" => setn_,
+        "sort" => sort,
+        "insert" => insert,
+        "remove" => remove,
+        _ => return None,
+    })
+}
 
 pub fn open(vm: &mut Vm) {
     let t = vm.heap.new_table(0, 3);
@@ -125,29 +141,45 @@ fn remove(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(vm.ret1(out))
 }
 
+/// 5.1's `tconcat`: items `i` (1) to `j` (`getn`), each a string or a number.
 fn concat(vm: &mut Vm, nargs: usize) -> R<usize> {
     let sep = vm.opt_str(nargs, 2, b"")?;
-    let mut i = vm.opt_int(nargs, 3, 1)? as i64;
-    let mut n = vm.opt_int(nargs, 4, 0)? as i64;
     let t = vm.check_table(nargs, 1)?;
-    if n == 0 {
-        n = getn(vm, t) as i64;
-    }
+    let mut i = vm.opt_int(nargs, 3, 1)?;
+    let last = if vm.arg(nargs, 3).is_nil() {
+        getn(vm, t) as i32
+    } else {
+        vm.check_int(nargs, 4)?
+    };
     let sep = vm.heap.str(sep).to_vec();
     let mut out = Vec::new();
-    while i <= n {
-        let v = rawgeti(vm, t, i);
-        let Some(s) = (match v.unpack() {
-            V::Str(_) | V::Num(_) => vm.tostr(v),
-            _ => None,
-        }) else {
-            return Err(vm.arg_error(1, "table contains non-strings"));
-        };
-        out.extend_from_slice(vm.heap.str(s));
-        if i != n {
-            out.extend_from_slice(&sep);
+    // `addfield`.
+    let add = |vm: &mut Vm, out: &mut Vec<u8>, i: i32| -> R<()> {
+        let v = rawgeti(vm, t, i as i64);
+        match matches!(v.unpack(), V::Str(_) | V::Num(_))
+            .then(|| vm.tostr(v))
+            .flatten()
+        {
+            Some(s) => {
+                out.extend_from_slice(vm.heap.str(s));
+                Ok(())
+            }
+            None => {
+                let msg = format!(
+                    "invalid value ({}) at index {i} in table for `concat'",
+                    v.type_name()
+                );
+                Err(vm.error_at(1, &msg))
+            }
         }
+    };
+    while i < last {
+        add(vm, &mut out, i)?;
+        out.extend_from_slice(&sep);
         i += 1;
+    }
+    if i == last {
+        add(vm, &mut out, i)?;
     }
     Ok(vm.ret_str(&out))
 }

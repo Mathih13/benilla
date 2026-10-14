@@ -1,5 +1,5 @@
-//! The virtual machine: one stack, one call-frame list, and 5.0's semantics for calls,
-//! metamethods, coercions and error messages.
+//! The virtual machine: one stack, one call-frame list, and the script host's 5.1 semantics for
+//! calls, metamethods, coercions and error messages.
 
 use std::rc::Rc;
 
@@ -126,8 +126,6 @@ pub struct Vm {
     c_depth: u32,
     /// The handler of each active protected call, innermost last; `None` for `pcall`.
     handlers: Vec<Option<Value>>,
-    /// MSVC's `rand()` state, which `math.random` steps; 1 until `randomseed`.
-    pub rand_seed: u32,
     /// Collect at every safe point: a test switch that finds a value the roots miss.
     pub gc_stress: bool,
     /// Code and upvalue lists a hot reload replaced, kept while a frame may still run them.
@@ -250,8 +248,9 @@ impl Vm {
             next: s(b"next"),
             gpow: s(b"__pow"),
         };
-        let globals = heap.new_table(0, 0);
-        let registry = heap.new_table(0, 0);
+        // `lua_newstate`: both made by `luaH_new(L, 0, 2)`.
+        let globals = heap.new_table(0, 2);
+        let registry = heap.new_table(0, 2);
         let mut vm = Vm {
             heap,
             stack: vec![Value::Nil; 256],
@@ -266,7 +265,6 @@ impl Vm {
             names,
             c_depth: 0,
             handlers: Vec::new(),
-            rand_seed: 1,
             gc_stress: false,
             retired: Vec::new(),
             fenv_gen: 0,
@@ -836,16 +834,8 @@ impl Vm {
                 Arith::Sub => x - y,
                 Arith::Mul => x * y,
                 Arith::Div => x / y,
-                Arith::Pow => {
-                    let f = self
-                        .heap
-                        .table(self.globals)
-                        .get(Value::Str(self.names.gpow));
-                    if !matches!(f.unpack(), V::Func(_)) {
-                        return Err(self.rt_error("`__pow' (`^' operator) is not a function"));
-                    }
-                    return self.call_tm_res(f, Value::Num(x), Value::Num(y));
-                }
+                // 5.1's `luai_numpow`: C's `pow`; a non-number goes to `__pow` below.
+                Arith::Pow => x.powf(y),
             }));
         }
         let name = match op {
@@ -1778,37 +1768,6 @@ impl Vm {
                     }
                 }};
             }
-            /// 5.0's `OP_FORLOOP` with its conversions and errors, for a loop whose registers are
-            /// not all numbers; the test follows the step's sign.
-            macro_rules! for_slow {
-                ($a:expr, $off:expr) => {{
-                    let (a, off) = ($a, $off);
-                    save!();
-                    if !matches!((r!(a)).unpack(), V::Num(_)) {
-                        return Err(self.rt_error("`for' initial value must be a number"));
-                    }
-                    let Some(limit) = self.tonumber(r!(a + 1)) else {
-                        return Err(self.rt_error("`for' limit must be a number"));
-                    };
-                    let Some(step) = self.tonumber(r!(a + 2)) else {
-                        return Err(self.rt_error("`for' step must be a number"));
-                    };
-                    r!(a + 1) = Value::Num(limit);
-                    r!(a + 2) = Value::Num(step);
-                    let V::Num(idx) = (r!(a)).unpack() else {
-                        unreachable!()
-                    };
-                    let idx = idx + step;
-                    if if step > 0.0 {
-                        idx <= limit
-                    } else {
-                        idx >= limit
-                    } {
-                        jump!(off);
-                        r!(a) = Value::num_raw(idx);
-                    }
-                }};
-            }
             /// A string key missing from table `tr`, through its metatable: the common one level
             /// (`__index` a table holding the key) inline, a longer chain by `index_meta_fast`.
             /// `None` when the full `index` must run.
@@ -2003,7 +1962,9 @@ impl Vm {
                         slow!(self.setindex(t, key, v, Some(a as usize)))?;
                     }
                     Op::NewTable(a, b, c) => {
-                        let t = self.heap.new_table(b as usize, c);
+                        let t = self
+                            .heap
+                            .new_table(b as usize, crate::compile::fb2int(c as u32) as usize);
                         r!(a) = Value::Table(t);
                         save!();
                         self.top = base!() + maxstack!();
@@ -2226,37 +2187,58 @@ impl Vm {
                         ret!(a, n);
                     }
                     Op::Return1(a) => ret!(a, 1),
+                    Op::ForPrep(a, off) => {
+                        // 5.1's `OP_FORPREP`: each control made a number, or the loop refused in
+                        // 5.1's order; the index primed one step back.
+                        save!();
+                        let Some(init) = self.tonumber(r!(a)) else {
+                            return Err(self.rt_error("`for' initial value must be a number"));
+                        };
+                        let Some(limit) = self.tonumber(r!(a + 1)) else {
+                            return Err(self.rt_error("`for' limit must be a number"));
+                        };
+                        let Some(step) = self.tonumber(r!(a + 2)) else {
+                            return Err(self.rt_error("`for' step must be a number"));
+                        };
+                        r!(a + 1) = Value::Num(limit);
+                        r!(a + 2) = Value::Num(step);
+                        r!(a) = Value::Num(init - step);
+                        jump!(off);
+                    }
+                    // The controls are numbers since `ForPrep` and no code can reach them.
                     Op::ForLoopUp(a, off) => {
-                        if let (Some(idx), Some(limit), Some(step)) =
-                            (r!(a).as_num(), r!(a + 1).as_num(), r!(a + 2).as_num())
-                        {
-                            let idx = idx + step;
-                            if idx <= limit {
-                                jump!(off);
-                                r!(a) = Value::num_raw(idx);
-                            }
-                            continue;
+                        let (idx, limit, step) = (
+                            r!(a).as_num().unwrap_or(f64::NAN),
+                            r!(a + 1).as_num().unwrap_or(f64::NAN),
+                            r!(a + 2).as_num().unwrap_or(f64::NAN),
+                        );
+                        let idx = idx + step;
+                        if idx <= limit {
+                            jump!(off);
+                            // Canonical numbers in, a canonical number out.
+                            let v = Value::num_raw(idx);
+                            r!(a) = v;
+                            r!(a + 3) = v;
                         }
-                        // A non-number: `ForLoop`'s path, which converts or raises.
-                        for_slow!(a, off);
                     }
                     Op::ForLoop(a, off) => {
-                        // Three numbers already: the step alone, nothing to convert back.
-                        if let (Some(idx), Some(limit), Some(step)) =
-                            (r!(a).as_num(), r!(a + 1).as_num(), r!(a + 2).as_num())
-                        {
-                            let idx = idx + step;
-                            if if step > 0.0 {
-                                idx <= limit
-                            } else {
-                                idx >= limit
-                            } {
-                                jump!(off);
-                                r!(a) = Value::num_raw(idx);
-                            }
-                            continue;
+                        let (idx, limit, step) = (
+                            r!(a).as_num().unwrap_or(f64::NAN),
+                            r!(a + 1).as_num().unwrap_or(f64::NAN),
+                            r!(a + 2).as_num().unwrap_or(f64::NAN),
+                        );
+                        let idx = idx + step;
+                        if if step > 0.0 {
+                            idx <= limit
+                        } else {
+                            limit <= idx
+                        } {
+                            jump!(off);
+                            // Canonical numbers in, a canonical number out.
+                            let v = Value::num_raw(idx);
+                            r!(a) = v;
+                            r!(a + 3) = v;
                         }
-                        for_slow!(a, off);
                     }
                     Op::TForPrep(a, off) => {
                         if let V::Table(_) = (r!(a)).unpack() {
@@ -2268,23 +2250,25 @@ impl Vm {
                     }
                     Op::TForLoop(a, nvar) => {
                         let nv = nvar as usize;
+                        let cb = a as usize + 3;
                         // The built-in `next` over a table, stepped without a call: what the
                         // call would do, minus the frame. An invalid key takes the call, which
-                        // raises from inside `next` as 5.0 does.
+                        // raises from inside `next` as before.
                         if r!(a) == self.builtin_next && !self.builtin_next.is_nil() {
                             if let V::Table(t) = (r!(a + 1)).unpack() {
                                 if let Ok(step) = self.heap.table(t).next(r!(a + 2)) {
                                     let (k, v) = step.unwrap_or((Value::Nil, Value::Nil));
-                                    r!(a + 2) = k;
+                                    r!(cb) = k;
                                     if nv >= 2 {
-                                        r!(a + 3) = v;
+                                        r!(cb + 1) = v;
                                         for i in 2..nv {
-                                            r!(a as usize + 2 + i) = Value::Nil;
+                                            r!(cb + i) = Value::Nil;
                                         }
                                     }
                                     if k.is_nil() {
                                         ip = unsafe { ip.add(1) };
                                     } else {
+                                        r!(a + 2) = k;
                                         // SAFETY: a `TForLoop` is always followed by its `Jmp`.
                                         let Op::Jmp(back) = (unsafe { *ip }) else {
                                             unreachable!()
@@ -2295,20 +2279,18 @@ impl Vm {
                                 }
                             }
                         }
-                        let cb = a as usize + nv + 2;
-                        r!(cb) = r!(a);
-                        r!(cb + 1) = r!(a + 1);
+                        // 5.1's `OP_TFORLOOP`: the call at `R(a+3)`, its results the variables.
                         r!(cb + 2) = r!(a + 2);
+                        r!(cb + 1) = r!(a + 1);
+                        r!(cb) = r!(a);
                         self.top = base!() + cb + 3;
-                        let b0 = base!();
-                        slow!(self.call_at(b0 + cb, 2, nv as i32))?;
+                        let call_at = base!() + cb;
+                        slow!(self.call_at(call_at, 2, nv as i32))?;
                         self.top = base!() + maxstack!();
-                        for i in 0..nv {
-                            r!(a as usize + 2 + i) = r!(cb + i);
-                        }
-                        if r!(a + 2).is_nil() {
+                        if r!(cb).is_nil() {
                             ip = unsafe { ip.add(1) };
                         } else {
+                            r!(a + 2) = r!(cb);
                             // SAFETY: a `TForLoop` is always followed by its `Jmp`.
                             let Op::Jmp(back) = (unsafe { *ip }) else {
                                 unreachable!()
@@ -2398,6 +2380,12 @@ fn objname_in(p: &Proto, heap: &Heap, pc: usize, reg: usize) -> Option<(&'static
             _ => None,
         },
         Op::Move(a, b) if (b as usize) < (a as usize) => objname_in(p, heap, last, b as usize),
+        Op::GetUpval(_, u) => Some((
+            "upvalue",
+            p.upval_names
+                .get(u as usize)
+                .map_or(b"?".to_vec(), |n| n.to_vec()),
+        )),
         Op::GetTable(_, _, c) => Some(("field", kname(c))),
         Op::GetField(_, _, kx) => Some(("field", kname(kx + RK_CONST))),
         Op::SelfOp(_, _, c) => Some(("method", kname(c))),
@@ -2443,15 +2431,16 @@ fn symbexec(p: &Proto, lastpc: usize, reg: usize) -> Option<usize> {
             Op::LoadNil(a, b) => (a as usize..=b as usize).contains(&reg),
             Op::SelfOp(a, ..) | Op::SelfField(a, ..) => writes(a, 2),
             Op::Call(a, ..) | Op::TailCall(a, ..) => reg >= a as usize,
-            Op::ForLoop(a, _) | Op::ForLoopUp(a, _) => writes(a, 1),
-            Op::TForLoop(a, n) => reg >= a as usize + 2 && reg < a as usize + 2 + n as usize,
+            Op::ForPrep(a, _) => writes(a, 3),
+            Op::ForLoop(a, _) | Op::ForLoopUp(a, _) => writes(a, 1) || reg == a as usize + 3,
+            Op::TForLoop(a, n) => reg >= a as usize + 2 && reg < a as usize + 3 + n as usize,
             _ => false,
         };
         if hit {
             last = Some(pc);
         }
         let jump = match op {
-            Op::Jmp(off) | Op::TForPrep(_, off) => Some(off),
+            Op::Jmp(off) | Op::TForPrep(_, off) | Op::ForPrep(_, off) => Some(off),
             _ => None,
         };
         if let Some(off) = jump {

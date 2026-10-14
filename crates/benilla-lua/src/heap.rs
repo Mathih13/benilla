@@ -377,8 +377,9 @@ impl Heap {
         out
     }
 
-    pub fn new_table(&mut self, narray: usize, lnhash: u8) -> TableRef {
-        let mut t = Table::new(narray, lnhash);
+    /// `luaH_new`: `narray` array slots and room for `nhash` keys.
+    pub fn new_table(&mut self, narray: usize, nhash: usize) -> TableRef {
+        let mut t = Table::new(narray, nhash);
         t.owner = self.cur_source;
         self.bytes += t.bytes();
         TableRef(self.tables.alloc(t))

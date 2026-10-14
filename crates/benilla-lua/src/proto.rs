@@ -120,14 +120,18 @@ pub enum Op {
     Return(Reg, u8),
     /// Return `R(a)` alone.
     Return1(Reg),
-    /// 5.0's numeric loop step: `R(a) += R(a+2)`, and while within `R(a+1)`, jump.
+    /// 5.1's `FORPREP`: `R(a)`, `R(a+1)`, `R(a+2)` made numbers or the loop refused, the index
+    /// primed one step back; then the jump to the loop's `ForLoop`.
+    ForPrep(Reg, i32),
+    /// 5.1's `FORLOOP`: `R(a) += R(a+2)`; while within `R(a+1)`, `R(a+3) = R(a)` and jump.
     ForLoop(Reg, i32),
     /// `ForLoop` whose step the compiler knows is a positive constant: the test is `<=`.
     ForLoopUp(Reg, i32),
     /// 5.0's `TFORPREP`: a table generator becomes `next` over it; then the jump.
     TForPrep(Reg, i32),
-    /// 5.0's `TFORLOOP`: call `R(a)(R(a+1), R(a+2))` into the `b` variables; on nil, skip the
-    /// next instruction, a jump back to the body.
+    /// 5.1's `TFORLOOP`: call `R(a)(R(a+1), R(a+2))` into the `b` variables from `R(a+3)`; unless
+    /// the first is nil it becomes the control `R(a+2)`, else the next instruction, the jump back
+    /// to the body, is skipped.
     TForLoop(Reg, u8),
     /// `R(a)[base + i] = R(a + i)` for `i` in `1..=n`: the pending list items.
     SetList(Reg, u32, u16),

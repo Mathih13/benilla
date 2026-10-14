@@ -25,7 +25,9 @@ local function E(f, ...)
     for i = 2, r.n do o[i - 1] = S1(r[i]) end
     return "ok " .. table.concat(o, ",", 1, r.n - 1)
   end
-  return "err " .. tostring(r[2])
+  local t = type(r[2])
+  -- A table or function error value prints its type: its address differs every run.
+  return "err " .. ((t == "table" or t == "function") and t or tostring(r[2]))
 end
 "#;
 
@@ -174,6 +176,99 @@ const CASES: &[(&str, &str)] = &[
     ("pow_metamethod", "local t = setmetatable({}, {__pow = function(a, b) return 'mm' end}) return S(E(function() return t ^ 2 end), E(function() return 2 ^ t end))"),
     ("upvalue_error_name", "local u return S(E(function() return u + 1 end), E(function() return u.x end), E(function() u() end))"),
     ("vararg_expr", "return S(E(loadstring, 'return function(...) return ... end'))"),
+    // ── Numbers as the C library reads and writes them ──
+    ("nonfinite_print", "return S(1/0, -1/0, string.format('%f %g %e %5.1f', 1/0, -1/0, 1/0, -1/0), tostring(1/0) .. '', 1e308 * 10)"),
+    ("nan_print", "local n = 0/0 return S(tostring(n) == tostring(n), string.format('%d', 3.7), string.format('%x', 255), string.format('%5.2s|', 'abc'))"),
+    ("tonumber_edges", r#"return S(tonumber("inf"), tonumber("-inf"), tonumber("nan") ~= nil, tonumber("1e"), tonumber("0x"), tonumber(" 0x1A "), tonumber("0x1p4"), tonumber("1e+"), tonumber(".5"), tonumber("5."), tonumber("- 1"), tonumber("1 2"), tonumber(""), tonumber("  "), tonumber("0x10", 10), tonumber("10", 36), tonumber("z", 36))"#),
+    ("tonumber_base_edges", r#"return S(tonumber("-1", 16), tonumber("0x10", 16), tonumber(" ff ", 16), tonumber("ffffffffffffffffffff", 16), tonumber("1z", 36), tonumber("8", 8), tonumber("", 16), tonumber("-ff", 16), tonumber("+7", 8))"#),
+    ("numeral_lexing", "return S(1e10, .5, 5., 3e-2, 0x7fffffff, 1E2, 0xA0, 2^53 + 1)"),
+    ("coerce_edges", r#"return S("0x10" * 1, " 2 " * " 3 ", E(function() return "1e" + 1 end), E(function() return "inf" + 0 end), 10 .. "", 1e100 .. "", -0.0 .. "", 2^63 .. "")"#),
+    // ── Syntax errors and the lexer's edges, through `loadstring` ──
+    ("syntax_errors", r#"local o = {}
+        for _, src in ipairs({"x = 1 +", "local function", "x = #t", "x = a % b",
+            "return function(...) return ... end", "for x do end", "x = 1..2", "x = \"a\nb\"",
+            "x = [[a", "x = 1\1", "f()\n(g)()", "break", "(a) = 1", "if x then\nend end",
+            "do\nx = 1", "x = 'a\rb'", "x = 1\ry = +", "x = 1\r\ny = +", "x = 1\n\ry = +",
+            "x = [=x", "x = [==[a]=]", "x = 0x", "x = 1e", "x = 3x", "--[==[ c\n]==] y = +",
+            "--[[ a [[ b ]] c ]] y = +", "x = [[a\r\nb\rc\n\rd]] y = +"}) do
+          local f, e = loadstring(src, "=t")
+          table.insert(o, (f and "ok" or e))
+        end
+        return table.concat(o, " | ")"#),
+    ("long_strings", r#"return S([[a [[b]] c]], [==[a ]] [[ ]=] b]==], [[
+first newline skipped]], [=[
+also]=], [[a
+b]])"#),
+    // ── Table layout, which `pairs` order shows ──
+    ("pairs_constructors", r#"local o = {}
+        for n = 1, 20 do
+          local parts = {}
+          for i = 1, n do table.insert(parts, "k" .. i .. "=" .. i) end
+          local t = loadstring("return {" .. table.concat(parts, ",") .. "}")()
+          local ks = {} for k in pairs(t) do table.insert(ks, k) end
+          table.insert(o, table.concat(ks, " "))
+        end
+        return table.concat(o, " | ")"#),
+    ("pairs_mixed", r#"local function keys(t) local ks = {} for k, v in pairs(t) do table.insert(ks, tostring(k) .. "=" .. tostring(v)) end return table.concat(ks, " ") end
+        local a = {1, 2, 3, x = 1, y = 2, [10] = 5, [1.5] = 6, [-1] = 7, z = 3}
+        local b = {} for i = 1, 10 do b[i] = i end b[5] = nil b[20] = 20 b.k = 1
+        local c = {} for i = 10, 1, -1 do c[i * 3] = i end
+        local d = {["a"] = 1, [2] = 2, [true] = 3, b = 4}
+        local e = {1, 2, nil, 4, nil, nil, 7}
+        return keys(a) .. " | " .. keys(b) .. " | " .. keys(c) .. " | " .. keys(d) .. " | " .. keys(e)"#),
+    ("pairs_growth", r#"local o = {}
+        local t = {}
+        for i = 1, 40 do t["s" .. i] = i if i == 13 or i == 27 then local ks = {} for k in pairs(t) do table.insert(ks, k) end table.insert(o, table.concat(ks, " ")) end end
+        for i = 1, 40, 3 do t["s" .. i] = nil end
+        for i = 41, 50 do t["s" .. i] = i end
+        local ks = {} for k in pairs(t) do table.insert(ks, k) end table.insert(o, table.concat(ks, " "))
+        return table.concat(o, " | ")"#),
+    ("newindex_layout", r#"local log = {}
+        local t = setmetatable({}, {__newindex = function(t, k, v) table.insert(log, k) end})
+        for i = 1, 10 do t["k" .. i] = i end
+        rawset(t, "z", 1) rawset(t, "y", 2) rawset(t, "x", 3)
+        local ks = {} for k in pairs(t) do table.insert(ks, k) end
+        local u = setmetatable({}, {__newindex = function(t, k, v) rawset(t, k, v * 10) end})
+        u.a = 1 u.b = 2 u.a = 3
+        local us = {} for k, v in pairs(u) do table.insert(us, k .. "=" .. v) end
+        return table.concat(log, ",") .. " | " .. table.concat(ks, ",") .. " | " .. table.concat(us, ",")"#),
+    ("metamethods", r#"local mt = {}
+        mt.__concat = function(a, b) return "cat" end
+        mt.__eq = function(a, b) return true end
+        mt.__lt = function(a, b) return true end
+        mt.__le = function(a, b) return false end
+        mt.__unm = function(a) return "neg" end
+        mt.__call = function(self, x) return "called " .. tostring(x) end
+        mt.__index = function(t, k) return "idx " .. k end
+        mt.__tostring = function() return "TOSTR" end
+        local a, b = setmetatable({}, mt), setmetatable({}, mt)
+        local c = setmetatable({}, {__metatable = "locked"})
+        return S(a .. "x", "x" .. a, a == b, a < b, a <= b, a > b, -a, a(5), a.foo, tostring(a),
+                 getmetatable(c), E(setmetatable, c, {}), rawequal(a, b), E(function() return a < 1 end))"#),
+    ("le_fallback", r#"local mt = {__lt = function(a, b) return a.v < b.v end}
+        local a, b = setmetatable({v = 1}, mt), setmetatable({v = 2}, mt)
+        return S(E(function() return a <= b end), E(function() return b >= a end), a < b)"#),
+    ("varargs_arg", r#"local function f(...) return arg.n, arg[1], arg[3] end
+        return S(E(f, 1, nil, 3), E(function(a, ...) return a, arg.n end, 9))"#),
+    ("pairs_libraries", r#"local o = {}
+        for _, lib in ipairs({"string", "table", "math", "bit"}) do
+          local ks = {} for k in pairs(_G[lib]) do table.insert(ks, k) end
+          table.insert(o, lib .. ": " .. table.concat(ks, " "))
+        end
+        return table.concat(o, " | ")"#),
+    ("pairs_globals", r#"local ks, n = {}, 0
+        for k in pairs(_G) do n = n + 1 if n <= 400 then table.insert(ks, tostring(k)) end end
+        return n .. ": " .. table.concat(ks, " ")"#),
+    ("getn_holes", r#"local function g(t) return table.getn(t) end
+        local a = {1, 2, nil, 4}
+        local b = {nil, nil, 3}
+        local c = {} c[1] = 1 c[2] = 2 c[4] = 4
+        local d = {} for i = 1, 20 do d[i] = i end d[7] = nil d[15] = nil
+        local e = {} for i = 1, 10 do e[i] = i end for i = 12, 40 do e[i] = i end
+        local f = {n = 3}
+        local h = {} h[1] = 1 h[3] = 3 h[2] = 2 h[100] = 100
+        return S(g(a), g(b), g(c), g(d), g(e), g(f), g(h), g({}), g({nil}), g({1, nil, 3, nil, 5, 6, 7, 8}))"#),
+    ("string_metatable", r#"return S(E(function() return ("abc"):upper() end), getmetatable("x") ~= nil, E(function() local s = "x" return s.len end))"#),
     // ── The whole library surface: every global and every library member, with its type ──
     ("global_surface", r#"local o = {} for k, v in pairs(_G) do if type(k) == "string" then table.insert(o, k .. ":" .. type(v)) end end table.sort(o) return table.concat(o, " ")"#),
     ("libraries", r#"local o = {}
@@ -187,6 +282,135 @@ const CASES: &[(&str, &str)] = &[
         return table.concat(o, " ")"#),
 ];
 
+/// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.
+const SWEEP_FNS: &[&str] = &[
+    "string.byte",
+    "string.char",
+    "string.find",
+    "string.format",
+    "string.gfind",
+    "string.gsub",
+    "string.len",
+    "string.lower",
+    "string.rep",
+    "string.sub",
+    "string.upper",
+    "string.match",
+    "string.gmatch",
+    "string.reverse",
+    "table.concat",
+    "table.getn",
+    "table.setn",
+    "table.insert",
+    "table.remove",
+    "table.sort",
+    "table.foreach",
+    "table.foreachi",
+    "table.maxn",
+    "math.abs",
+    "math.ceil",
+    "math.floor",
+    "math.max",
+    "math.min",
+    "math.mod",
+    "math.fmod",
+    "math.sqrt",
+    "math.exp",
+    "math.log",
+    "math.log10",
+    "math.pow",
+    "math.frexp",
+    "math.ldexp",
+    "math.deg",
+    "math.rad",
+    "math.sin",
+    "math.cos",
+    "math.tan",
+    "math.asin",
+    "math.acos",
+    "math.atan",
+    "math.atan2",
+    "math.modf",
+    "math.cosh",
+    "math.sinh",
+    "math.tanh",
+    "tonumber",
+    "type",
+    "rawequal",
+    "rawget",
+    "rawset",
+    "select",
+    "unpack",
+    "next",
+    "ipairs",
+    "pairs",
+    "getmetatable",
+    "setmetatable",
+    "assert",
+    "error",
+    "pcall",
+    "xpcall",
+    "getfenv",
+    "setfenv",
+    "loadstring",
+    "strfind",
+    "strsub",
+    "strlen",
+    "strlower",
+    "strupper",
+    "strrep",
+    "format",
+    "gsub",
+    "tinsert",
+    "tremove",
+    "getn",
+    "foreach",
+    "foreachi",
+    "sort",
+    "abs",
+    "ceil",
+    "floor",
+    "max",
+    "min",
+    "mod",
+    "sqrt",
+    "frexp",
+    "ldexp",
+    "deg",
+    "rad",
+    "sin",
+    "cos",
+    "tan",
+];
+
+/// The argument sets, built fresh for each call so a mutation stays in it; and the function
+/// that runs one name over all of them.
+const SWEEP: &str = r#"
+local function ARGS() return {
+  {}, {nil}, {"abc"}, {"abc", 2}, {"abc", -2}, {"abc", 2, 3}, {"abc", 0, -1}, {"abc", 5, 9},
+  {"a.c", "%."}, {"hello", "l+"}, {"hello", "(l)(l)", 1}, {"hello", "l", "L"},
+  {"hello", "(h)(e)", "%2%1"}, {"x%sy", "%%"}, {"abc", "[a"}, {"abc", "(", 1}, {1.5}, {-3},
+  {0}, {"10"}, {{1, 2, 3}}, {{1, 2, 3}, 2}, {{1, 2, 3}, 2, 9}, {{"a", "b"}, "-", 1, 2},
+  {{}, 1}, {2, 3}, {"%5.2f", 3.14159}, {"%d", "x"}, {"%q", "a\"b\n\r\0"}, {true},
+  {"abc", "b", 1, true}, {1e300, 1e300}, {-1, 0.5}, {65, 66, 300}, {{3, 1, 2}, "x"},
+}
+end
+local function name(f)
+  local t, k = string.find(f, ".", 1, true)
+  if t then return _G[string.sub(f, 1, t - 1)][string.sub(f, t + 1)] end
+  return _G[f]
+end
+function SWEEP(fname)
+  local f = name(fname)
+  if type(f) ~= "function" then return "absent" end
+  local o = {}
+  for i, a in ipairs(ARGS()) do
+    o[i] = E(f, unpack(a))
+  end
+  return table.concat(o, " | ")
+end
+"#;
+
 fn run(src: &str) -> String {
     let s = UiScript::new().expect("a script host");
     match s.lua().load(src).set_name("=t").eval::<String>() {
@@ -196,6 +420,59 @@ fn run(src: &str) -> String {
 }
 
 const GOLDEN: &str = "tests/vm_parity.golden";
+
+/// `escape_default` undone: the golden file's one-line answers back to text.
+fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = it.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+            }
+            Some(c) => out.push(c),
+            None => {}
+        }
+    }
+    out
+}
+
+/// The C Lua build hands Lua an error from a Rust callback through mlua's wrapper:
+/// `runtime error: ` before the message, and a Rust-side `stack traceback:` block after it.
+/// Neither Lua nor the 1.12 client writes either, and benilla's own VM raises the message alone,
+/// so the wrapper is taken out of a golden answer before it is compared; the message must match.
+fn without_mlua_wrapper(s: &str) -> String {
+    let s = s.replace("runtime error: ", "");
+    let mut out = String::new();
+    let mut rest = s.as_str();
+    while let Some(i) = rest.find("\nstack traceback:") {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + "\nstack traceback:".len()..];
+        // The block's lines each open with a tab; one newline after it goes with it.
+        while let Some(r) = rest.strip_prefix("\n\t") {
+            rest = r.find('\n').map_or("", |j| &r[j..]);
+        }
+        rest = rest.strip_prefix('\n').unwrap_or(rest);
+        rest = rest.strip_prefix("stack traceback:").map_or(rest, |r| {
+            // A second block straight after the first, as a rethrown error carries.
+            let mut r = r;
+            while let Some(x) = r.strip_prefix("\n\t") {
+                r = x.find('\n').map_or("", |j| &x[j..]);
+            }
+            r.strip_prefix('\n').unwrap_or(r)
+        });
+    }
+    out.push_str(rest);
+    out
+}
 
 /// `name\tanswer`, one case a line, the answer escaped onto one line.
 fn render(answers: &[(&str, String)]) -> String {
@@ -207,20 +484,32 @@ fn render(answers: &[(&str, String)]) -> String {
 
 #[test]
 fn every_case_answers_as_the_c_lua_build_recorded() {
-    let answers: Vec<(&str, String)> = CASES
+    let sweep: Vec<(String, String)> = SWEEP_FNS
+        .iter()
+        .map(|f| (format!("sweep {f}"), format!("return SWEEP({f:?})")))
+        .collect();
+    let cases: Vec<(&str, String)> = CASES
+        .iter()
+        .map(|(n, b)| (*n, b.to_string()))
+        .chain(
+            sweep
+                .iter()
+                .map(|(n, b)| (n.as_str(), format!("{SWEEP}\n{b}"))),
+        )
+        .collect();
+    let answers: Vec<(&str, String)> = cases
         .iter()
         .map(|(name, body)| (*name, run(&format!("{PRELUDE}\n{body}"))))
         .collect();
-    let mut names: Vec<&str> = CASES.iter().map(|c| c.0).collect();
+    let mut names: Vec<&str> = cases.iter().map(|c| c.0).collect();
     names.sort_unstable();
     names.dedup();
-    assert_eq!(names.len(), CASES.len(), "case names are unique");
+    assert_eq!(names.len(), cases.len(), "case names are unique");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
     if std::env::var_os("BENILLA_BLESS").is_some() {
-        assert!(
-            !cfg!(feature = "benilla-vm"),
-            "the golden answers come from the C Lua build"
-        );
+        if cfg!(feature = "benilla-vm") {
+            panic!("the golden answers come from the C Lua build");
+        }
         std::fs::write(&path, render(&answers)).expect("write the golden file");
         return;
     }
@@ -232,7 +521,17 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
         let got = got.escape_default().to_string();
         match want.get(name) {
             Some(w) if *w == got => {}
-            Some(w) => failures.push(format!("{name}\n    got:  {got}\n    want: {w}")),
+            Some(w)
+                if without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string()
+                    == got => {}
+            Some(w) => {
+                let w = without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string();
+                failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
+            }
             None => failures.push(format!(
                 "{name}: no golden answer; bless on the C Lua build"
             )),
@@ -242,7 +541,7 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
         failures.is_empty(),
         "{} of {} cases differ:\n{}",
         failures.len(),
-        CASES.len(),
+        cases.len(),
         failures.join("\n")
     );
 }

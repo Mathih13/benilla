@@ -1,5 +1,5 @@
-//! The parser: Lua 5.0's `lparser.c` grammar, which the 1.12 client embeds, producing an [`ast`]
-//! with names resolved in the same pass. Messages and the token they quote are 5.0's.
+//! The parser: the script host's `lparser.c`, 5.1's with the 1.12 grammar, producing an [`ast`]
+//! with names resolved in the same pass. Messages and the token they quote are 5.1's.
 
 use std::rc::Rc;
 
@@ -46,7 +46,7 @@ pub fn parse(src: &[u8], chunkname: &[u8]) -> R<Func> {
     p.open_func(Rc::from(chunkname), 0);
     p.chunk()?;
     if p.lx.cur.tok != Tok::Eof {
-        return Err(p.lx.error("<eof> expected"));
+        return Err(p.lx.error("`<eof>' expected"));
     }
     Ok(p.close_func())
 }
@@ -131,7 +131,7 @@ impl<'a> Parser<'a> {
 
     fn checkname(&mut self) -> R<Bytes> {
         if self.tok() != Tok::Name {
-            return Err(self.lx.error("<name> expected"));
+            return Err(self.lx.error("`<name>' expected"));
         }
         let name: Bytes = Rc::from(&self.lx.cur.bytes[..]);
         self.next()?;
@@ -295,13 +295,21 @@ impl<'a> Parser<'a> {
             }
             Tok::For => out.push(self.forstat(line)?),
             Tok::Repeat => {
+                // 5.1's `repeatstat`: a loop block, and inside it the scope the condition shares
+                // with the body.
                 self.enter_block(true);
+                self.enter_block(false);
                 self.next()?;
-                let body = self.block()?;
+                let mut stats = Vec::new();
+                self.chunk_into(&mut stats)?;
                 self.check_match(Tok::Until, Tok::Repeat, line)?;
                 let cond = self.expr()?;
                 self.leave_block();
-                out.push(Stat::Repeat { body, cond });
+                self.leave_block();
+                out.push(Stat::Repeat {
+                    body: Block { stats },
+                    cond,
+                });
             }
             Tok::Function => {
                 self.next()?;
@@ -375,7 +383,8 @@ impl<'a> Parser<'a> {
     }
 
     fn forstat(&mut self, line: u32) -> R<Stat> {
-        self.enter_block(false);
+        // The loop's block, which `break` leaves, holds the control variables.
+        self.enter_block(true);
         self.next()?;
         let name = self.checkname()?;
         let s = match self.tok() {
@@ -389,9 +398,10 @@ impl<'a> Parser<'a> {
     }
 
     fn fornum(&mut self, name: Bytes, line: u32) -> R<Stat> {
-        let var = self.declare_n(&name, 0)?;
+        let index = self.declare_n(b"(for index)", 0)?;
         let limit = self.declare_n(b"(for limit)", 1)?;
         let step = self.declare_n(b"(for step)", 2)?;
+        let var = self.declare_n(&name, 3)?;
         self.check(Tok::Char(b'='))?;
         let start_e = self.expr()?;
         self.check(Tok::Char(b','))?;
@@ -401,11 +411,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let body = self.forbody(3)?;
+        let body = self.forbody(1)?;
         Ok(Stat::NumFor {
-            var,
+            index,
             limit,
             step,
+            var,
             start_e,
             limit_e,
             step_e,
@@ -417,18 +428,20 @@ impl<'a> Parser<'a> {
     fn forlist(&mut self, first: Bytes, _line: u32) -> R<Stat> {
         let generator = self.declare_n(b"(for generator)", 0)?;
         let state = self.declare_n(b"(for state)", 1)?;
-        let mut vars = vec![self.declare_n(&first, 2)?];
+        let control = self.declare_n(b"(for control)", 2)?;
+        let mut vars = vec![self.declare_n(&first, 3)?];
         while self.testnext(Tok::Char(b','))? {
             let n = self.checkname()?;
-            vars.push(self.declare_n(&n, vars.len() + 2)?);
+            vars.push(self.declare_n(&n, vars.len() + 3)?);
         }
         self.check(Tok::In)?;
         let line = self.lx.line;
         let exprs = self.explist()?;
-        let body = self.forbody(vars.len() + 2)?;
+        let body = self.forbody(vars.len())?;
         Ok(Stat::GenFor {
             generator,
             state,
+            control,
             vars,
             exprs,
             body,
@@ -436,10 +449,18 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// 5.1's `forbody`: the three control variables, then the declared ones in a block of their
+    /// own, entered fresh each iteration.
     fn forbody(&mut self, nvars: usize) -> R<Block> {
-        self.activate(nvars);
+        let total = self.fs().func.locals.len();
+        // `adjustlocalvars(ls, 3)`: the control variables, declared before the declared ones.
+        let fs = self.fs();
+        for id in total - nvars - 3..total - nvars {
+            fs.actives.push(id as LocalId);
+        }
         self.check(Tok::Do)?;
-        self.enter_block(true);
+        self.enter_block(false);
+        self.activate(nvars);
         let b = self.block()?;
         self.leave_block();
         Ok(b)

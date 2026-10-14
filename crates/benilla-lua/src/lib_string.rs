@@ -1,11 +1,30 @@
-//! The string library: 5.0.2's `lstrlib.c`, whose twelve names and messages the client carries
-//! (the pattern matcher with `%f` and `%b`, `gfind`, no `gmatch`/`match`/`reverse`). A pattern
-//! ends at its first NUL, as 5.0's matcher reads a C string.
+//! The string library: 5.1's `lstrlib.c`, whose messages the script host carries (the pattern
+//! matcher with `%f` and `%b`). A pattern ends at its first NUL, as the C matcher reads a C
+//! string.
 
 use crate::api::R;
 use crate::cfmt::{self, Spec};
 use crate::value::{Value, V};
 use crate::vm::{LuaError, Vm};
+
+/// The string function benilla has under `name`, for a state that registers its own list.
+pub(crate) fn native(name: &str) -> Option<crate::heap::NativeFn> {
+    Some(match name {
+        "len" => len,
+        "sub" => sub,
+        "lower" => lower,
+        "upper" => upper,
+        "char" => char_,
+        "rep" => rep,
+        "byte" => byte,
+        "format" => format,
+        "dump" => dump,
+        "find" => find,
+        "gfind" => gfind,
+        "gsub" => gsub,
+        _ => return None,
+    })
+}
 
 pub fn open(vm: &mut Vm) {
     let t = vm.heap.new_table(0, 4);
@@ -31,13 +50,14 @@ pub fn open(vm: &mut Vm) {
     vm.set_global("string", Value::Table(t));
 }
 
-/// 5.0's `posrelat`: a negative position counts from the end.
+/// 5.1's `posrelat`: a negative position counts back from the end, and one before the start is 0.
 fn posrelat(pos: i64, len: usize) -> i64 {
-    if pos >= 0 {
-        pos
+    let pos = if pos < 0 {
+        pos.saturating_add(len as i64 + 1)
     } else {
-        len as i64 + pos + 1
-    }
+        pos
+    };
+    pos.max(0)
 }
 
 fn len(vm: &mut Vm, nargs: usize) -> R<usize> {
@@ -49,8 +69,8 @@ fn len(vm: &mut Vm, nargs: usize) -> R<usize> {
 fn sub(vm: &mut Vm, nargs: usize) -> R<usize> {
     let s = vm.check_str(nargs, 1)?;
     let l = vm.heap.str(s).len();
-    let start = vm.check_int(nargs, 2)? as i64;
-    let end = vm.opt_int(nargs, 3, -1)? as i64;
+    let start = vm.check_integer(nargs, 2)?;
+    let end = vm.opt_integer(nargs, 3, -1)?;
     let mut start = posrelat(start, l);
     let mut end = posrelat(end, l);
     if start < 1 {
@@ -92,6 +112,7 @@ fn char_(vm: &mut Vm, nargs: usize) -> R<usize> {
     let mut out = Vec::with_capacity(nargs);
     for i in 1..=nargs {
         let c = vm.check_int(nargs, i)?;
+        // `uchar(c) == c`.
         if !(0..=255).contains(&c) {
             return Err(vm.arg_error(i, "invalid value"));
         }
@@ -112,21 +133,42 @@ fn rep(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(vm.ret_str(&out))
 }
 
-/// 5.0's `byte`: one byte, or nothing out of range.
+/// 5.1's `byte`: the bytes from `i` (1) to `j` (`i`), each a number.
 fn byte(vm: &mut Vm, nargs: usize) -> R<usize> {
     let s = vm.check_str(nargs, 1)?;
     let l = vm.heap.str(s).len();
-    let pos = posrelat(vm.opt_int(nargs, 2, 1)? as i64, l);
-    if pos <= 0 || pos as usize > l {
+    let posi = posrelat(vm.opt_integer(nargs, 2, 1)?, l);
+    let pose = posrelat(vm.opt_integer(nargs, 3, posi)?, l);
+    let posi = posi.max(1);
+    let pose = pose.min(l as i64);
+    if posi > pose {
         return Ok(0);
     }
-    let b = vm.heap.str(s)[pos as usize - 1];
-    Ok(vm.ret1(Value::Num(b as f64)))
+    let n = (pose - posi + 1) as usize;
+    for i in 0..n {
+        let b = vm.heap.str(s)[posi as usize - 1 + i];
+        vm.push(Value::Num(b as f64));
+    }
+    Ok(n)
 }
 
+/// 5.1's `dump`: a Lua function becomes a binary chunk, a native one cannot. The chunk carries
+/// 5.1's header and the function's source name, not 5.1 bytecode: the script host's
+/// `loadstring` refuses every binary chunk, so nothing reads past the header.
 fn dump(vm: &mut Vm, nargs: usize) -> R<usize> {
-    vm.check_function(nargs, 1)?;
-    Err(vm.error_at(1, "unable to dump given function"))
+    let f = vm.check_function(nargs, 1)?;
+    let V::Func(f) = f.unpack() else {
+        unreachable!("checked a function")
+    };
+    let source = match vm.heap.func(f) {
+        crate::heap::FuncObj::Lua { proto, .. } => proto.source.clone(),
+        crate::heap::FuncObj::Native { .. } => {
+            return Err(vm.error_at(1, "unable to dump given function"))
+        }
+    };
+    let mut out = b"\x1bLuaQ\x00\x01\x04\x08\x04\x08\x00".to_vec();
+    out.extend_from_slice(&source);
+    Ok(vm.ret_str(&out))
 }
 
 // ── string.format ────────────────────────────────────────────────────────────────────────────
@@ -160,7 +202,8 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
         // `scanformat`: flags, two width digits, a point and two precision digits at most.
         let mut spec = Spec::default();
         let at = |j: usize| f.get(j).copied().unwrap_or(0);
-        while b"-+ #0".contains(&at(i)) && at(i) != 0 {
+        let flags_at = i;
+        while at(i) != 0 && b"-+ #0".contains(&at(i)) {
             match at(i) {
                 b'-' => spec.minus = true,
                 b'+' => spec.plus = true,
@@ -169,6 +212,10 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
                 _ => spec.zero = true,
             }
             i += 1;
+        }
+        // 5.1's `scanformat`: six flags or more, which `FLAGS` cannot hold.
+        if i - flags_at >= 6 {
+            return Err(vm.error_at(1, "invalid format (repeated flags)"));
         }
         for _ in 0..2 {
             if at(i).is_ascii_digit() {
@@ -194,7 +241,8 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
         i += 1;
         match conv {
             b'c' => {
-                let c = vm.check_int(nargs, arg)?;
+                // `(int)luaL_checknumber`: the double cast straight to 32 bits.
+                let c = crate::api::c_int_direct(vm.check_number(nargs, arg)?);
                 let item = cfmt::fmt_str(
                     &[c as u8],
                     &Spec {
@@ -206,17 +254,20 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
                 out.extend(item.iter().take_while(|&&b| b != 0));
             }
             b'd' | b'i' => {
-                let n = vm.check_int(nargs, arg)?;
+                // `(long)luaL_checknumber`.
+                let n = crate::api::c_integer(vm.check_number(nargs, arg)?);
                 if spec.is_plain() {
                     // A bare `%d`: the digits alone.
-                    crate::number::push_g14(n as f64, out);
+                    out.extend_from_slice(n.to_string().as_bytes());
                 } else {
                     out.extend_from_slice(cfmt::fmt_int(n, &spec).as_bytes());
                 }
             }
             b'o' | b'u' | b'x' | b'X' => {
                 let n = vm.check_number(nargs, arg)?;
-                out.extend_from_slice(cfmt::fmt_uint(n as i64 as u32, conv, &spec).as_bytes());
+                // `(unsigned long)luaL_checknumber`.
+                let n = crate::api::c_ulong(n);
+                out.extend_from_slice(cfmt::fmt_uint(n, conv, &spec).as_bytes());
             }
             b'e' | b'E' | b'f' | b'g' | b'G' => {
                 let n = vm.check_number(nargs, arg)?;
@@ -231,6 +282,7 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
                             out.push(b'\\');
                             out.push(c);
                         }
+                        b'\r' => out.extend_from_slice(b"\\r"),
                         0 => out.extend_from_slice(b"\\000"),
                         _ => out.push(c),
                     }
@@ -252,7 +304,16 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
                     }
                 }
             }
-            _ => return Err(vm.error_at(1, "invalid option in `format'")),
+            c => {
+                // 5.1 names the option; past the end it is the C string's NUL, which prints as
+                // nothing.
+                let opt = if c == 0 {
+                    String::new()
+                } else {
+                    (c as char).to_string()
+                };
+                return Err(vm.error_at(1, &format!("invalid option `%{opt}' to `format'")));
+            }
         }
     }
     Ok(vm.ret_str(out))
@@ -633,7 +694,7 @@ fn find_in(vm: &mut Vm, nargs: usize, [src, pat, cpat]: &mut [Vec<u8>; 3]) -> R<
     let s = vm.check_str(nargs, 1)?;
     let p = vm.check_str(nargs, 2)?;
     let l1 = vm.heap.str(s).len();
-    let mut init = posrelat(vm.opt_int(nargs, 3, 1)? as i64, l1) - 1;
+    let mut init = posrelat(vm.opt_integer(nargs, 3, 1)?, l1) - 1;
     if init < 0 {
         init = 0;
     } else if init as usize > l1 {
@@ -746,8 +807,7 @@ fn gfind_in(vm: &mut Vm, _nargs: usize, [src, cpat]: &mut [Vec<u8>; 2]) -> R<usi
     Ok(0)
 }
 
-/// 5.0's `gsub`: a string or function replacement; a function answering neither string nor
-/// number deletes the match.
+/// 5.1's `gsub`: a string, table or function replacement; `nil` or `false` keeps the match.
 fn gsub(vm: &mut Vm, nargs: usize) -> R<usize> {
     let mut b = vm.take_bufs::<4>();
     let r = gsub_in(vm, nargs, &mut b);
@@ -759,22 +819,27 @@ fn gsub_in(vm: &mut Vm, nargs: usize, [src, cpat, out, repl_buf]: &mut [Vec<u8>;
     let s = vm.check_str(nargs, 1)?;
     let p = vm.check_str(nargs, 2)?;
     let srcl = vm.heap.str(s).len();
-    let max_s = vm.opt_int(nargs, 4, srcl as i32 + 1)?;
     let repl = vm.arg(nargs, 2);
-    if nargs < 3 || !(vm.is_string(repl) || matches!(repl.unpack(), V::Func(_))) {
-        return Err(vm.arg_error(3, "string or function expected"));
-    }
-    let repl_bytes = match repl.unpack() {
-        V::Func(_) => None,
-        _ => {
-            let r = vm.tostr(repl).unwrap();
-            repl_buf.extend_from_slice(vm.heap.str(r));
-            Some(&repl_buf[..])
-        }
+    let max_s = vm.opt_int(nargs, 4, srcl as i32 + 1)?;
+    // 5.1's `str_gsub`: a string or number, a function, or a table.
+    let kind = match repl.unpack() {
+        _ if nargs < 3 => None,
+        V::Str(_) | V::Num(_) => Some(0),
+        V::Func(_) => Some(1),
+        V::Table(_) => Some(2),
+        _ => None,
     };
+    let Some(kind) = kind else {
+        return Err(vm.arg_error(3, "string/function/table expected"));
+    };
+    if kind == 0 {
+        // `lua_tolstring(L, 3)`: a number replacement is its text.
+        let r = vm.tostr(repl).unwrap();
+        repl_buf.extend_from_slice(vm.heap.str(r));
+    }
     src.extend_from_slice(vm.heap.str(s));
     c_pattern(vm.heap.str(p), cpat);
-    let (src, cpat) = (&src[..], &cpat[..]);
+    let (src, cpat, repl_bytes) = (&src[..], &cpat[..], &repl_buf[..]);
     let (anchor, pstart) = if cpat[0] == b'^' {
         (true, 1)
     } else {
@@ -791,46 +856,7 @@ fn gsub_in(vm: &mut Vm, nargs: usize, [src, cpat, out, repl_buf]: &mut [Vec<u8>;
         };
         if let Some(e) = e {
             n += 1;
-            // `add_s`
-            match &repl_bytes {
-                Some(r) => {
-                    let mut i = 0;
-                    while i < r.len() {
-                        if r[i] != b'%' {
-                            out.push(r[i]);
-                        } else {
-                            i += 1;
-                            let c = r.get(i).copied().unwrap_or(0);
-                            if !c.is_ascii_digit() {
-                                out.push(c);
-                            } else {
-                                let v = ms.check_capture(c).and_then(|l| ms.capture_value(vm, l));
-                                match v {
-                                    Ok(v) => {
-                                        let sv = vm.tostr(v).unwrap();
-                                        out.extend_from_slice(vm.heap.str(sv));
-                                    }
-                                    Err(e) => return Err(pat_err(vm, e)),
-                                }
-                            }
-                        }
-                        i += 1;
-                    }
-                }
-                None => {
-                    let caps = match ms.captures(vm, Some((at, e))) {
-                        Ok(c) => c,
-                        Err(e) => return Err(pat_err(vm, e)),
-                    };
-                    let r = vm.call_value(repl, &caps, 1)?;
-                    if let Some(sv) = match r[0].unpack() {
-                        V::Str(_) | V::Num(_) => vm.tostr(r[0]),
-                        _ => None,
-                    } {
-                        out.extend_from_slice(vm.heap.str(sv));
-                    }
-                }
-            }
+            add_value(vm, &ms, out, kind, repl, repl_bytes, at, e)?;
         }
         match e {
             Some(e) if e > at => at = e,
@@ -849,4 +875,78 @@ fn gsub_in(vm: &mut Vm, nargs: usize, [src, cpat, out, repl_buf]: &mut [Vec<u8>;
     vm.push(r);
     vm.push(Value::Num(n as f64));
     Ok(2)
+}
+
+/// 5.1's `push_onecapture`: capture `i`, or the whole match `s..e` for 0 when there are none.
+fn one_capture(vm: &mut Vm, ms: &MatchState, i: usize, s: usize, e: usize) -> R<Value> {
+    if i >= ms.level {
+        if i == 0 {
+            return Ok(vm.str(&ms.src[s..e]));
+        }
+        return Err(pat_err(vm, PatErr("invalid capture index")));
+    }
+    ms.capture_value(vm, i).map_err(|e| pat_err(vm, e))
+}
+
+/// 5.1's `add_value`: one match's replacement onto `out`.
+#[allow(clippy::too_many_arguments)]
+fn add_value(
+    vm: &mut Vm,
+    ms: &MatchState,
+    out: &mut Vec<u8>,
+    kind: u8,
+    repl: Value,
+    repl_bytes: &[u8],
+    s: usize,
+    e: usize,
+) -> R<()> {
+    let v = match kind {
+        0 => {
+            // `add_s`: `%0` the whole match, `%1`-`%9` a capture, `%` and anything else itself.
+            let mut i = 0;
+            while i < repl_bytes.len() {
+                let c = repl_bytes[i];
+                if c != b'%' {
+                    out.push(c);
+                } else {
+                    i += 1;
+                    let d = repl_bytes.get(i).copied().unwrap_or(0);
+                    if !d.is_ascii_digit() {
+                        out.push(d);
+                    } else if d == b'0' {
+                        out.extend_from_slice(&ms.src[s..e]);
+                    } else {
+                        let v = one_capture(vm, ms, (d - b'1') as usize, s, e)?;
+                        let sv = vm.tostr(v).unwrap();
+                        out.extend_from_slice(vm.heap.str(sv));
+                    }
+                }
+                i += 1;
+            }
+            return Ok(());
+        }
+        1 => {
+            let caps = ms
+                .captures(vm, Some((s, e)))
+                .map_err(|err| pat_err(vm, err))?;
+            vm.call_value(repl, &caps, 1)?[0]
+        }
+        _ => {
+            let k = one_capture(vm, ms, 0, s, e)?;
+            vm.index(repl, k, None)?
+        }
+    };
+    if !v.truthy() {
+        // Nil or false keeps the matched text.
+        out.extend_from_slice(&ms.src[s..e]);
+    } else if let Some(sv) = matches!(v.unpack(), V::Str(_) | V::Num(_))
+        .then(|| vm.tostr(v))
+        .flatten()
+    {
+        out.extend_from_slice(vm.heap.str(sv));
+    } else {
+        let t = v.type_name();
+        return Err(vm.rt_error(&format!("invalid replacement value (a {t})")));
+    }
+    Ok(())
 }

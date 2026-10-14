@@ -81,25 +81,27 @@ struct Fc<'a> {
     child_names: HashMap<Vec<u8>, u32>,
 }
 
-/// `luaO_int2fb`: 5.0's "floating point byte" for a constructor's array hint.
+/// 5.1's `luaO_int2fb`: a size as a "floating point byte", `eeeeexxx`, rounded up.
 fn int2fb(mut x: u32) -> u32 {
-    let mut m = 0;
-    while x >= 8 {
+    let mut e = 0;
+    while x >= 16 {
         x = (x + 1) >> 1;
-        m += 1;
+        e += 1;
     }
-    (m << 3) | x
-}
-
-fn fb2int(x: u32) -> u32 {
-    (x & 7) << (x >> 3)
-}
-
-fn log2(x: u32) -> i32 {
-    if x == 0 {
-        -1
+    if x < 8 {
+        x
     } else {
-        31 - x.leading_zeros() as i32
+        ((e + 1) << 3) | (x - 8)
+    }
+}
+
+/// 5.1's `luaO_fb2int`.
+pub fn fb2int(x: u32) -> u32 {
+    let e = (x >> 3) & 31;
+    if e == 0 {
+        x
+    } else {
+        ((x & 7) + 8) << (e - 1)
     }
 }
 
@@ -231,6 +233,7 @@ impl<'a> Fc<'a> {
                 | Op::JmpCmpK(_, _, _, o)
                 | Op::JmpCmpKR(_, _, _, o)
                 | Op::JmpIf(_, _, o)
+                | Op::ForPrep(_, o)
                 | Op::ForLoop(_, o)
                 | Op::ForLoopUp(_, o)
                 | Op::TForPrep(_, o) => *o = off,
@@ -413,11 +416,29 @@ impl<'a> Fc<'a> {
                 self.patch_here(&breaks);
             }
             Stat::Repeat { body, cond } => {
+                // 5.1's `repeatstat`: the condition is compiled inside the body's scope.
                 let start = self.here();
                 self.enter_scope(true);
-                self.block(body)?;
-                let back = self.cond(cond, false)?;
-                self.patch_to(&back, start);
+                self.enter_scope(false);
+                self.stats(&body.stats)?;
+                if !self.scopes.last().unwrap().captured {
+                    let back = self.cond(cond, false)?;
+                    self.leave_scope();
+                    self.patch_to(&back, start);
+                } else {
+                    // A captured body local: a true condition breaks out closing it, a false one
+                    // closes it and loops.
+                    let again = self.cond(cond, false)?;
+                    let loop_scope = self.scopes.len() - 2;
+                    let n = self.scopes[loop_scope].nactive;
+                    self.emit(Op::Close(n));
+                    let j = self.jump();
+                    self.scopes[loop_scope].breaks.push(j);
+                    self.patch_here(&again);
+                    self.leave_scope();
+                    let back = self.jump();
+                    self.patch_to(&[back], start);
+                }
                 let breaks = self.leave_scope();
                 self.patch_here(&breaks);
             }
@@ -437,16 +458,20 @@ impl<'a> Fc<'a> {
                 self.patch_here(&ends);
             }
             Stat::NumFor {
-                var,
+                index,
                 limit,
                 step,
+                var,
                 start_e,
                 limit_e,
                 step_e,
                 body,
                 line,
             } => {
-                self.enter_scope(false);
+                // 5.1's `forstat`, `fornum` and `forbody`: the loop's scope holds the three
+                // control variables, and the declared variable lives in a scope of its own, closed
+                // at the end of each pass.
+                self.enter_scope(true);
                 let base = self.freereg;
                 let r = self.reserve(1)?;
                 self.exp2reg(start_e, r)?;
@@ -460,17 +485,16 @@ impl<'a> Fc<'a> {
                         self.emit(Op::LoadK(r, k));
                     }
                 }
-                self.line = *line;
-                // 5.0 primes the counter one step back, then enters at the loop test; the
-                // variables come into scope after, so an error here names no local.
-                self.emit(Op::Sub(base, base, base + 2));
-                let prep = self.jump();
-                self.activate(*var)?;
+                self.activate(*index)?;
                 self.activate(*limit)?;
                 self.activate(*step)?;
-                self.enter_scope(true);
+                self.line = *line;
+                let prep = self.emit(Op::ForPrep(base, 0));
+                self.enter_scope(false);
+                self.activate(*var)?;
                 let body_start = self.here();
                 self.block(body)?;
+                self.leave_scope();
                 self.patch_here(&[prep]);
                 self.line = *line;
                 // A missing step is 1; a positive literal one tests `<=` alone.
@@ -487,32 +511,35 @@ impl<'a> Fc<'a> {
                 self.patch_to(&[l], body_start);
                 let breaks = self.leave_scope();
                 self.patch_here(&breaks);
-                self.leave_scope();
             }
             Stat::GenFor {
                 generator,
                 state,
+                control,
                 vars,
                 exprs,
                 body,
                 line,
             } => {
-                self.enter_scope(false);
+                self.enter_scope(true);
                 let base = self.freereg;
-                let nvars = vars.len() + 2;
                 self.line = *line;
-                self.explist_adjust(exprs, nvars)?;
+                self.explist_adjust(exprs, 3)?;
                 self.activate(*generator)?;
                 self.activate(*state)?;
+                self.activate(*control)?;
+                // The call frame at `R(a+3)`: generator, state and control, then the results.
+                self.need(base as usize + 3 + vars.len().max(3))?;
+                // 5.0's table-for substitution, kept by the script host's patched `TFORLOOP`,
+                // then the jump to the loop's `TForLoop`.
+                let prep = self.emit(Op::TForPrep(base, 0));
+                self.enter_scope(false);
                 for &v in vars {
                     self.activate(v)?;
                 }
-                // The call frame above the variables: generator, state, control.
-                self.need(base as usize + nvars + 3)?;
-                let prep = self.emit(Op::TForPrep(base, 0));
-                self.enter_scope(true);
                 let body_start = self.here();
                 self.block(body)?;
+                self.leave_scope();
                 self.patch_here(&[prep]);
                 self.line = *line;
                 self.emit(Op::TForLoop(base, vars.len() as u8));
@@ -520,7 +547,6 @@ impl<'a> Fc<'a> {
                 self.patch_to(&[back], body_start);
                 let breaks = self.leave_scope();
                 self.patch_here(&breaks);
-                self.leave_scope();
             }
             Stat::Function { target, func, line } => {
                 self.line = *line;
@@ -1141,8 +1167,8 @@ impl<'a> Fc<'a> {
             self.emit(Op::SetList(dst, stored, pending as u16));
         }
         self.freereg = items_base;
-        let lnh = (log2(nh) + 1) as u8;
-        self.code[pc] = Op::NewTable(dst, fb2int(int2fb(na)), lnh);
+        // 5.1's `OP_NEWTABLE`: both hints as floating point bytes; the array one is kept decoded.
+        self.code[pc] = Op::NewTable(dst, fb2int(int2fb(na)), int2fb(nh) as u8);
         Ok(())
     }
 }
@@ -1152,11 +1178,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constructor_hints_are_5_0_s() {
-        assert_eq!(fb2int(int2fb(9)), 10);
+    /// 5.1's floating point bytes: exact below 16, then rounded up to 4 significant bits.
+    fn constructor_hints_are_5_1_s() {
+        assert_eq!(fb2int(int2fb(9)), 9);
         assert_eq!(fb2int(int2fb(7)), 7);
-        assert_eq!(fb2int(int2fb(33)), 40);
-        assert_eq!(log2(0) + 1, 0);
-        assert_eq!(log2(3) + 1, 2);
+        assert_eq!(fb2int(int2fb(15)), 15);
+        assert_eq!(fb2int(int2fb(17)), 18);
+        assert_eq!(fb2int(int2fb(33)), 36);
+        assert_eq!(fb2int(int2fb(0)), 0);
     }
 }

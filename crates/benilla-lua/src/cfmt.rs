@@ -1,5 +1,5 @@
-//! C `printf` conversions as the client's MSVC runtime writes them, for `string.format`: three-
-//! digit exponents, and `1.#INF`/`-1.#IND` for the non-finite values.
+//! C `printf` conversions as glibc writes them, for `string.format`: exponents of two digits at
+//! least, and `inf`/`nan` (`INF`/`NAN` for the upper-case conversions) for the non-finite values.
 
 #[derive(Default, Clone, Copy)]
 pub struct Spec {
@@ -51,8 +51,8 @@ fn sign(neg: bool, spec: &Spec) -> &'static str {
     }
 }
 
-/// `%d`/`%i` of an `int`.
-pub fn fmt_int(v: i32, spec: &Spec) -> String {
+/// `%d`/`%i` of a `long`.
+pub fn fmt_int(v: i64, spec: &Spec) -> String {
     let mut digits = v.unsigned_abs().to_string();
     let zero_ok = spec.precision.is_none();
     if let Some(p) = spec.precision {
@@ -70,8 +70,8 @@ pub fn fmt_int(v: i32, spec: &Spec) -> String {
     pad(digits, sign(v < 0, spec), &s, true)
 }
 
-/// `%o`, `%u`, `%x`, `%X` of an `unsigned int`.
-pub fn fmt_uint(v: u32, conv: u8, spec: &Spec) -> String {
+/// `%o`, `%u`, `%x`, `%X` of an `unsigned long`.
+pub fn fmt_uint(v: u64, conv: u8, spec: &Spec) -> String {
     let mut digits = match conv {
         b'o' => format!("{v:o}"),
         b'x' => format!("{v:x}"),
@@ -109,7 +109,7 @@ fn exp_form(m: f64, prec: usize, upper: bool) -> String {
     let x: i32 = exp.parse().unwrap();
     let e = if upper { 'E' } else { 'e' };
     let sg = if x < 0 { '-' } else { '+' };
-    format!("{mant}{e}{sg}{:03}", x.abs())
+    format!("{mant}{e}{sg}{:02}", x.abs())
 }
 
 /// `format!("{a:.prec$}")` for a finite `a >= 0`, exactly, without float formatting: `a` is
@@ -156,14 +156,12 @@ fn fixed_fast(a: f64, prec: usize) -> Option<String> {
 pub fn fmt_float(v: f64, conv: u8, spec: &Spec) -> String {
     let neg = v.is_sign_negative() && !(v == 0.0 && !v.is_sign_negative());
     if !v.is_finite() {
-        let body = if v.is_nan() {
-            if v.is_sign_negative() {
-                "1.#IND"
-            } else {
-                "1.#QNAN"
-            }
-        } else {
-            "1.#INF"
+        let upper = conv.is_ascii_uppercase();
+        let body = match (v.is_nan(), upper) {
+            (true, false) => "nan",
+            (true, true) => "NAN",
+            (false, false) => "inf",
+            (false, true) => "INF",
         };
         let s = Spec {
             zero: false,
@@ -324,11 +322,13 @@ mod tests {
         assert_eq!(fmt_uint(255, b'x', &sp("#")), "0xff");
         assert_eq!(fmt_uint(255, b'X', &sp("04")), "00FF");
         assert_eq!(fmt_float(1.23456, b'f', &sp(".2")), "1.23");
-        assert_eq!(fmt_float(1234.5, b'e', &sp("")), "1.234500e+003");
+        assert_eq!(fmt_float(1234.5, b'e', &sp("")), "1.234500e+03");
         assert_eq!(fmt_float(0.0001, b'g', &sp("")), "0.0001");
-        assert_eq!(fmt_float(1e-5, b'g', &sp("")), "1e-005");
+        assert_eq!(fmt_float(1e-5, b'g', &sp("")), "1e-05");
         assert_eq!(fmt_float(100000.0, b'g', &sp("")), "100000");
-        assert_eq!(fmt_float(1e6, b'g', &sp("")), "1e+006");
+        assert_eq!(fmt_float(1e6, b'g', &sp("")), "1e+06");
+        assert_eq!(fmt_float(f64::INFINITY, b'f', &sp("5")), "  inf");
+        assert_eq!(fmt_float(f64::NEG_INFINITY, b'E', &sp("")), "-INF");
         assert_eq!(fmt_float(2.5, b'f', &sp("08.3")), "0002.500");
         assert_eq!(fmt_str(b"abc", &sp("5")), b"  abc");
         assert_eq!(fmt_str(b"abcdef", &sp(".2")), b"ab");
