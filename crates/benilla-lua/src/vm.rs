@@ -141,6 +141,9 @@ pub struct Vm {
     hook: Option<Hook>,
     /// A hook or a profile is on: the flag the dispatch loop tests.
     hooked: bool,
+    /// The hook is running: 5.1's `luaD_hook` clears `allowhook` around the hook, so code the
+    /// hook runs does not count toward, or run, the hook again.
+    in_hook: bool,
     /// Time charged to each chunk while profiling (`set_profiling`).
     pub profile: Option<Box<Profile>>,
     /// The embedding host's handle to its own state, which a host closure reads at each call
@@ -272,6 +275,7 @@ impl Vm {
             root_free: Vec::new(),
             hook: None,
             hooked: false,
+            in_hook: false,
             profile: None,
             host: None,
         };
@@ -1335,6 +1339,9 @@ impl Vm {
         if let Some(p) = self.profile.as_mut() {
             p.mark(std::time::Instant::now(), src);
         }
+        if self.in_hook {
+            return Ok(());
+        }
         let Some(h) = self.hook.as_mut() else {
             return Ok(());
         };
@@ -1344,7 +1351,10 @@ impl Vm {
         }
         h.counted -= h.step;
         let f = h.f.clone();
-        f(self)
+        self.in_hook = true;
+        let r = f(self);
+        self.in_hook = false;
+        r
     }
 
     // ── stack inspection ─────────────────────────────────────────────────────────────────────
@@ -2168,6 +2178,11 @@ impl Vm {
                             b as usize - 1
                         };
                         save!();
+                        // A call like any other for the budget: a tail-recursive loop passes
+                        // no back edge and no `Call`.
+                        if self.hooked {
+                            slow!(self.hook_count(1))?;
+                        }
                         // A Lua callee replaces this frame; a native runs and its results
                         // return through the `Return` that follows.
                         let is_lua = matches!((r!(a)).unpack(),
@@ -2191,7 +2206,9 @@ impl Vm {
                         match self.precall(dest, nargs, me.nresults) {
                             Ok(Called::Lua) => {
                                 let f = self.frames.last_mut().unwrap();
-                                f.tailcalls = me.tailcalls + 1;
+                                // 5.1's `ci->tailcalls++` is a C int; saturated here so 2^32
+                                // tail calls cannot overflow, a count no traceback reaches.
+                                f.tailcalls = me.tailcalls.saturating_add(1);
                                 f.boundary = me.boundary;
                                 continue 'frame;
                             }
