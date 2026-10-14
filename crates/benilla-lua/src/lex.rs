@@ -67,6 +67,34 @@ const RESERVED: [(&[u8], Tok); 21] = [
     (b"while", Tok::While),
 ];
 
+/// The reserved word `word` is, if any: [`RESERVED`] as a `match`.
+fn reserved(word: &[u8]) -> Option<Tok> {
+    Some(match word {
+        b"and" => Tok::And,
+        b"break" => Tok::Break,
+        b"do" => Tok::Do,
+        b"else" => Tok::Else,
+        b"elseif" => Tok::Elseif,
+        b"end" => Tok::End,
+        b"false" => Tok::False,
+        b"for" => Tok::For,
+        b"function" => Tok::Function,
+        b"if" => Tok::If,
+        b"in" => Tok::In,
+        b"local" => Tok::Local,
+        b"nil" => Tok::Nil,
+        b"not" => Tok::Not,
+        b"or" => Tok::Or,
+        b"repeat" => Tok::Repeat,
+        b"return" => Tok::Return,
+        b"then" => Tok::Then,
+        b"true" => Tok::True,
+        b"until" => Tok::Until,
+        b"while" => Tok::While,
+        _ => return None,
+    })
+}
+
 impl Tok {
     /// `luaX_token2str`: a token as an error message names it.
     pub fn text(self) -> Vec<u8> {
@@ -319,8 +347,8 @@ impl<'a> Lexer<'a> {
                             self.pos += 1;
                         }
                         let word = &self.src[start..self.pos];
-                        if let Some(r) = RESERVED.iter().find(|r| r.0 == word) {
-                            return Ok(Self::tok(r.1));
+                        if let Some(r) = reserved(word) {
+                            return Ok(Self::tok(r));
                         }
                         let mut t = Self::tok(Tok::Name);
                         t.bytes = word.to_vec();
@@ -537,6 +565,21 @@ impl<'a> Lexer<'a> {
                 Ok(t)
             }
             None => Err(self.lex_error("malformed number", false)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_matches_the_reserved_table() {
+        for (word, tok) in RESERVED {
+            assert_eq!(reserved(word), Some(tok));
+        }
+        for word in [&b"self"[..], b"An", b"ends", b"whil", b""] {
+            assert_eq!(reserved(word), None);
         }
     }
 }
