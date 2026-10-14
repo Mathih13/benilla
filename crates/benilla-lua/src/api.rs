@@ -131,7 +131,18 @@ impl Vm {
     }
 
     /// `luaL_checknumber`: a number or a numeric string.
+    #[inline]
     pub fn check_number(&mut self, nargs: usize, n: usize) -> R<f64> {
+        // A number, the common argument, here; a string or an error out of line. An argument
+        // past `nargs` reads nil.
+        if let Some(x) = self.arg(nargs, n - 1).as_num() {
+            return Ok(x);
+        }
+        self.check_number_slow(nargs, n)
+    }
+
+    #[inline(never)]
+    fn check_number_slow(&mut self, nargs: usize, n: usize) -> R<f64> {
         let v = self.arg(nargs, n - 1);
         match self.tonumber(v) {
             Some(x) if n <= nargs => Ok(x),
@@ -203,6 +214,7 @@ impl Vm {
     }
 
     /// Push one result and answer the count, for `return Ok(vm.ret1(v))`.
+    #[inline]
     pub fn ret1(&mut self, v: Value) -> usize {
         self.push(v);
         1

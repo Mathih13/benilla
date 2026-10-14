@@ -805,6 +805,7 @@ impl Vm {
         self.stack.resize(n.next_power_of_two(), Value::Nil);
     }
 
+    #[inline]
     pub fn push(&mut self, v: Value) {
         self.ensure(self.top + 1);
         self.stack[self.top] = v;
@@ -1424,40 +1425,67 @@ impl Vm {
                 });
                 Ok(Called::Lua)
             }
-            FuncObj::Native { f, host, .. } => {
-                let f = *f;
-                let host = host.clone();
-                let base = func_idx + 1;
-                self.top = base + nargs;
-                self.frames.push(Frame {
-                    func: fref,
-                    base: base as u32,
-                    ip: std::ptr::null(),
-                    nresults: nres,
-                    consts: std::ptr::null(),
-                    maxstack: 0,
-                    source: self.heap.cur_source,
-                    proto: std::ptr::null(),
-                    upvals: std::ptr::null(),
-                    env: self.globals,
-                    env_gen: self.fenv_gen,
-                    tailcalls: 0,
-                    boundary: false,
-                });
-                let n = match host {
-                    Some(h) => h(self, nargs)?,
-                    None => f(self, nargs)?,
-                };
-                // A string the native made could not be: it raises here, in its caller.
-                if self.heap.oom {
-                    return Err(self.memory_error());
-                }
-                self.frames.pop();
-                let first = self.top - n;
-                self.poscall(func_idx, first, n, nres);
+            FuncObj::Native { .. } => {
+                self.call_native(fref, func_idx, nargs, nres)?;
                 Ok(Called::Done)
             }
         }
+    }
+
+    /// 5.0's `luaD_precall` for a native, the call depth already checked, then
+    /// `luaD_poscall`: the native `fref` at `func_idx` runs on the `nargs` values above it, and
+    /// its results replace them.
+    #[inline(never)]
+    fn call_native(
+        &mut self,
+        fref: FuncRef,
+        func_idx: usize,
+        nargs: usize,
+        nres: i32,
+    ) -> Result<(), LuaError> {
+        let FuncObj::Native { f, host, .. } = self.heap.func(fref) else {
+            unreachable!("a native")
+        };
+        let f = *f;
+        let host = host.clone();
+        let base = func_idx + 1;
+        self.top = base + nargs;
+        self.frames.push(Frame {
+            func: fref,
+            base: base as u32,
+            ip: std::ptr::null(),
+            nresults: nres,
+            consts: std::ptr::null(),
+            maxstack: 0,
+            source: self.heap.cur_source,
+            proto: std::ptr::null(),
+            upvals: std::ptr::null(),
+            env: self.globals,
+            env_gen: self.fenv_gen,
+            tailcalls: 0,
+            boundary: false,
+        });
+        let n = match host {
+            Some(h) => h(self, nargs)?,
+            None => f(self, nargs)?,
+        };
+        // A string the native made could not be: it raises here, in its caller.
+        if self.heap.oom {
+            return Err(self.memory_error());
+        }
+        self.frames.pop();
+        let first = self.top - n;
+        // One result wanted, at least one given: the common call in an expression.
+        if nres == 1 && n >= 1 {
+            self.stack[func_idx] = self.stack[first];
+            self.top = func_idx + 1;
+        } else if nres == 0 {
+            // None, a call statement.
+            self.top = func_idx;
+        } else {
+            self.poscall(func_idx, first, n, nres);
+        }
+        Ok(())
     }
 
     /// 5.1's `tryfuncTM`: the value at `func_idx` is not a function, so its `__call` goes below
@@ -1552,6 +1580,7 @@ impl Vm {
     // ── natives' view ────────────────────────────────────────────────────────────────────────
 
     /// The `i`th argument (0-based) of the running native, or nil.
+    #[inline]
     pub fn arg(&self, nargs: usize, i: usize) -> Value {
         if i < nargs {
             self.stack[self.frames.last().unwrap().base() + i]
@@ -2536,6 +2565,15 @@ impl Vm {
                                     refresh!();
                                     continue;
                                 }
+                            } else if self.frames.len() < self.ci_limit {
+                                // A native: `precall`'s native half, without its dispatch.
+                                self.call_native(f, func_idx, nargs, c as i32 - 1)?;
+                                refresh!();
+                                if c != 0 {
+                                    self.top = base!() + maxstack!();
+                                }
+                                self.check_gc();
+                                continue;
                             }
                         }
                         match self.precall(func_idx, nargs, c as i32 - 1)? {
