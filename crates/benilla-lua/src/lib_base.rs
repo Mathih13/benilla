@@ -336,18 +336,29 @@ pub fn setn(vm: &mut Vm, t: crate::value::TableRef, n: usize) {
     }
 }
 
+/// 5.1's `luaB_unpack`: items `i` (1) to `j`, `j` by default the table's `getn`; more than the
+/// stack's room raises.
 fn unpack(vm: &mut Vm, nargs: usize) -> R<usize> {
     let t = vm.check_table(nargs, 1)?;
-    let n = getn(vm, t);
-    // `luaL_checkstack` against 5.0's `LUA_MAXCSTACK` of 2048.
-    if n > 2048 {
-        return Err(vm.error_at(1, "stack overflow (table too big to unpack)"));
+    let i = vm.opt_int(nargs, 2, 1)?;
+    let e = if vm.arg(nargs, 2).is_nil() {
+        getn(vm, t) as i32
+    } else {
+        vm.check_int(nargs, 3)?
+    };
+    if i > e {
+        return Ok(0);
     }
-    for i in 1..=n {
-        let v = vm.heap.table(t).get_int(i as i32);
+    // `n <= 0` is 5.1's test for an overflowed `e - i + 1`.
+    let n = e.wrapping_sub(i).wrapping_add(1);
+    if n <= 0 || !vm.check_stack(n as usize) {
+        return Err(vm.error_at(1, "too many results to unpack"));
+    }
+    for k in 0..n {
+        let v = vm.heap.table(t).get_int(i.wrapping_add(k));
         vm.push(v);
     }
-    Ok(n)
+    Ok(n as usize)
 }
 
 fn rawequal(vm: &mut Vm, nargs: usize) -> R<usize> {

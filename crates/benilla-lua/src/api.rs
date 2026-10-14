@@ -51,6 +51,9 @@ pub fn c_ulong(n: f64) -> u64 {
 /// and Linux grants far more than it can fill, so past this bound the libraries raise C's message.
 pub const MAX_STRING: usize = i32::MAX as usize;
 
+/// 5.1's `LUAI_MAXCSTACK`: the most values a native's frame may hold.
+pub const MAX_C_STACK: usize = 8000;
+
 impl Vm {
     /// 5.1's memory error: `not enough memory`, with no position (`luaD_throw(L, LUA_ERRMEM)`).
     #[cold]
@@ -67,6 +70,12 @@ impl Vm {
             return Err(self.memory_error());
         }
         Ok(())
+    }
+
+    /// 5.1's `lua_checkstack` from a native: room for `n` more values within its frame's
+    /// `LUAI_MAXCSTACK`, its arguments counted.
+    pub fn check_stack(&self, n: usize) -> bool {
+        n <= MAX_C_STACK && self.top - self.native_base() + n <= MAX_C_STACK
     }
 
     /// `luaL_checkany`.

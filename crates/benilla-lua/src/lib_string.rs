@@ -157,6 +157,9 @@ fn byte(vm: &mut Vm, nargs: usize) -> R<usize> {
         return Ok(0);
     }
     let n = (pose - posi + 1) as usize;
+    if !vm.check_stack(n) {
+        return Err(vm.error_at(1, "stack overflow (string slice too long)"));
+    }
     for i in 0..n {
         let b = vm.heap.str(s)[posi as usize - 1 + i];
         vm.push(Value::Num(b as f64));

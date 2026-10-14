@@ -430,6 +430,8 @@ b]])"#),
         end
         table.insert(o, tostring(({loadstring("x = = 1\r--y")})[2]))
         return table.concat(o, "|")"#),
+    ("fix-libs byte_c_stack", r#"local s = string.rep("a", 9000)
+        return S(E(function() return table.getn({string.byte(s, 1, -1)}) end), E(function() return table.getn({string.byte(s, 1, 7997)}) end), E(function() return table.getn({string.byte(s, 1, 7998)}) end), E(function() local n = table.getn({string.byte(s, 1, 7990)}) return n end))"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

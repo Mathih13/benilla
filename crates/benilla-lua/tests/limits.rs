@@ -72,3 +72,38 @@ fn a_deep_match_is_pattern_too_complex() {
         Ok(vec!["1".into(), "9000".into()])
     );
 }
+
+/// A native pushes at most `LUAI_MAXCSTACK` values, its arguments counted, as 5.1's
+/// `lua_checkstack` allows: `unpack` raises `too many results to unpack`, `string.byte` its
+/// `luaL_checkstack` message.
+#[test]
+fn results_beyond_the_c_stack_raise() {
+    let src = r#"local t = {} for i = 1, 9000 do t[i] = i end
+        local s = string.rep("a", 9000)
+        local ok1, e1 = pcall(unpack, t)
+        local ok2, e2 = pcall(function() return unpack(t, 1, 7998) end)
+        local n3 = table.getn({unpack(t, 1, 7997)})
+        local ok4, e4 = pcall(string.byte, s, 1, -1)
+        local n5 = table.getn({string.byte(s, 1, 7997)})
+        local ok6, e6 = pcall(function() return string.byte(s, 1, 7998) end)
+        return ok1, e1, ok2, e2, n3, ok4, e4, n5, ok6, e6"#;
+    let got = run(src).unwrap();
+    assert_eq!(
+        &got[..2],
+        ["false", "too many results to unpack"],
+        "{got:?}"
+    );
+    assert_eq!(got[2], "false", "{got:?}");
+    assert!(got[3].ends_with("too many results to unpack"), "{got:?}");
+    assert_eq!(got[4], "7997");
+    assert_eq!(
+        &got[5..7],
+        ["false", "stack overflow (string slice too long)"]
+    );
+    assert_eq!(got[7], "7997");
+    assert_eq!(got[8], "false");
+    assert!(
+        got[9].ends_with("stack overflow (string slice too long)"),
+        "{got:?}"
+    );
+}
