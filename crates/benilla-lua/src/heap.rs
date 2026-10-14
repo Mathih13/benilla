@@ -947,22 +947,20 @@ impl Heap {
         }
         // Sweep. Dead strings leave the intern chains.
         let mut live = 0usize;
-        live += sweep(&mut self.tables, |t| t.bytes(), drop);
+        live += sweep(&mut self.tables, |t| t.bytes(), |_| false, drop);
         // A host closure's captures run Rust destructors, which may reach the VM: they wait in
         // `freed_hosts` until the collection ends (`Vm::full_gc`).
         let freed = &mut self.freed_hosts;
         live += sweep(
             &mut self.funcs,
             |_| 48,
-            |f| match f {
-                FuncObj::Native { host: Some(_), .. } => freed.push(f),
-                _ => drop(f),
-            },
+            |f| matches!(f, FuncObj::Native { host: Some(_), .. }),
+            |f| freed.push(f),
         );
-        live += sweep(&mut self.upvals, |_| 24, drop);
-        live += sweep(&mut self.users, |_| 32, drop);
+        live += sweep(&mut self.upvals, |_| 24, |_| false, drop);
+        live += sweep(&mut self.users, |_| 32, |_| false, drop);
         let freed = self.strs.free.len();
-        live += sweep(&mut self.strs, |s| 32 + s.bytes().len(), drop);
+        live += sweep(&mut self.strs, |s| 32 + s.bytes().len(), |_| false, drop);
         let dead_str = self.strs.free.len() != freed;
         let live_strs = self.strs.live() as u32;
         self.str_gc_at = live_strs + (self.str_id_limit.saturating_sub(live_strs)) / 2;
@@ -1031,7 +1029,8 @@ fn mark_proto(p: &Rc<Proto>, gray: &mut Vec<Value>, epoch: u32) {
 fn sweep<T: Dead>(
     a: &mut Arena<T>,
     size: impl Fn(&T) -> usize,
-    mut on_free: impl FnMut(T),
+    keep: impl Fn(&T) -> bool,
+    mut kept: impl FnMut(T),
 ) -> usize {
     let mut live = 0;
     let n = a.used as usize;
@@ -1044,7 +1043,11 @@ fn sweep<T: Dead>(
                 live += size(&items[i]);
             }
             _ => {
-                on_free(std::mem::replace(&mut items[i], T::dead()));
+                if keep(&items[i]) {
+                    kept(std::mem::replace(&mut items[i], T::dead()));
+                } else {
+                    items[i] = T::dead();
+                }
                 state[i] = FREE;
                 a.free.push(i as u32);
             }
