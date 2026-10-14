@@ -68,8 +68,8 @@ fn a_deep_match_is_pattern_too_complex() {
     assert!(got[1].ends_with("C stack overflow"), "{got:?}");
     // Below the bound a match as deep as a pattern can get still runs.
     assert_eq!(
-        run(r#"return string.find(string.rep("a", 9000), string.rep("a?", 9000))"#),
-        Ok(vec!["1".into(), "9000".into()])
+        run(r#"return string.find(string.rep("a", 7000), string.rep("a?", 7000))"#),
+        Ok(vec!["1".into(), "7000".into()])
     );
 }
 

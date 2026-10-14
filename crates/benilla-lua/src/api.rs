@@ -66,7 +66,33 @@ impl Vm {
     /// what the allocator grants; else [`Vm::memory_error`].
     #[inline]
     pub fn reserve(&mut self, buf: &mut Vec<u8>, extra: usize) -> R<()> {
-        if buf.len().saturating_add(extra) > MAX_STRING || buf.try_reserve(extra).is_err() {
+        if extra <= buf.capacity() - buf.len() {
+            return Ok(());
+        }
+        self.grow_str(buf, extra)
+    }
+
+    /// [`Vm::memory_error`] once `buf` holds [`MAX_STRING`] bytes, for a string that grows by
+    /// short pieces.
+    #[inline]
+    pub fn check_len(&mut self, buf: &[u8]) -> R<()> {
+        if buf.len() >= MAX_STRING {
+            return Err(self.memory_error());
+        }
+        Ok(())
+    }
+
+    /// [`Vm::reserve`] past the capacity: doubling, as `Vec` grows, but never past
+    /// [`MAX_STRING`].
+    #[cold]
+    #[inline(never)]
+    fn grow_str(&mut self, buf: &mut Vec<u8>, extra: usize) -> R<()> {
+        let need = buf.len().saturating_add(extra);
+        if need > MAX_STRING {
+            return Err(self.memory_error());
+        }
+        let want = need.max(buf.capacity().saturating_mul(2)).min(MAX_STRING);
+        if buf.try_reserve_exact(want - buf.len()).is_err() {
             return Err(self.memory_error());
         }
         Ok(())

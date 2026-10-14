@@ -218,6 +218,8 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
         if arg > nargs {
             return Err(vm.arg_error(arg, "no value"));
         }
+        // A number's text is short: the bound on the whole is enough for it.
+        vm.check_len(out)?;
         // `scanformat`: flags, two width digits, a point and two precision digits at most.
         let mut spec = Spec::default();
         let at = |j: usize| f.get(j).copied().unwrap_or(0);
@@ -271,7 +273,6 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
                 );
                 // `luaL_addlstring(b, buff, strlen(buff))`: a `%c` of 0 ends the item.
                 let item = &item[..item.iter().position(|&b| b == 0).unwrap_or(item.len())];
-                vm.reserve(out, item.len())?;
                 out.extend_from_slice(item);
             }
             b'd' | b'i' => {
@@ -283,7 +284,6 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
                 } else {
                     cfmt::fmt_int(n, &spec)
                 };
-                vm.reserve(out, item.len())?;
                 out.extend_from_slice(item.as_bytes());
             }
             b'o' | b'u' | b'x' | b'X' => {
@@ -291,13 +291,11 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
                 // `(unsigned long)luaL_checknumber`.
                 let n = crate::api::c_ulong(n);
                 let item = cfmt::fmt_uint(n, conv, &spec);
-                vm.reserve(out, item.len())?;
                 out.extend_from_slice(item.as_bytes());
             }
             b'e' | b'E' | b'f' | b'g' | b'G' => {
                 let n = vm.check_number(nargs, arg)?;
                 let item = cfmt::fmt_float(n, conv, &spec);
-                vm.reserve(out, item.len())?;
                 out.extend_from_slice(item.as_bytes());
             }
             b'q' => {
@@ -359,9 +357,9 @@ const MAX_CAPTURES: usize = 32;
 /// The matcher's recursion bound: a level per pattern item (a quantified single, a capture) the
 /// match is inside, so a real pattern stays far below it. Deviation: 5.1's `match` recurses
 /// without a bound and overflows the C stack (near 32000 levels on 8 MB); this raises 5.2's
-/// `pattern too complex` instead. A dev build overflows a 2 MB thread near 14500 levels under
+/// `pattern too complex` instead. A dev build overflows a 2 MB thread near 11200 levels under
 /// the deepest native nesting the VM allows; this keeps a third of that spare.
-const MAX_MATCH_DEPTH: u32 = 10_000;
+const MAX_MATCH_DEPTH: u32 = 7_500;
 const CAP_UNFINISHED: isize = -1;
 const CAP_POSITION: isize = -2;
 const SPECIALS: &[u8] = b"^$*+?.([%-";
@@ -480,18 +478,20 @@ impl MatchState<'_> {
         }
     }
 
-    /// `do_match` within the recursion bound.
-    fn do_match(&mut self, s: usize, p: usize) -> M<Option<usize>> {
+    /// A nested `do_match`, within the recursion bound. The first level, which `find`, `gsub`
+    /// and `gfind` call, is not counted, so a pattern that never nests pays nothing.
+    #[inline(never)]
+    fn sub_match(&mut self, s: usize, p: usize) -> M<Option<usize>> {
         if self.depth == 0 {
             return Err(PatErr("pattern too complex"));
         }
         self.depth -= 1;
-        let r = self.match_level(s, p);
+        let r = self.do_match(s, p);
         self.depth += 1;
         r
     }
 
-    fn match_level(&mut self, s: usize, p: usize) -> M<Option<usize>> {
+    fn do_match(&mut self, s: usize, p: usize) -> M<Option<usize>> {
         let (mut s, mut p) = (s, p);
         loop {
             match self.p(p) {
@@ -545,7 +545,7 @@ impl MatchState<'_> {
                     match self.p(ep) {
                         b'?' => {
                             if m {
-                                if let Some(r) = self.do_match(s + 1, ep + 1)? {
+                                if let Some(r) = self.sub_match(s + 1, ep + 1)? {
                                     return Ok(Some(r));
                                 }
                             }
@@ -607,7 +607,7 @@ impl MatchState<'_> {
             i += 1;
         }
         loop {
-            if let Some(r) = self.do_match(s + i, ep + 1)? {
+            if let Some(r) = self.sub_match(s + i, ep + 1)? {
                 return Ok(Some(r));
             }
             if i == 0 {
@@ -623,7 +623,7 @@ impl MatchState<'_> {
     fn min_expand(&mut self, s: usize, p: usize, ep: usize) -> M<Option<usize>> {
         let mut s = s;
         loop {
-            if let Some(r) = self.do_match(s, ep + 1)? {
+            if let Some(r) = self.sub_match(s, ep + 1)? {
                 return Ok(Some(r));
             }
             if s < self.src.len() && self.single(self.src[s], p, ep) {
@@ -643,7 +643,7 @@ impl MatchState<'_> {
         }
         self.capture[self.level] = (s, what);
         self.level += 1;
-        let r = self.do_match(s, p)?;
+        let r = self.sub_match(s, p)?;
         if r.is_none() {
             self.level -= 1;
         }
@@ -656,7 +656,7 @@ impl MatchState<'_> {
     fn end_capture(&mut self, s: usize, p: usize) -> M<Option<usize>> {
         let l = self.capture_to_close()?;
         self.capture[l].1 = (s - self.capture[l].0) as isize;
-        let r = self.do_match(s, p)?;
+        let r = self.sub_match(s, p)?;
         if r.is_none() {
             self.capture[l].1 = CAP_UNFINISHED;
         }
@@ -958,7 +958,7 @@ fn add_value(
     let v = match kind {
         0 => {
             // `add_s`: `%0` the whole match, `%1`-`%9` a capture, `%` and anything else itself.
-            vm.reserve(out, repl_bytes.len())?;
+            vm.check_len(out)?;
             let mut i = 0;
             while i < repl_bytes.len() {
                 let c = repl_bytes[i];
