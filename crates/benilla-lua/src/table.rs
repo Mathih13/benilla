@@ -122,6 +122,25 @@ impl Table {
         t
     }
 
+    /// What a heap slot with no table holds: no node at all, so it costs no allocation; a
+    /// stale handle reading it panics on the missing node instead of finding a key.
+    pub(crate) fn dead() -> Table {
+        Table {
+            array: Vec::new(),
+            node: Vec::new(),
+            lsizenode: 0,
+            lastfree: 0,
+            dummy: true,
+            meta: None,
+            flags: 0,
+            setn: None,
+            weak: 0,
+            owner: 0,
+            hint_key: std::cell::Cell::new(Value::Nil),
+            hint_pos: std::cell::Cell::new(0),
+        }
+    }
+
     /// 5.1's `setnodevector`: room for `size` keys, or the dummy node for none.
     fn set_node_vector(&mut self, size: usize) {
         self.node.clear();

@@ -138,70 +138,160 @@ pub struct UserObj {
     pub tag: u64,
 }
 
+/// Objects of one type, addressed by handle. A handle is a plain index anyone can build, so
+/// every slot holds a valid object: a freed slot, and the padding that keeps `items` a power of
+/// two long, hold an empty one. A handle is masked into bounds, so a stale or foreign handle
+/// reads some object of the right type, never freed or outside memory, and an access costs one
+/// `and` and no branch.
 #[derive(Clone)]
 struct Arena<T> {
-    items: Vec<Option<T>>,
-    marks: Vec<bool>,
+    items: Vec<T>,
+    /// Each slot's `FREE`, `LIVE` or `MARKED`.
+    state: Vec<u8>,
     free: Vec<u32>,
+    /// Slots ever handed out: the rest of `items` is padding.
+    used: u32,
+    /// `items.len() - 1`.
+    mask: usize,
 }
 
-impl<T> Default for Arena<T> {
-    fn default() -> Self {
+/// A slot with no live object.
+const FREE: u8 = 0;
+/// A live object a collection has not reached yet.
+const LIVE: u8 = 1;
+/// A live object this collection reached.
+const MARKED: u8 = 2;
+
+/// The empty object a slot with no live one holds.
+trait Dead {
+    fn dead() -> Self;
+}
+
+impl Dead for StrObj {
+    fn dead() -> Self {
+        StrObj {
+            data: StrData::Inline(0, [0; INLINE]),
+            hash: 0,
+        }
+    }
+}
+
+impl Dead for Table {
+    fn dead() -> Self {
+        Table::dead()
+    }
+}
+
+impl Dead for FuncObj {
+    fn dead() -> Self {
+        FuncObj::Native {
+            f: dead_function,
+            host: None,
+            name: "?",
+            upvals: Box::new([]),
+            env: TableRef(0),
+        }
+    }
+}
+
+impl Dead for UpvalObj {
+    fn dead() -> Self {
+        UpvalObj::Closed(Value::Nil)
+    }
+}
+
+impl Dead for UserObj {
+    fn dead() -> Self {
+        UserObj { meta: None, tag: 0 }
+    }
+}
+
+impl<T: Dead> Arena<T> {
+    fn new() -> Self {
+        const FIRST: usize = 64;
         Arena {
-            items: Vec::new(),
-            marks: Vec::new(),
+            items: (0..FIRST).map(|_| T::dead()).collect(),
+            state: vec![FREE; FIRST],
             free: Vec::new(),
+            used: 0,
+            mask: FIRST - 1,
         }
     }
-}
 
-impl<T> Arena<T> {
     fn alloc(&mut self, v: T) -> u32 {
-        if let Some(i) = self.free.pop() {
-            self.items[i as usize] = Some(v);
-            self.marks[i as usize] = false;
-            i
-        } else {
-            self.items.push(Some(v));
-            self.marks.push(false);
-            (self.items.len() - 1) as u32
-        }
+        let i = match self.free.pop() {
+            Some(i) => i,
+            None => {
+                if self.used as usize == self.items.len() {
+                    let n = self.items.len() * 2;
+                    self.items.resize_with(n, T::dead);
+                    self.state.resize(n, FREE);
+                    self.mask = n - 1;
+                }
+                self.used += 1;
+                self.used - 1
+            }
+        };
+        // The empty object owns nothing (anything a stale handle wrote into it is leaked, not
+        // dropped): no drop to run on the hot path of every allocation.
+        std::mem::forget(std::mem::replace(&mut self.items[i as usize], v));
+        self.state[i as usize] = LIVE;
+        i
     }
 
-    #[inline]
+    /// Whether handle `i` names a live object.
+    fn is_live(&self, i: u32) -> bool {
+        self.state.get(i as usize).is_some_and(|&s| s != FREE)
+    }
+
+    /// The object handle `i` names: masked into bounds (see the type). A debug build panics on
+    /// a handle to no live object; the VM never makes one.
+    #[inline(always)]
     fn get(&self, i: u32) -> &T {
-        debug_assert!(
-            self.items.get(i as usize).is_some_and(Option::is_some),
-            "a live handle"
-        );
-        // SAFETY: a handle the VM dereferences is reachable, and the collector frees nothing
-        // reachable; a stale handle (an uncleared register) is only ever read by the
-        // collector, which checks it first (`Heap::is_live`).
-        unsafe {
-            self.items
-                .get_unchecked(i as usize)
-                .as_ref()
-                .unwrap_unchecked()
+        debug_assert!(self.is_live(i), "a live handle");
+        let i = i as usize & self.mask;
+        // SAFETY: `items.len()` is a power of two and `mask` one less, so `i` is below it.
+        unsafe { self.items.get_unchecked(i) }
+    }
+
+    #[inline(always)]
+    fn get_mut(&mut self, i: u32) -> &mut T {
+        debug_assert!(self.is_live(i), "a live handle");
+        let i = i as usize & self.mask;
+        // SAFETY: as `get`.
+        unsafe { self.items.get_unchecked_mut(i) }
+    }
+
+    /// Mark live object `i`: whether it was live and not yet marked.
+    fn mark(&mut self, i: u32) -> bool {
+        match self.state.get_mut(i as usize) {
+            Some(s) if *s == LIVE => {
+                *s = MARKED;
+                true
+            }
+            _ => false,
         }
     }
 
-    #[inline]
-    fn get_mut(&mut self, i: u32) -> &mut T {
-        debug_assert!(
-            self.items.get(i as usize).is_some_and(Option::is_some),
-            "a live handle"
-        );
-        // SAFETY: as `get`.
-        unsafe {
-            self.items
-                .get_unchecked_mut(i as usize)
-                .as_mut()
-                .unwrap_unchecked()
-        }
+    fn iter_live(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.items
+            .iter()
+            .zip(&self.state)
+            .enumerate()
+            .filter(|(_, (_, &s))| s != FREE)
+            .map(|(i, (o, _))| (i, o))
+    }
+
+    fn iter_live_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.items
+            .iter_mut()
+            .zip(&self.state)
+            .filter(|(_, &s)| s != FREE)
+            .map(|(o, _)| o)
     }
 
     fn live(&self) -> usize {
-        self.items.len() - self.free.len()
+        self.used as usize - self.free.len()
     }
 }
 
@@ -252,12 +342,12 @@ pub struct Heap {
 impl Default for Heap {
     fn default() -> Self {
         Heap {
-            strs: Arena::default(),
+            strs: Arena::new(),
             strt: vec![STRT_EMPTY; 128],
-            tables: Arena::default(),
-            funcs: Arena::default(),
-            upvals: Arena::default(),
-            users: Arena::default(),
+            tables: Arena::new(),
+            funcs: Arena::new(),
+            upvals: Arena::new(),
+            users: Arena::new(),
             bytes: 0,
             threshold: 64 * 1024,
             // Id 0 is the host: whatever no Lua chunk created.
@@ -313,14 +403,12 @@ impl Heap {
     fn resize_strt(&mut self, size: usize) {
         let mut strt = vec![STRT_EMPTY; size];
         let mask = size - 1;
-        for (i, slot) in self.strs.items.iter().enumerate() {
-            if let Some(o) = slot {
-                let mut b = strt_home(o.hash, mask);
-                while strt[b] != STRT_EMPTY {
-                    b = (b + 1) & mask;
-                }
-                strt[b] = strt_entry(o.hash, i as u32);
+        for (i, o) in self.strs.iter_live() {
+            let mut b = strt_home(o.hash, mask);
+            while strt[b] != STRT_EMPTY {
+                b = (b + 1) & mask;
             }
+            strt[b] = strt_entry(o.hash, i as u32);
         }
         self.strt = strt;
     }
@@ -362,12 +450,12 @@ impl Heap {
     /// prototype's chunk. Indexed by source id.
     pub fn census(&self) -> Vec<Census> {
         let mut out = vec![Census::default(); self.sources.len()];
-        for t in self.tables.items.iter().flatten() {
+        for (_, t) in self.tables.iter_live() {
             let c = &mut out[t.owner as usize];
             c.tables += 1;
             c.bytes += t.bytes();
         }
-        for f in self.funcs.items.iter().flatten() {
+        for (_, f) in self.funcs.iter_live() {
             if let FuncObj::Lua { proto, upvals, .. } = f {
                 let c = &mut out[proto.source_id as usize];
                 c.functions += 1;
@@ -414,7 +502,7 @@ impl Heap {
 
     /// Every live function, for a hot reload's walk.
     pub fn funcs_mut(&mut self) -> impl Iterator<Item = &mut FuncObj> {
-        self.funcs.items.iter_mut().flatten()
+        self.funcs.iter_live_mut()
     }
 
     pub fn new_upval(&mut self, u: UpvalObj) -> u32 {
@@ -490,8 +578,7 @@ impl Heap {
         }
         loop {
             if let Some(u) = gray_upvals.pop() {
-                if !self.upvals.marks[u as usize] {
-                    self.upvals.marks[u as usize] = true;
+                if self.upvals.mark(u) {
                     if let UpvalObj::Closed(v) = self.upval(u) {
                         gray.push(v);
                     }
@@ -506,12 +593,13 @@ impl Heap {
                 continue;
             }
             match v.unpack() {
-                V::Str(s) => self.strs.marks[s.id as usize] = true,
+                V::Str(s) => {
+                    self.strs.mark(s.id);
+                }
                 V::Table(t) => {
-                    if self.tables.marks[t.0 as usize] {
+                    if !self.tables.mark(t.0) {
                         continue;
                     }
-                    self.tables.marks[t.0 as usize] = true;
                     let tab = self.tables.get(t.0);
                     let weak = match tab.meta {
                         Some(m) => self.weak_mode(m, mode_key),
@@ -543,10 +631,9 @@ impl Heap {
                     self.tables.get_mut(t.0).weak = weak;
                 }
                 V::Func(f) => {
-                    if self.funcs.marks[f.0 as usize] {
+                    if !self.funcs.mark(f.0) {
                         continue;
                     }
-                    self.funcs.marks[f.0 as usize] = true;
                     match self.funcs.get(f.0) {
                         FuncObj::Lua {
                             proto, upvals, env, ..
@@ -562,10 +649,9 @@ impl Heap {
                     }
                 }
                 V::User(u) => {
-                    if self.users.marks[u.0 as usize] {
+                    if !self.users.mark(u.0) {
                         continue;
                     }
-                    self.users.marks[u.0 as usize] = true;
                     if let Some(m) = self.users.get(u.0).meta {
                         gray.push(Value::Table(m));
                     }
@@ -575,19 +661,15 @@ impl Heap {
         }
         // Weak tables drop entries whose collectable key or value died.
         for t in weak_tables {
-            let marks = (
-                &self.strs.marks,
-                &self.tables.marks,
-                &self.funcs.marks,
-                &self.users.marks,
-            );
+            let (tables, funcs, users) = (&self.tables.state, &self.funcs.state, &self.users.state);
+            let marked = |st: &Vec<u8>, i: u32| st.get(i as usize) == Some(&MARKED);
             let alive = |v: Value| match v.unpack() {
-                V::Table(r) => marks.1[r.0 as usize],
-                V::Func(r) => marks.2[r.0 as usize],
-                V::User(r) => marks.3[r.0 as usize],
+                V::Table(r) => marked(tables, r.0),
+                V::Func(r) => marked(funcs, r.0),
+                V::User(r) => marked(users, r.0),
                 _ => true,
             };
-            let tab = self.tables.items[t as usize].as_mut().unwrap();
+            let tab = &mut self.tables.items[t as usize];
             for v in tab.array.iter_mut() {
                 if !alive(*v) {
                     *v = Value::Nil;
@@ -605,19 +687,9 @@ impl Heap {
         live += sweep(&mut self.funcs, |_| 48);
         live += sweep(&mut self.upvals, |_| 24);
         live += sweep(&mut self.users, |_| 32);
-        let mut dead_str = false;
-        for (i, slot) in self.strs.items.iter_mut().enumerate() {
-            if slot.is_some() {
-                if self.strs.marks[i] {
-                    self.strs.marks[i] = false;
-                    live += 32 + slot.as_ref().unwrap().bytes().len();
-                } else {
-                    *slot = None;
-                    self.strs.free.push(i as u32);
-                    dead_str = true;
-                }
-            }
-        }
+        let freed = self.strs.free.len();
+        live += sweep(&mut self.strs, |s| 32 + s.bytes().len());
+        let dead_str = self.strs.free.len() != freed;
         if dead_str {
             let size = self.strt.len();
             self.resize_strt(size);
@@ -631,26 +703,10 @@ impl Heap {
     /// Whether a value's object still exists; anything not collectable does.
     fn is_live(&self, v: Value) -> bool {
         match v.unpack() {
-            V::Str(s) => self
-                .strs
-                .items
-                .get(s.id as usize)
-                .is_some_and(Option::is_some),
-            V::Table(t) => self
-                .tables
-                .items
-                .get(t.0 as usize)
-                .is_some_and(Option::is_some),
-            V::Func(f) => self
-                .funcs
-                .items
-                .get(f.0 as usize)
-                .is_some_and(Option::is_some),
-            V::User(u) => self
-                .users
-                .items
-                .get(u.0 as usize)
-                .is_some_and(Option::is_some),
+            V::Str(s) => self.strs.is_live(s.id),
+            V::Table(t) => self.tables.is_live(t.0),
+            V::Func(f) => self.funcs.is_live(f.0),
+            V::User(u) => self.users.is_live(u.0),
             _ => true,
         }
     }
@@ -665,6 +721,11 @@ impl Heap {
             _ => 0,
         }
     }
+}
+
+/// The function a handle to no live function calls.
+fn dead_function(vm: &mut crate::vm::Vm, _: usize) -> Result<usize, crate::vm::LuaError> {
+    Err(vm.rt_error("attempt to call a dead function"))
 }
 
 fn is_collectable(v: Value) -> bool {
@@ -689,15 +750,22 @@ fn mark_proto(p: &Rc<Proto>, gray: &mut Vec<Value>, epoch: u32) {
     }
 }
 
-fn sweep<T>(a: &mut Arena<T>, size: impl Fn(&T) -> usize) -> usize {
+/// Free every live object the mark left unmarked, and unmark the rest; answers the bytes that
+/// stay.
+fn sweep<T: Dead>(a: &mut Arena<T>, size: impl Fn(&T) -> usize) -> usize {
     let mut live = 0;
-    for (i, slot) in a.items.iter_mut().enumerate() {
-        if let Some(o) = slot {
-            if a.marks[i] {
-                a.marks[i] = false;
-                live += size(o);
-            } else {
-                *slot = None;
+    let n = a.used as usize;
+    let (items, state) = (&mut a.items[..n], &mut a.state[..n]);
+    for i in 0..n {
+        match state[i] {
+            FREE => {}
+            MARKED => {
+                state[i] = LIVE;
+                live += size(&items[i]);
+            }
+            _ => {
+                items[i] = T::dead();
+                state[i] = FREE;
                 a.free.push(i as u32);
             }
         }
