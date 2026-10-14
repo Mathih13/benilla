@@ -23,7 +23,8 @@ pub struct Report {
     /// or their key is numbered and the count of functions sharing its name changed, so it may
     /// name another function now.
     pub reshaped: Vec<String>,
-    /// Functions only the new source has; they exist once their definition runs again.
+    /// Functions only the new source has; they exist once their definition runs again. A
+    /// function the old source had without a live closure is none of these.
     pub added: Vec<String>,
     /// Functions only the old source had, with live closures still on the old code.
     pub removed: Vec<String>,
@@ -54,6 +55,8 @@ impl Vm {
             self.retired.clear();
         }
         let mut retired = Vec::new();
+        // The keys the old source had, from what its live closures carry.
+        let mut old_keys: Vec<Rc<[Bytes]>> = Vec::new();
         for f in self.heap.funcs_mut() {
             let FuncObj::Lua {
                 proto,
@@ -68,21 +71,24 @@ impl Vm {
             if &*proto.source != chunkname || proto.key.is_empty() {
                 continue;
             }
+            if !old_keys.iter().any(|k| Rc::ptr_eq(k, &proto.chunk_keys)) {
+                old_keys.push(proto.chunk_keys.clone());
+            }
             let key = proto.key.clone();
             let Some(new) = fresh.get(&key) else {
                 seen.entry(key).or_insert(false);
                 continue;
             };
-            // The new function's upvalues, by name, from the closure's existing ones; none when
-            // the key may now name another function.
+            // The new function's upvalues, by the declaration each captures, from the closure's
+            // existing ones; none when the key may now name another function.
             let remap: Option<Vec<u32>> = if new.key_counts != proto.key_counts {
                 None
             } else {
-                new.upval_names
+                new.upval_decls
                     .iter()
                     .map(|d| {
                         proto
-                            .upval_names
+                            .upval_decls
                             .iter()
                             .position(|o| o == d)
                             .map(|i| upvals[i])
@@ -113,7 +119,8 @@ impl Vm {
             }
         }
         for k in fresh.keys() {
-            if !k.is_empty() && !seen.contains_key(k) {
+            let had = old_keys.iter().any(|ks| ks.contains(k));
+            if !k.is_empty() && !seen.contains_key(k) && !had {
                 report.added.push(show(k));
             }
         }

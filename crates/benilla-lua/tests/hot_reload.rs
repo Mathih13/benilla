@@ -304,3 +304,26 @@ fn numbered_keys_whose_count_changed_stay_on_the_old_code() {
     assert_eq!(report.reshaped, ["anon", "anon#2"]);
     assert!(report.swapped.is_empty(), "{report:#?}");
 }
+
+#[test]
+fn a_capture_of_another_declaration_of_a_name_is_a_reshape() {
+    let (before, after, fresh, report) = three(
+        "local x = 'outer' do local x = 'inner' function F() return x end end",
+        "",
+        "local x = 'outer' function F() return x end",
+        "return F()",
+    );
+    assert_eq!(
+        (before.as_str(), after.as_str(), fresh.as_str()),
+        ("inner", "inner", "outer")
+    );
+    assert_eq!(report.reshaped, ["F"]);
+}
+
+#[test]
+fn a_function_without_a_live_closure_is_not_added() {
+    let v = "if false then H = function() end end function F() return 1 end";
+    let (_, _, _, report) = three(v, "", v, "return F()");
+    assert!(report.added.is_empty(), "{report:#?}");
+    assert_eq!(report.swapped, ["F"]);
+}

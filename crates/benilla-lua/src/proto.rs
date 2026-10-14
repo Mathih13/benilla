@@ -168,6 +168,9 @@ pub struct Proto {
     /// upvalues.
     pub upvals: Vec<(bool, u16)>,
     pub upval_names: Vec<Bytes>,
+    /// The declaration each upvalue captures, for hot reload: the declaring function's key, the
+    /// name, and which declaration of that name it is (`MyAddon|x#2`).
+    pub upval_decls: Vec<Bytes>,
     /// Parameters including `self`.
     pub nparams: u8,
     /// `...`: the extras become the `arg` table in register `nparams`.
@@ -185,6 +188,8 @@ pub struct Proto {
     /// For each part of `key`, how many siblings share its name: a numbered key matches the
     /// same function across an edit only while these counts hold.
     pub key_counts: Box<[u32]>,
+    /// Every key of the chunk this function was compiled in.
+    pub chunk_keys: std::rc::Rc<[Bytes]>,
     /// `source`'s id in the heap's chunk list, for profiles and memory censuses.
     pub source_id: u32,
     /// The collection that last marked this prototype's constants (`Heap::collect`).

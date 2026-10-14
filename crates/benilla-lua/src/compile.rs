@@ -174,6 +174,8 @@ pub(crate) struct FuncState {
     /// Each upvalue as `(true, register)` in the enclosing function or `(false, upvalue)`.
     pub upvals: Vec<(bool, u16)>,
     pub upval_names: Vec<Bytes>,
+    /// The declaration each upvalue captures ([`FuncState::local_decl`]).
+    pub upval_decls: Vec<Bytes>,
     pub locvars: Vec<LocVar>,
     /// `locvars` index of each active local, then of those declared but not yet active.
     pub actvar: Vec<u16>,
@@ -207,6 +209,7 @@ impl FuncState {
             protos: Vec::new(),
             upvals: Vec::new(),
             upval_names: Vec::new(),
+            upval_decls: Vec::new(),
             locvars: Vec::new(),
             actvar: Vec::new(),
             nactvar: 0,
@@ -227,6 +230,22 @@ impl FuncState {
 
     pub fn pc(&self) -> usize {
         self.code.len()
+    }
+
+    /// The declaration of the active local in register `r`, as hot reload tells captured
+    /// variables apart: this function's key, the name, and which declaration of that name it is.
+    pub fn local_decl(&self, r: Reg) -> Bytes {
+        let idx = self.actvar[r as usize] as usize;
+        let name = &self.locvars[idx].name;
+        let nth = self.locvars[..=idx]
+            .iter()
+            .filter(|v| v.name == *name)
+            .count();
+        let mut d = self.key.to_vec();
+        d.push(b'|');
+        d.extend_from_slice(name);
+        d.extend_from_slice(format!("#{nth}").as_bytes());
+        Rc::from(d)
     }
 
     /// A child's key: this function's, then the child's name, numbered when it repeats. Hot
@@ -264,6 +283,7 @@ impl FuncState {
             protos: self.protos,
             upvals: self.upvals,
             upval_names: self.upval_names,
+            upval_decls: self.upval_decls,
             nparams: self.nparams,
             vararg: self.vararg,
             maxstack: self.maxstack as u16 + 1,
@@ -273,6 +293,7 @@ impl FuncState {
             locvars: self.locvars,
             key: self.key,
             key_counts: Box::new([]),
+            chunk_keys: Rc::from(Vec::new()),
             gc_mark: Default::default(),
         }
     }
@@ -287,10 +308,12 @@ fn key_base(key: &[u8]) -> &[u8] {
     }
 }
 
-/// Fill in each function's [`Proto::key_counts`] once the whole chunk is compiled.
+/// Fill in the whole chunk's key facts once it is compiled: each function's
+/// [`Proto::key_counts`] and the chunk's [`Proto::chunk_keys`].
 pub(crate) fn finish_keys(root: &mut Proto) {
-    fn counts(p: &mut Proto, path: &[u32]) {
+    fn counts(p: &mut Proto, path: &[u32], keys: &mut Vec<Bytes>) {
         p.key_counts = path.into();
+        keys.push(p.key.clone());
         let mut same: HashMap<&[u8], u32> = HashMap::new();
         for q in &p.protos {
             *same.entry(key_base(&q.key)).or_insert(0) += 1;
@@ -299,11 +322,19 @@ pub(crate) fn finish_keys(root: &mut Proto) {
         let mut sub = path.to_vec();
         for (q, n) in p.protos.iter_mut().zip(n) {
             sub.push(n);
-            counts(Rc::get_mut(q).expect("a fresh prototype"), &sub);
+            counts(Rc::get_mut(q).expect("a fresh prototype"), &sub, keys);
             sub.pop();
         }
     }
-    counts(root, &[]);
+    fn share(p: &mut Proto, keys: &Rc<[Bytes]>) {
+        p.chunk_keys = keys.clone();
+        for q in &mut p.protos {
+            share(Rc::get_mut(q).expect("a fresh prototype"), keys);
+        }
+    }
+    let mut keys = Vec::new();
+    counts(root, &[], &mut keys);
+    share(root, &Rc::from(keys));
 }
 
 /// The jump offset an instruction carries, if it is a jump.

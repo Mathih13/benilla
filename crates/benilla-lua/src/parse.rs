@@ -317,9 +317,14 @@ impl<'a> Parser<'a> {
             let msg = format!("function at line {line} has more than {MAXUPVALUES} upvalues");
             return Err(self.lx.error_plain(&msg));
         }
+        let decl = match k {
+            Kind::Local(r) => self.fs[level - 1].local_decl(r),
+            _ => self.fs[level - 1].upval_decls[key.1 as usize].clone(),
+        };
         let fs = &mut self.fs[level];
         fs.upvals.push(key);
         fs.upval_names.push(name.clone());
+        fs.upval_decls.push(decl);
         Ok(Some(Kind::Upval((fs.upvals.len() - 1) as u16)))
     }
 
