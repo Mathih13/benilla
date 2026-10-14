@@ -32,6 +32,7 @@ pub(super) struct PointerFeed<'w> {
     synthetic: Res<'w, super::SyntheticPointer>,
     /// A capture owns the pointer ([`super::CapturePointerPinned`]): no OS cursor in the shot.
     capture_pinned: Res<'w, super::CapturePointerPinned>,
+    egui_keyboard: Res<'w, super::EguiKeyboard>,
 }
 
 impl PointerFeed<'_> {
@@ -219,6 +220,10 @@ pub(super) fn feed_ui_input(
     // and before the keys (an Escape that clears focus still counts as captured this frame).
     capture.typing = script.has_keyboard_focus();
     capture.consumed.clear();
+    if pointer.egui_keyboard.0 {
+        capture.typing = true;
+        keyboard.clear();
+    }
     script.set_alt_down(alt);
     // ── The alt-arrow exemption ────────────────────────────────────────────────────────────────
     // An EditBox in alt-arrow mode (`ignoreArrows`, set on the chat box at `ChatFrame.xml:21`)
