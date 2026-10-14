@@ -828,7 +828,7 @@ impl<'a> Fc<'a> {
     /// The constant `x` names, when it is a string: a field name.
     fn str_const(&self, x: Rk) -> Option<u16> {
         (x >= RK_CONST && self.consts[(x - RK_CONST) as usize].as_str().is_some())
-            .then_some(x - RK_CONST)
+            .then(|| x - RK_CONST)
     }
 
     /// `R(dst) = R(t)[RK(key)]`, as `GetField` when the key is a field name.

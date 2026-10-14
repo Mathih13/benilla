@@ -1733,9 +1733,10 @@ impl Vm {
                     if nresults == 1 && n >= 1 {
                         // One result, the common call in an expression, into the callee's slot
                         // just below this frame's registers.
-                        // SAFETY: `base` is at least 1 for a Lua frame; `regs` is current.
-                        let v = r!(a);
-                        unsafe { *regs.sub(1) = v };
+                        // SAFETY: `base` is at least 1 for a Lua frame; `regs` is still the
+                        // returning frame's, and `a` one of its registers (`r!` would check it
+                        // against the caller's frame, now on top).
+                        unsafe { *regs.sub(1) = *regs.add(a as usize) };
                     } else if nresults == 0 {
                         // None, a call statement.
                         self.top = func_idx;
