@@ -333,9 +333,16 @@ pub struct Heap {
     pub bytes: usize,
     /// 5.0's `GCthreshold`: a collection runs when `bytes` reaches it.
     pub threshold: usize,
-    /// Every chunk name a prototype was compiled under, by id: the owners a profile and a
-    /// memory census charge to.
-    pub sources: Vec<crate::ast::Bytes>,
+    /// The chunk names prototypes were compiled under, by source id: the owners a profile and
+    /// a memory census charge to. [`Heap::free_unreferenced_sources`] frees the slot of a chunk
+    /// no function or table refers to any more (a `loadstring` chunk is named by its own code),
+    /// and a new chunk takes a free slot: `None` is a free one. Id 0 is the host's and never
+    /// freed. A profile's time for an id carries on into the chunk that takes its slot:
+    /// [`Heap::source_seq`] tells the two apart.
+    pub sources: Vec<Option<crate::ast::Bytes>>,
+    /// The rest of the sources' bookkeeping, boxed: the heap sits inside the VM, whose layout
+    /// the interpreter loop's code is sensitive to.
+    src: Box<SourceBook>,
     source_ids: std::collections::HashMap<crate::ast::Bytes, u32>,
     /// The chunk whose code runs now; a new table is charged to it.
     pub cur_source: u32,
@@ -353,6 +360,22 @@ pub struct Heap {
     str_gc_at: u32,
 }
 
+/// [`Heap::sources`]' bookkeeping.
+#[derive(Clone, Default)]
+struct SourceBook {
+    /// The order each slot's chunk was first compiled in, which slot order no longer is once a
+    /// slot is reused.
+    seq: Vec<u64>,
+    next_seq: u64,
+    /// Moves whenever a chunk takes or leaves a slot.
+    epoch: u64,
+    free: Vec<u32>,
+    /// New slots left before a new chunk first frees the slots nothing refers to: as many as
+    /// lived after the last such pass, 64 at least, so the passes cost the heap's size once per
+    /// that many new chunks.
+    scan_in: usize,
+}
+
 impl Default for Heap {
     fn default() -> Self {
         let mut h = Heap {
@@ -365,8 +388,13 @@ impl Default for Heap {
             bytes: 0,
             threshold: 64 * 1024,
             // Id 0 is the host: whatever no Lua chunk created.
-            sources: vec![Rc::from(&b"=[host]"[..])],
+            sources: vec![Some(Rc::from(&b"=[host]"[..]))],
             source_ids: Default::default(),
+            src: Box::new(SourceBook {
+                seq: vec![0],
+                scan_in: 64,
+                ..Default::default()
+            }),
             cur_source: 0,
             scratch: Vec::new(),
             oom: false,
@@ -497,15 +525,99 @@ impl Heap {
 
     // ── tables ───────────────────────────────────────────────────────────────────────────────
 
-    /// The id of chunk name `name`, made on first sight.
+    /// The id of chunk name `name`, made on first sight, in a freed slot if there is one.
     pub fn source_id(&mut self, name: &crate::ast::Bytes) -> u32 {
         if let Some(&id) = self.source_ids.get(name) {
             return id;
         }
-        let id = self.sources.len() as u32;
-        self.sources.push(name.clone());
+        if self.src.free.is_empty() {
+            if self.src.scan_in == 0 {
+                self.free_unreferenced_sources();
+            } else {
+                self.src.scan_in -= 1;
+            }
+        }
+        let book = &mut *self.src;
+        book.next_seq += 1;
+        let seq = book.next_seq;
+        let id = match book.free.pop() {
+            Some(id) => {
+                self.sources[id as usize] = Some(name.clone());
+                book.seq[id as usize] = seq;
+                id
+            }
+            None => {
+                self.sources.push(Some(name.clone()));
+                book.seq.push(seq);
+                self.sources.len() as u32 - 1
+            }
+        };
         self.source_ids.insert(name.clone(), id);
+        book.epoch += 1;
+        // The name is held twice, in the slot and the map: counted, so chunks made in a loop
+        // bring the collection that frees their slots.
+        self.bytes += 2 * name.len() + 64;
         id
+    }
+
+    /// Free the slot of every source nothing refers to: no table's owner, no Lua function's
+    /// prototype (a nested prototype shares its parent's chunk), not the one being charged now.
+    /// Objects a collection has not swept yet still count, so a slot leaves only once a
+    /// collection has freed what referred to it. A new chunk runs this once it has made as many
+    /// new slots as the last pass kept (64 at least); a host that wants the slots back sooner
+    /// runs it after a collection.
+    pub fn free_unreferenced_sources(&mut self) {
+        let mut live = vec![false; self.sources.len()];
+        live[0] = true;
+        live[self.cur_source as usize] = true;
+        for (_, t) in self.tables.iter_live() {
+            live[t.owner as usize] = true;
+        }
+        for (_, f) in self.funcs.iter_live() {
+            if let FuncObj::Lua { proto, .. } = f {
+                live[proto.source_id as usize] = true;
+            }
+        }
+        let mut kept = 0;
+        for (id, live) in live.iter().enumerate() {
+            if *live {
+                kept += 1;
+            } else if let Some(name) = self.sources[id].take() {
+                self.source_ids.remove(&name);
+                self.src.free.push(id as u32);
+                self.src.epoch += 1;
+            }
+        }
+        self.src.scan_in = kept.max(64);
+    }
+
+    /// The chunk name of source `id`, if the slot holds one.
+    pub fn source_name(&self, id: u32) -> Option<&crate::ast::Bytes> {
+        self.sources.get(id as usize)?.as_ref()
+    }
+
+    /// The live sources in the order they were first compiled: `(id, name)`.
+    pub fn sources_in_order(&self) -> Vec<(u32, &crate::ast::Bytes)> {
+        let mut v: Vec<(u32, &crate::ast::Bytes)> = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| Some((i as u32, s.as_ref()?)))
+            .collect();
+        v.sort_by_key(|&(i, _)| self.src.seq[i as usize]);
+        v
+    }
+
+    /// The order source `id`'s chunk was first compiled in among all chunks: slot order is not
+    /// compile order once a slot is reused.
+    pub fn source_seq(&self, id: u32) -> u64 {
+        self.src.seq.get(id as usize).copied().unwrap_or(0)
+    }
+
+    /// A number that moves whenever a chunk takes or leaves a source slot: a view built from
+    /// [`Heap::sources`] is stale once it differs.
+    pub fn sources_epoch(&self) -> u64 {
+        self.src.epoch
     }
 
     /// Bytes and objects per owner: each table to the chunk that made it, each closure to its

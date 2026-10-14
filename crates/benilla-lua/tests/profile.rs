@@ -5,7 +5,7 @@ fn source_id(vm: &benilla_lua::Vm, name: &[u8]) -> usize {
     vm.heap
         .sources
         .iter()
-        .position(|s| &**s == name)
+        .position(|s| s.as_deref() == Some(name))
         .expect("a compiled chunk")
 }
 
@@ -45,4 +45,55 @@ fn time_and_tables_land_on_the_chunk_that_spent_and_made_them() {
     // Off, nothing more is charged.
     vm.set_profiling(false);
     assert!(vm.profile.is_none());
+}
+
+/// A chunk nothing refers to any more gives its source slot back at a collection: `loadstring`
+/// names a chunk by its own code, so code built in a loop would otherwise hold every name. A
+/// new chunk takes a freed slot, and the profile and census still charge the live ones.
+#[test]
+fn chunk_names_nothing_refers_to_are_collected() {
+    let mut vm = benilla_lua::new_state();
+    vm.exec(
+        b"Kept = loadstring('return 7') Made = {}",
+        b"@Interface\\AddOns\\Kept\\Kept.lua",
+    )
+    .unwrap();
+    vm.exec(
+        b"for i = 1, 200000 do local f = loadstring('return ' .. i) f() end",
+        b"=driver",
+    )
+    .unwrap();
+    vm.full_gc();
+    vm.heap.free_unreferenced_sources();
+    let live: Vec<String> = vm
+        .heap
+        .sources_in_order()
+        .into_iter()
+        .map(|(_, s)| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    assert_eq!(
+        live,
+        [
+            "=[host]",
+            "=[benilla-lua compat]",
+            "@Interface\\AddOns\\Kept\\Kept.lua",
+            "return 7",
+            "=driver"
+        ],
+        "the host, the compat chunk and the file whose functions and table live, the chunk a \
+         global holds, and the one charged last"
+    );
+    assert!(
+        vm.heap.sources.len() < 20_000,
+        "{} slots: collections ran while the loop made chunks",
+        vm.heap.sources.len()
+    );
+    let kept = source_id(&vm, b"@Interface\\AddOns\\Kept\\Kept.lua");
+    assert!(vm.heap.census()[kept].tables >= 1);
+    // A freed slot is taken again, by a chunk compiled after the ones still live.
+    let before = vm.heap.sources.len();
+    vm.exec(b"return 1", b"=again").unwrap();
+    assert_eq!(vm.heap.sources.len(), before);
+    let order = vm.heap.sources_in_order();
+    assert_eq!(&**order.last().unwrap().1, b"=again");
 }
