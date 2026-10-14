@@ -8,8 +8,9 @@ fn is_space(b: u8) -> bool {
 }
 
 /// 5.1's `luaO_str2d`: `strtod` must read something; a stop at an `x` is retried as hex through
-/// `strtoul`; only whitespace may follow.
+/// `strtoul`; only whitespace may follow, up to the C string's end at its first NUL.
 pub fn str2d(s: &[u8]) -> Option<f64> {
+    let s = &s[..s.iter().position(|&b| b == 0).unwrap_or(s.len())];
     let (mut v, mut end) = strtod(s)?;
     if matches!(s.get(end), Some(b'x' | b'X')) {
         let (n, e) = strtoul(s, 16);
@@ -155,8 +156,62 @@ fn hex_float(s: &[u8]) -> (f64, usize) {
         }
     }
     let m = m | sticky as u128;
-    let v = m as f64 * 2f64.powi(exp.clamp(-2200, 2200) as i32);
-    (v, i)
+    (scale_exact(m, exp), i)
+}
+
+/// `m * 2^exp` rounded once, to nearest even, as glibc's `strtod` rounds a hex float. A result
+/// below the normal range keeps only the bits the subnormal grid holds, so it is not rounded
+/// twice.
+fn scale_exact(m: u128, exp: i64) -> f64 {
+    if m == 0 {
+        return 0.0;
+    }
+    let exp = exp.clamp(-1 << 24, 1 << 24);
+    let bits = 128 - m.leading_zeros() as i64;
+    // The top bit at 2^-1022 or above.
+    if exp + bits > -1022 {
+        // Normal or beyond: one rounding to 53 bits, then an exact power of two (or infinity).
+        return ldexp(m as f64, exp as i32);
+    }
+    // Subnormal: the units of 2^-1074 the value holds, rounded on the bits below.
+    let drop = -1074 - exp;
+    let q = if drop <= 0 {
+        m << -drop
+    } else if drop >= 128 {
+        0
+    } else {
+        let q = m >> drop;
+        let r = m - (q << drop);
+        let half = 1u128 << (drop - 1);
+        q + (r > half || (r == half && q & 1 == 1)) as u128
+    };
+    ldexp(q as f64, -1074)
+}
+
+/// C's `ldexp` (`scalbn`): `x * 2^n` with one rounding, in steps that neither overflow nor
+/// underflow early.
+pub fn ldexp(x: f64, n: i32) -> f64 {
+    let two = |e: i32| f64::from_bits(((0x3ff + e) as u64) << 52);
+    let (mut y, mut n) = (x, n);
+    if n > 1023 {
+        y *= two(1023);
+        n -= 1023;
+        if n > 1023 {
+            y *= two(1023);
+            n -= 1023;
+            n = n.min(1023);
+        }
+    } else if n < -1022 {
+        // Two steps that keep the last one's result above the subnormal range, so it rounds once.
+        y *= two(-1022) * two(53);
+        n += 1022 - 53;
+        if n < -1022 {
+            y *= two(-1022) * two(53);
+            n += 1022 - 53;
+            n = n.max(-1022);
+        }
+    }
+    y * two(n)
 }
 
 /// glibc's `strtoul` with a 64-bit `unsigned long`: the value and the index after the last digit,
@@ -347,6 +402,68 @@ mod tests {
         assert_eq!(str2d(b"- 1"), None);
         assert_eq!(str2d(b""), None);
         assert_eq!(str2d(b"1e400"), Some(f64::INFINITY));
+        assert_eq!(str2d(b"1\0x"), Some(1.0), "a C string ends at its NUL");
+        assert_eq!(str2d(b"12\0 "), Some(12.0));
+        assert_eq!(str2d(b"\0 1"), None);
+        assert_eq!(str2d(b"0x1p-1074"), Some(f64::from_bits(1)));
+        assert_eq!(str2d(b"0x1p-1075"), Some(0.0), "a tie rounds to even");
+        assert_eq!(str2d(b"0x3p-1075"), Some(f64::from_bits(2)));
+        assert_eq!(str2d(b"0x1000000000000p-1070"), Some(f64::MIN_POSITIVE));
+        assert_eq!(str2d(b"0x1p1023"), Some(f64::from_bits(0x7fe << 52)));
+        assert_eq!(str2d(b"0x1p1024"), Some(f64::INFINITY));
+    }
+
+    /// `ldexp` against the C library the build links.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ldexp_is_cs() {
+        extern "C" {
+            #[link_name = "ldexp"]
+            fn c_ldexp(x: f64, e: i32) -> f64;
+        }
+        let xs = [
+            0.5,
+            1.0,
+            1.5,
+            3.0,
+            -0.0,
+            0.1,
+            f64::from_bits(1),
+            f64::from_bits(0x3ff << 40) * 1.75,
+            1e300,
+            1e-300,
+            f64::INFINITY,
+            f64::MAX,
+            0.75,
+        ];
+        let es = [
+            0,
+            1,
+            -1,
+            1024,
+            -1074,
+            -1075,
+            1074,
+            2098,
+            -2000,
+            2000,
+            -1022,
+            -1023,
+            1023,
+            -1100,
+            -2100,
+            i32::MAX,
+            i32::MIN,
+            53,
+            -53,
+        ];
+        for &x in &xs {
+            for &e in &es {
+                // SAFETY: a pure libm call.
+                let want = unsafe { c_ldexp(x, e) };
+                assert_eq!(ldexp(x, e).to_bits(), want.to_bits(), "ldexp({x:e}, {e})");
+            }
+        }
     }
 
     #[test]

@@ -384,6 +384,11 @@ b]])"#),
     ("fix-libs random_ranges", r#"math.randomseed(7) local o = {}
         for _ = 1, 4 do table.insert(o, math.random(-2^31, 2^31 - 1)) table.insert(o, math.random(2^31 - 2, 2^31 - 1)) table.insert(o, math.random(2^31 - 1)) table.insert(o, math.random(-5, 5)) end
         return table.concat(o, " ")"#),
+    ("fix-libs ldexp", r#"local z = 0 local inf = 1 / z local f = function(x) return string.format("%.17g", x) end
+        return S(f(math.ldexp(0.5, 1024)), f(math.ldexp(1, -1074)), f(math.ldexp(2^-1074, 1074)), f(math.ldexp(1, -1075)), f(math.ldexp(3, -1075)), f(math.ldexp(1, 1024)), f(math.ldexp(1, -2000)), f(math.ldexp(2^-1074, 2098)), f(math.ldexp(1.5, -1074)), f(math.ldexp(inf, -5000)), f(math.ldexp(5, 2^40)), f(ldexp(0.75, -1073)), f(math.ldexp(1, 2^31)))"#),
+    ("fix-libs hex_float", r#"local f = function(x) return string.format("%.17g", x or -1) end
+        return S(f(tonumber("0x1p-1074")), f(tonumber("0x1000000000000p-1070")), f(tonumber("0x1p1023")), f(tonumber("0x1p1024")), f(tonumber("0x.1p-1070")), f(tonumber("0x1p-1075")), f(tonumber("0x3p-1075")), f(tonumber("0x1.8p-1074")), f(tonumber("0x1fffffffffffffp-1126")), f(tonumber("0x123456789abcdef0123p-1100")), f(tonumber("0x1p-1080")), f("0x1p-1074" + 0))"#),
+    ("fix-libs str_nul", r#"return S(tonumber("1\0"), tonumber("12\0 "), tonumber("1\0x"), E(function() return "1\0" + 1 end), E(function() return "0x10\0" + 0 end), tonumber("\0"), tonumber(" 5\0abc"), tonumber("ff\0", 16), tonumber("0x1\0"), tonumber("\0 1"), tonumber("1e\0"), tonumber("1 \0 x"))"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

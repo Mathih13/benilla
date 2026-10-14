@@ -142,7 +142,7 @@ fn frexp(vm: &mut Vm, nargs: usize) -> R<usize> {
 fn ldexp(vm: &mut Vm, nargs: usize) -> R<usize> {
     let e = vm.check_int(nargs, 2)?;
     let x = vm.check_number(nargs, 1)?;
-    Ok(vm.ret1(Value::Num(x * 2f64.powi(e))))
+    Ok(vm.ret1(Value::Num(crate::number::ldexp(x, e))))
 }
 
 fn min(vm: &mut Vm, nargs: usize) -> R<usize> {
