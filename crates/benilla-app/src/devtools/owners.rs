@@ -3,7 +3,10 @@
 /// The addon a chunk name belongs to: the folder of an `@Interface\AddOns\<Folder>\…` file,
 /// `FrameXML` for the stock interface, `benilla` for benilla's own layer. An XML handler's chunk
 /// (`<frame>:<script>`) names no file, so it goes to the addon whose file was compiled just before
-/// it: the loader compiles an addon's handlers while that addon loads.
+/// it: the loader compiles an addon's handlers while that addon loads, so an addon whose handlers
+/// come before any of its `.lua` files is charged to the one before it. A chunk compiled later from
+/// a string (`loadstring`, `RunScript`, a binding's body) names no addon either, so it goes to the
+/// addon loaded last: an approximation the per-addon time carries.
 pub(super) fn owner_names(sources: &[std::rc::Rc<[u8]>]) -> Vec<String> {
     let mut out = Vec::with_capacity(sources.len());
     let mut current = String::from("FrameXML");

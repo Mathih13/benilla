@@ -220,6 +220,8 @@ pub(super) fn feed_ui_input(
     // and before the keys (an Escape that clears focus still counts as captured this frame).
     capture.typing = script.has_keyboard_focus();
     capture.consumed.clear();
+    // egui's keyboard focus is the last pass's: a key in the very frame a click focuses an egui
+    // field still reaches the game.
     if pointer.egui_keyboard.0 {
         capture.typing = true;
         keyboard.clear();
@@ -230,7 +232,8 @@ pub(super) fn feed_ui_input(
     // passes the arrows on unless ALT is held: its handler returns 0 at `0x77b1c4` and the
     // binding runs at `CGWorldFrame`; a focused box swallows any other key (`0x77b35e` returns 1),
     // PRINTSCREEN excepted (`0x77b17f`, see `crate::bindings`).
-    capture.arrows_fall_through = !alt && script.editbox_alt_arrow_mode();
+    capture.arrows_fall_through =
+        !alt && script.editbox_alt_arrow_mode() && !pointer.egui_keyboard.0;
 
     // ── Keyboard → VM ── every press is one key-down walk by name (`0x765f10`), in which a box is
     // a frame like the rest; a box the walk reached then takes the key's editing action through

@@ -33,6 +33,9 @@ struct Row {
 #[derive(Resource, Default)]
 pub(crate) struct AddonProfiler {
     open: bool,
+    /// The VM session profiling was turned on in: a new VM (a world entry, a `/reload`) starts
+    /// without it.
+    session: u64,
     next: f32,
     next_census: f32,
     frames: u32,
@@ -64,6 +67,7 @@ pub(super) fn toggle(
     if prof.open {
         *prof = AddonProfiler {
             open: true,
+            session: script.session(),
             last_ns: vm
                 .profile
                 .as_ref()
@@ -83,6 +87,15 @@ pub(super) fn sample(
         return;
     }
     let Some(script) = script else { return };
+    if prof.session != script.session() {
+        script.lua().raw_vm().set_profiling(true);
+        *prof = AddonProfiler {
+            open: true,
+            session: script.session(),
+            ..default()
+        };
+        return;
+    }
     prof.frames += 1;
     let now = time.elapsed_secs();
     if now < prof.next {

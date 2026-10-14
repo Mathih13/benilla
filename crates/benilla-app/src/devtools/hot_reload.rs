@@ -1,6 +1,7 @@
 //! Hot reload: an edited `.lua` file under the addon folder takes effect in the running UI, its
 //! functions swapped into the live closures (`benilla_lua::reload`), state and registrations
-//! kept. The folder is polled twice a second; each reload is reported in the chat frame.
+//! kept. The files the VM loaded are checked twice a second; each reload is reported in the chat
+//! frame.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -10,15 +11,19 @@ use benilla_ui::mlua::{ObjectLike, Table};
 use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
-/// How often the folder is polled.
+/// How often the files are checked.
 const POLL_SECS: f32 = 0.5;
 /// Reloads the profiler panel lists.
 pub(super) const LOG_LINES: usize = 6;
 
 #[derive(Resource, Default)]
 pub(crate) struct HotReload {
+    /// The VM session the files below were read from.
+    session: u64,
+    /// Each source id's file on disk, for a chunk the loader read from the addon folder; the list
+    /// grows with the VM's.
+    files: Vec<Option<PathBuf>>,
     mtimes: HashMap<PathBuf, SystemTime>,
-    primed: bool,
     next_poll: f32,
     /// The latest reloads, newest last: the time, the line and whether it applied.
     pub(super) log: VecDeque<(f32, String, bool)>,
@@ -30,21 +35,37 @@ pub(super) fn poll(time: Res<Time>, script: Option<NonSend<UiScript>>, mut hr: R
         return;
     }
     hr.next_poll = now + POLL_SECS;
-    let Some(root) = crate::ui_script::addons::root() else {
+    let (Some(root), Some(script)) = (crate::ui_script::addons::root(), script) else {
         return;
     };
-    let mut seen = HashMap::new();
-    walk(&root, &mut seen);
-    let changed: Vec<PathBuf> = seen
-        .iter()
-        .filter(|(p, t)| hr.primed && hr.mtimes.get(*p) != Some(*t))
-        .map(|(p, _)| p.clone())
-        .collect();
-    hr.mtimes = seen;
-    hr.primed = true;
-    let Some(script) = script else { return };
-    for path in changed {
-        let (line, ok) = reload(&script, &root, &path);
+    let hr = &mut *hr;
+    if hr.session != script.session() {
+        hr.session = script.session();
+        hr.files.clear();
+        hr.mtimes.clear();
+    }
+    let sources = &script.lua().raw_vm().heap.sources;
+    for name in &sources[hr.files.len()..] {
+        hr.files
+            .push(file_of(&root, &String::from_utf8_lossy(name)));
+    }
+    let mut changed = Vec::new();
+    for (id, path) in hr.files.iter().enumerate() {
+        let Some(path) = path else { continue };
+        let Ok(t) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        // A file first seen is recorded, not reloaded.
+        if hr
+            .mtimes
+            .insert(path.clone(), t)
+            .is_some_and(|old| old != t)
+        {
+            changed.push((id, path.clone()));
+        }
+    }
+    for (id, path) in changed {
+        let (line, ok) = reload(&script, &root, id, &path);
         info!("devtools: {line}");
         chat(&script, &line, ok);
         hr.log.push_back((now, line, ok));
@@ -54,52 +75,34 @@ pub(super) fn poll(time: Res<Time>, script: Option<NonSend<UiScript>>, mut hr: R
     }
 }
 
-/// Every `.lua` file under `dir`, with its modification time.
-fn walk(dir: &Path, out: &mut HashMap<PathBuf, SystemTime>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            walk(&p, out);
-        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lua")) {
-            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
-                out.insert(p, t);
-            }
-        }
-    }
+/// The file a chunk was read from: the loader names it `@Interface\AddOns\<Folder>\<file>`, in
+/// the `.toc`'s spelling, matched on disk case-insensitively as the loader matched it.
+fn file_of(root: &Path, chunk: &str) -> Option<PathBuf> {
+    let rel = chunk.strip_prefix('@')?;
+    benilla_assets::loose_addon_file(root, &benilla_assets::normalize_path(rel))
 }
 
-/// Reload one file into the chunk the loader compiled it as; the report line and whether it
-/// applied.
-fn reload(script: &UiScript, root: &Path, path: &Path) -> (String, bool) {
-    let rel: Vec<String> = path
+/// Reload one file into the chunk the loader compiled it as, source `id`; the report line and
+/// whether it applied.
+fn reload(script: &UiScript, root: &Path, id: usize, path: &Path) -> (String, bool) {
+    let shown = path
         .strip_prefix(root)
         .unwrap_or(path)
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    let shown = rel.join("/");
-    // The loader names a file chunk `@Interface\AddOns\<Folder>\<file>` in the `.toc`'s own
-    // spelling, which may differ from the disk's in case.
-    let key = format!("@interface\\addons\\{}", rel.join("\\")).to_ascii_lowercase();
+        .to_string_lossy()
+        .into_owned();
     let lua = script.lua();
     let vm = lua.raw_vm();
-    let Some(name) = vm
-        .heap
-        .sources
-        .iter()
-        .find(|s| String::from_utf8_lossy(s).to_ascii_lowercase() == key)
-        .cloned()
-    else {
-        return (format!("{shown}: not loaded, nothing to reload"), false);
-    };
+    let name = vm.heap.sources[id].clone();
     let Ok(bytes) = std::fs::read(path) else {
         return (format!("{shown}: unreadable"), false);
     };
     let src = benilla_ui::source::chunk(&bytes);
     match vm.hot_reload(&name, src) {
+        // A file of top-level code only: nothing to swap, and it does not rerun.
+        Ok(r) if r.swapped.is_empty() && r.reshaped.is_empty() && r.added.is_empty() => (
+            format!("{shown}: no function to swap; top-level code runs again only on /reload"),
+            false,
+        ),
         Ok(r) => {
             let mut line = format!(
                 "{shown}: {} function(s) swapped into {} closure(s)",

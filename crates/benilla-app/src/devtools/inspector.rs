@@ -2,11 +2,11 @@
 //! benilla-lua's heap. An expression picks the root, and opening it picks the frame under the
 //! cursor, else `_G`; a statement runs as a REPL line. Tables, metatables and a closure's upvalues
 //! expand in place, each function with its source line and owning addon, a frame with its name and
-//! its script handlers, and a scalar field or upvalue edits in place, written raw. Every value is read from the root each frame, and the
-//! root is a VM root, so a collection keeps it.
+//! its script handlers, and a scalar field or upvalue edits in place, written raw. Every value is
+//! read from the root each frame, and the root is a VM root, so a collection keeps it.
 
 use benilla_ui::mlua::benilla_lua::heap::{FuncObj, UpvalObj};
-use benilla_ui::mlua::benilla_lua::value::{TableRef, V};
+use benilla_ui::mlua::benilla_lua::value::{FuncRef, TableRef, V};
 use benilla_ui::mlua::benilla_lua::{Value, Vm};
 use benilla_ui::script::UiScript;
 use benilla_world::modkeys::dev_chord;
@@ -24,8 +24,11 @@ const MAX_CHILDREN: usize = 400;
 const PREVIEW: usize = 80;
 /// A text field's fill: the overlay's own background is too dark to show one.
 const FIELD: egui::Color32 = egui::Color32::from_rgb(38, 42, 56);
-/// A frame's name, then each handler it has and its script, through the 1.12 API.
+/// A frame's name, then each handler it has and its script, through the 1.12 API. The library
+/// functions are taken when the inspector opens, so an addon's later replacement does not reach
+/// them.
 const FRAME_HELPER: &[u8] = br#"
+local pcall, getn, tinsert, unpack = pcall, table.getn, table.insert, unpack
 local H = { "OnLoad", "OnEvent", "OnUpdate", "OnShow", "OnHide", "OnEnter", "OnLeave", "OnClick",
   "OnDoubleClick", "OnMouseDown", "OnMouseUp", "OnMouseWheel", "OnDragStart", "OnDragStop",
   "OnReceiveDrag", "OnKeyDown", "OnKeyUp", "OnChar", "OnSizeChanged", "OnValueChanged",
@@ -34,19 +37,29 @@ local H = { "OnLoad", "OnEvent", "OnUpdate", "OnShow", "OnHide", "OnEnter", "OnL
 return function(f)
   local ok, name = pcall(f.GetName, f)
   local out = { ok and name or false }
-  for i = 1, table.getn(H) do
+  for i = 1, getn(H) do
     local has, s = pcall(f.GetScript, f, H[i])
-    if has and s then table.insert(out, H[i]) table.insert(out, s) end
+    if has and s then tinsert(out, H[i]) tinsert(out, s) end
   end
   return unpack(out)
 end
 "#;
 
-/// Where an edited value is written back.
+/// Where an edited value is written back: a table's key, or a closure's upvalue by index.
 #[derive(Clone, Copy)]
 enum Slot {
     Field(TableRef, Value),
-    Upval(u32),
+    Upval(FuncRef, usize),
+}
+
+impl Slot {
+    /// The values the slot names, rooted while an edit's text runs, since that text may collect.
+    fn holds(self) -> [Value; 2] {
+        match self {
+            Slot::Field(t, k) => [Value::Table(t), k],
+            Slot::Upval(f, _) => [Value::Func(f), Value::Nil],
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -57,8 +70,8 @@ pub(crate) struct LuaInspector {
     root: Option<(u32, u64)>,
     /// Narrows the root table's keys.
     filter: String,
-    /// The row under edit and the text typed so far.
-    edit: Option<(egui::Id, String)>,
+    /// The row under edit, the text typed so far, and whether the field still needs the focus.
+    edit: Option<(egui::Id, String, bool)>,
     /// The last evaluation's or edit's outcome, and whether it went through.
     status: Option<(String, bool)>,
     /// The owning addon of each chunk the VM has compiled.
@@ -95,6 +108,14 @@ fn release_root(ins: &mut LuaInspector, script: &UiScript) {
     }
 }
 
+/// [`run`] under the load budget, so a runaway line errors instead of hanging the client.
+fn run_bounded(script: &UiScript, text: &str) -> Result<Option<Value>, String> {
+    script.set_instruction_budget(crate::ui_script::addons::LOAD_INSTRUCTION_BUDGET);
+    let r = run(script.lua().raw_vm(), text);
+    script.clear_instruction_budget();
+    r
+}
+
 /// `return <text>` when it compiles, else `<text>` as statements: the first result, if any.
 fn run(vm: &mut Vm, text: &str) -> Result<Option<Value>, String> {
     const NAME: &[u8] = b"=[inspector]";
@@ -111,11 +132,10 @@ fn run(vm: &mut Vm, text: &str) -> Result<Option<Value>, String> {
 }
 
 fn evaluate(ins: &mut LuaInspector, script: &UiScript) {
-    let vm = script.lua().raw_vm();
-    match run(vm, &ins.expr) {
+    match run_bounded(script, &ins.expr) {
         Ok(Some(v)) => {
             release_root(ins, script);
-            ins.root = Some((vm.root(v), script.session()));
+            ins.root = Some((script.lua().raw_vm().root(v), script.session()));
             ins.filter.clear();
             ins.status = None;
         }
@@ -123,6 +143,7 @@ fn evaluate(ins: &mut LuaInspector, script: &UiScript) {
         Err(e) => ins.status = Some((e, false)),
     }
     if ins.root.is_none() {
+        let vm = script.lua().raw_vm();
         let g = Value::Table(vm.globals);
         ins.root = Some((vm.root(g), script.session()));
     }
@@ -139,7 +160,7 @@ struct Asks {
 struct Cx<'a> {
     vm: &'a mut Vm,
     owners: &'a [String],
-    edit: &'a mut Option<(egui::Id, String)>,
+    edit: &'a mut Option<(egui::Id, String, bool)>,
     asks: &'a mut Asks,
     helper: Value,
 }
@@ -151,6 +172,9 @@ fn frame_info(cx: &mut Cx, t: TableRef) -> Option<(String, Vec<(String, Value)>)
         return None;
     }
     let r = cx.vm.pcall_value(cx.helper, &[Value::Table(t)], -1).ok()?;
+    if r.is_empty() {
+        return None;
+    }
     let name = match r.first().map(|v| v.unpack()) {
         Some(V::Str(_)) => cx.vm.display(r[0]),
         _ => "(anonymous)".into(),
@@ -198,6 +222,8 @@ pub(super) fn panel_ui(
     let ctx = contexts.ctx_mut()?;
     let ins = &mut *ins;
     let mut asks = Asks::default();
+    // Drawing calls the frame helper, whose `GetName` and `GetScript` an addon may override.
+    script.set_instruction_budget(crate::ui_script::addons::LOAD_INSTRUCTION_BUDGET);
 
     egui::Window::new("Lua inspector")
         .default_pos(egui::pos2(560.0, 200.0))
@@ -265,16 +291,22 @@ pub(super) fn panel_ui(
                     _ => row(ui, &mut cx, egui::Id::new("lua_root"), "value", root, None),
                 });
         });
+    script.clear_instruction_budget();
 
     if let Some((slot, text)) = asks.commit {
+        let held = slot.holds().map(|v| script.lua().raw_vm().root(v));
+        let r = run_bounded(&script, &text);
         let vm = script.lua().raw_vm();
-        ins.status = Some(match run(vm, &text) {
-            Ok(v) => {
-                write(vm, slot, v.unwrap_or(Value::Nil));
-                (format!("wrote {text}"), true)
-            }
+        ins.status = Some(match r {
+            Ok(v) => match write(vm, slot, v.unwrap_or(Value::Nil)) {
+                Ok(()) => (format!("wrote {text}"), true),
+                Err(e) => (e, false),
+            },
             Err(e) => (e, false),
         });
+        for id in held {
+            vm.unroot(id);
+        }
     }
     if asks.evaluate {
         evaluate(ins, &script);
@@ -283,15 +315,24 @@ pub(super) fn panel_ui(
 }
 
 /// A raw write: no `__newindex`, no frame script runs.
-fn write(vm: &mut Vm, slot: Slot, v: Value) {
+fn write(vm: &mut Vm, slot: Slot, v: Value) -> Result<(), String> {
     match slot {
-        Slot::Field(t, k) => {
-            let _ = vm.heap.table_mut(t).set(k, v);
+        Slot::Field(t, k) => vm
+            .heap
+            .table_mut(t)
+            .set(k, v)
+            .map_err(|e| format!("{e:?} key")),
+        Slot::Upval(f, i) => {
+            let FuncObj::Lua { upvals, .. } = vm.heap.func(f) else {
+                return Err("not a Lua function".into());
+            };
+            let u = upvals[i];
+            match vm.heap.upval(u) {
+                UpvalObj::Open(s) => vm.stack[s as usize] = v,
+                UpvalObj::Closed(_) => *vm.heap.upval_mut(u) = UpvalObj::Closed(v),
+            }
+            Ok(())
         }
-        Slot::Upval(i) => match vm.heap.upval(i) {
-            UpvalObj::Open(s) => vm.stack[s as usize] = v,
-            UpvalObj::Closed(_) => *vm.heap.upval_mut(i) = UpvalObj::Closed(v),
-        },
     }
 }
 
@@ -362,12 +403,30 @@ fn describe(cx: &mut Cx, v: Value) -> String {
     }
 }
 
-/// A value as Lua source, the starting text of an edit.
-fn literal(vm: &mut Vm, v: Value) -> String {
-    match v.unpack() {
-        V::Str(_) => format!("{:?}", vm.display(v)),
-        _ => vm.display(v),
-    }
+/// A value as Lua source that reads back as the same value, the starting text of an edit; `None`
+/// for a value no literal spells (a light userdata), which stays read-only.
+fn literal(vm: &Vm, v: Value) -> Option<String> {
+    Some(match v.unpack() {
+        V::Nil => "nil".into(),
+        V::Bool(b) => b.to_string(),
+        V::Num(n) if n.is_nan() => "0/0".into(),
+        V::Num(n) if n.is_infinite() => if n > 0.0 { "1/0" } else { "-1/0" }.into(),
+        // Rust's shortest round-trip spelling, where `%.14g` would lose digits.
+        V::Num(n) => format!("{n:?}"),
+        V::Str(_) => {
+            let mut q = String::from("\"");
+            for &b in vm.bytes(v)? {
+                match b {
+                    b'"' | b'\\' => q.extend(['\\', b as char]),
+                    b' '..=b'~' => q.push(b as char),
+                    _ => q.push_str(&format!("\\{b:03}")),
+                }
+            }
+            q.push('"');
+            q
+        }
+        _ => return None,
+    })
 }
 
 fn colour(v: Value) -> egui::Color32 {
@@ -461,7 +520,7 @@ fn row(ui: &mut egui::Ui, cx: &mut Cx, id: egui::Id, key: &str, v: Value, slot: 
                             UpvalObj::Open(s) => cx.vm.stack[s as usize],
                             UpvalObj::Closed(x) => x,
                         };
-                        row(ui, cx, id.with(i), &name, uv, Some(Slot::Upval(u)));
+                        row(ui, cx, id.with(i), &name, uv, Some(Slot::Upval(f, i)));
                     }
                 });
         }
@@ -501,21 +560,25 @@ fn pairs_count(vm: &Vm, t: TableRef) -> usize {
 fn scalar(ui: &mut egui::Ui, cx: &mut Cx, id: egui::Id, key: &str, v: Value, slot: Option<Slot>) {
     ui.horizontal(|ui| {
         ui.label(key);
-        let editing = cx.edit.as_ref().is_some_and(|(e, _)| *e == id);
+        let editing = cx.edit.as_ref().is_some_and(|(e, ..)| *e == id);
         if let (true, Some(slot)) = (editing, slot) {
-            let (_, text) = cx.edit.as_mut().unwrap();
+            let (_, text, fresh) = cx.edit.as_mut().unwrap();
             let r = ui.add(
                 egui::TextEdit::singleline(text)
                     .font(egui::TextStyle::Monospace)
                     .background_color(FIELD)
                     .desired_width(240.0),
             );
-            r.request_focus();
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                *cx.edit = None;
-            } else if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                let (_, text) = cx.edit.take().unwrap();
-                cx.asks.commit = Some((slot, text));
+            // Focus once, so a click elsewhere takes it and ends the edit.
+            if std::mem::take(fresh) {
+                r.request_focus();
+            } else if r.lost_focus() {
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let (_, text, _) = cx.edit.take().unwrap();
+                    cx.asks.commit = Some((slot, text));
+                } else {
+                    *cx.edit = None;
+                }
             }
             return;
         }
@@ -526,8 +589,10 @@ fn scalar(ui: &mut egui::Ui, cx: &mut Cx, id: egui::Id, key: &str, v: Value, slo
         )
         .sense(egui::Sense::click());
         let r = ui.add(label);
-        if slot.is_some() && r.on_hover_text("click to edit").clicked() {
-            *cx.edit = Some((id, literal(cx.vm, v)));
+        if let (Some(_), Some(text)) = (slot, literal(cx.vm, v)) {
+            if r.on_hover_text("click to edit").clicked() {
+                *cx.edit = Some((id, text, true));
+            }
         }
     });
 }
@@ -550,7 +615,7 @@ mod tests {
         let labels: Vec<String> = pairs(&mut vm, t).into_iter().map(|p| p.0).collect();
         assert_eq!(labels, ["[1]", "[2]", "a", "b"]);
         let k = vm.str(b"c");
-        write(&mut vm, Slot::Field(t, k), Value::Num(7.0));
+        write(&mut vm, Slot::Field(t, k), Value::Num(7.0)).unwrap();
         let c = vm.heap.table(t).get(k);
         assert_eq!(vm.display(c), "7", "written past __newindex");
 
@@ -563,9 +628,29 @@ mod tests {
         let FuncObj::Lua { upvals, .. } = vm.heap.func(fr).clone() else {
             panic!("a Lua closure")
         };
-        write(&mut vm, Slot::Upval(upvals[0]), Value::Num(9.0));
+        assert_eq!(upvals.len(), 1);
+        write(&mut vm, Slot::Upval(fr, 0), Value::Num(9.0)).unwrap();
         vm.set_global("f", f);
         let got = run(&mut vm, "f()").unwrap().unwrap();
         assert_eq!(vm.display(got), "9", "the closure sees the edited upvalue");
+    }
+
+    #[test]
+    fn an_edit_starts_from_a_literal_that_reads_back_the_same() {
+        let mut vm = benilla_ui::mlua::benilla_lua::new_state();
+        let src = r#"return 0.1, 1/3, 1e300, 1/0, -1/0, 'a"b\\c\n\200', true, nil"#;
+        let vals = vm.exec(src.as_bytes(), b"=t").unwrap();
+        for v in vals {
+            let text = literal(&vm, v).unwrap();
+            let back = run(&mut vm, &text).unwrap().unwrap_or(Value::Nil);
+            vm.set_global("a", v);
+            vm.set_global("b", back);
+            let eq = run(&mut vm, "a == b").unwrap().unwrap();
+            assert_eq!(vm.display(eq), "true", "{text} reads back as itself");
+        }
+        assert!(
+            literal(&vm, Value::Light(1)).is_none(),
+            "a light userdata stays read-only"
+        );
     }
 }
