@@ -43,7 +43,30 @@ pub fn c_ulong(n: f64) -> u64 {
     }
 }
 
+/// The longest string the libraries build, `INT32_MAX` bytes: more than the 1.12 client's 32-bit
+/// address space could hold. Deviation: the C build grows a string while `realloc` succeeds, and
+/// a failure is the catchable `not enough memory`; Rust's allocator aborts the process instead,
+/// and Linux grants far more than it can fill, so past this bound the libraries raise C's message.
+pub const MAX_STRING: usize = i32::MAX as usize;
+
 impl Vm {
+    /// 5.1's memory error: `not enough memory`, with no position (`luaD_throw(L, LUA_ERRMEM)`).
+    #[cold]
+    pub fn memory_error(&mut self) -> LuaError {
+        let v = self.str(b"not enough memory");
+        self.throw(v)
+    }
+
+    /// Room in `buf` for `extra` more bytes of a string being built, within [`MAX_STRING`] and
+    /// what the allocator grants; else [`Vm::memory_error`].
+    #[inline]
+    pub fn reserve(&mut self, buf: &mut Vec<u8>, extra: usize) -> R<()> {
+        if buf.len().saturating_add(extra) > MAX_STRING || buf.try_reserve(extra).is_err() {
+            return Err(self.memory_error());
+        }
+        Ok(())
+    }
+
     /// `luaL_checkany`.
     pub fn check_any(&mut self, nargs: usize, n: usize) -> R<Value> {
         if n > nargs {

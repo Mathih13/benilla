@@ -161,6 +161,7 @@ fn concat(vm: &mut Vm, nargs: usize) -> R<usize> {
             .flatten()
         {
             Some(s) => {
+                vm.reserve(out, vm.heap.str(s).len())?;
                 out.extend_from_slice(vm.heap.str(s));
                 Ok(())
             }
@@ -175,6 +176,7 @@ fn concat(vm: &mut Vm, nargs: usize) -> R<usize> {
     };
     while i < last {
         add(vm, &mut out, i)?;
+        vm.reserve(&mut out, sep.len())?;
         out.extend_from_slice(&sep);
         i += 1;
     }

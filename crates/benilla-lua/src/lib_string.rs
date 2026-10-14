@@ -121,16 +121,28 @@ fn char_(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(vm.ret_str(&out))
 }
 
+/// 5.1's `rep`: `n` copies; a result past [`crate::api::MAX_STRING`] is `not enough memory`.
 fn rep(vm: &mut Vm, nargs: usize) -> R<usize> {
     let s = vm.check_str(nargs, 1)?;
     let n = vm.check_int(nargs, 2)?;
-    let b = vm.heap.str(s);
-    let out = if n > 0 {
-        b.repeat(n as usize)
-    } else {
-        Vec::new()
-    };
-    Ok(vm.ret_str(&out))
+    let l = vm.heap.str(s).len();
+    if n <= 0 || l == 0 {
+        return Ok(vm.ret_str(b""));
+    }
+    let total = l.saturating_mul(n as usize);
+    let [mut out] = vm.take_bufs::<1>();
+    let r = vm.reserve(&mut out, total);
+    if r.is_ok() {
+        // Doubling copies, as `slice::repeat` makes them.
+        out.extend_from_slice(vm.heap.str(s));
+        while out.len() <= total / 2 {
+            out.extend_from_within(..);
+        }
+        out.extend_from_within(..total - out.len());
+    }
+    let r = r.map(|()| vm.ret_str(&out));
+    vm.give_bufs([out]);
+    r
 }
 
 /// 5.1's `byte`: the bytes from `i` (1) to `j` (`i`), each a number.
@@ -251,30 +263,41 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
                     },
                 );
                 // `luaL_addlstring(b, buff, strlen(buff))`: a `%c` of 0 ends the item.
-                out.extend(item.iter().take_while(|&&b| b != 0));
+                let item = &item[..item.iter().position(|&b| b == 0).unwrap_or(item.len())];
+                vm.reserve(out, item.len())?;
+                out.extend_from_slice(item);
             }
             b'd' | b'i' => {
                 // `(long)luaL_checknumber`.
                 let n = crate::api::c_integer(vm.check_number(nargs, arg)?);
-                if spec.is_plain() {
+                let item = if spec.is_plain() {
                     // A bare `%d`: the digits alone.
-                    out.extend_from_slice(n.to_string().as_bytes());
+                    n.to_string()
                 } else {
-                    out.extend_from_slice(cfmt::fmt_int(n, &spec).as_bytes());
-                }
+                    cfmt::fmt_int(n, &spec)
+                };
+                vm.reserve(out, item.len())?;
+                out.extend_from_slice(item.as_bytes());
             }
             b'o' | b'u' | b'x' | b'X' => {
                 let n = vm.check_number(nargs, arg)?;
                 // `(unsigned long)luaL_checknumber`.
                 let n = crate::api::c_ulong(n);
-                out.extend_from_slice(cfmt::fmt_uint(n, conv, &spec).as_bytes());
+                let item = cfmt::fmt_uint(n, conv, &spec);
+                vm.reserve(out, item.len())?;
+                out.extend_from_slice(item.as_bytes());
             }
             b'e' | b'E' | b'f' | b'g' | b'G' => {
                 let n = vm.check_number(nargs, arg)?;
-                out.extend_from_slice(cfmt::fmt_float(n, conv, &spec).as_bytes());
+                let item = cfmt::fmt_float(n, conv, &spec);
+                vm.reserve(out, item.len())?;
+                out.extend_from_slice(item.as_bytes());
             }
             b'q' => {
                 let s = vm.check_str(nargs, arg)?;
+                // `addquoted`: two quotes, and up to four bytes for each byte quoted.
+                let len = vm.heap.str(s).len();
+                vm.reserve(out, len.saturating_mul(4).saturating_add(2))?;
                 out.push(b'"');
                 for &c in vm.heap.str(s) {
                     match c {
@@ -291,6 +314,9 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
             }
             b's' => {
                 let s = vm.check_str(nargs, arg)?;
+                // At most the string and a two-digit width.
+                let len = vm.heap.str(s).len();
+                vm.reserve(out, len.saturating_add(99))?;
                 let b = vm.heap.str(s);
                 if spec.precision.is_none() && b.len() >= 100 {
                     out.extend_from_slice(b);
@@ -903,6 +929,7 @@ fn add_value(
     let v = match kind {
         0 => {
             // `add_s`: `%0` the whole match, `%1`-`%9` a capture, `%` and anything else itself.
+            vm.reserve(out, repl_bytes.len())?;
             let mut i = 0;
             while i < repl_bytes.len() {
                 let c = repl_bytes[i];
@@ -914,10 +941,12 @@ fn add_value(
                     if !d.is_ascii_digit() {
                         out.push(d);
                     } else if d == b'0' {
+                        vm.reserve(out, e - s)?;
                         out.extend_from_slice(&ms.src[s..e]);
                     } else {
                         let v = one_capture(vm, ms, (d - b'1') as usize, s, e)?;
                         let sv = vm.tostr(v).unwrap();
+                        vm.reserve(out, vm.heap.str(sv).len())?;
                         out.extend_from_slice(vm.heap.str(sv));
                     }
                 }
@@ -938,11 +967,13 @@ fn add_value(
     };
     if !v.truthy() {
         // Nil or false keeps the matched text.
+        vm.reserve(out, e - s)?;
         out.extend_from_slice(&ms.src[s..e]);
     } else if let Some(sv) = matches!(v.unpack(), V::Str(_) | V::Num(_))
         .then(|| vm.tostr(v))
         .flatten()
     {
+        vm.reserve(out, vm.heap.str(sv).len())?;
         out.extend_from_slice(vm.heap.str(sv));
     } else {
         let t = v.type_name();
