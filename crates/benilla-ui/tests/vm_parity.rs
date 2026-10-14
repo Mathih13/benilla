@@ -512,6 +512,19 @@ b]])"#),
         local ok, e = pcall(calls[3], 7999)
         local _, _, m = string.find(tostring(e), "^([^\n]*)")
         return table.concat(o, " ") .. " " .. m"#),
+    // ── perf-fix: gsub skips to a literal first byte; every shape answers as before ──
+    ("perf-fix gsub_literal_first", r##"local s = "a-b--c-d.e%f(g)h"
+        return S(string.gsub(s, "%-", "+"), string.gsub(s, "-", "+"), string.gsub(s, "%-+", "+"), string.gsub(s, "%-*", "+"),
+          string.gsub(s, "%-?", "+"), string.gsub(s, "b%-", "B"), string.gsub(s, "%-", "+", 2), string.gsub(s, "%-", "+", 0),
+          string.gsub(s, "%.", "!"), string.gsub(s, "%%", "#"), string.gsub(s, "%(", "["), string.gsub(s, "d(.)", "<%1>"),
+          string.gsub(s, "x", "y"), string.gsub("", "x", "y"), string.gsub(s, "^a", "A"), string.gsub(s, "^b", "B"),
+          string.gsub(s, "h$", "H"), string.gsub(s, "-c", function(m) return "[" .. m .. "]" end),
+          string.gsub(s, "c", {c = "C"}), string.gsub("aaa", "a", "%0%0"))"##),
+    ("perf-fix gsub_literal_errors", r#"return S(E(function() return string.gsub("abc", "b%", "x") end), E(function() return string.gsub("xyz", "b%", "x") end),
+          E(function() return string.gsub("abc", "b(", "x") end), E(function() return string.gsub("xyz", "b(", "x") end),
+          E(function() return string.gsub("abc", "b%1", "x") end), E(function() return string.gsub("xyz", "b[", "x") end),
+          E(function() return string.gsub("abc", "b[", "x") end), E(function() return string.gsub("abc", "b", "%2") end),
+          E(function() return string.gsub("xyz", "b", "%2") end))"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

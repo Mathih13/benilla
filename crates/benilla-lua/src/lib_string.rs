@@ -719,6 +719,28 @@ fn pat_err(vm: &mut Vm, e: PatErr) -> LuaError {
 
 /// The pattern as 5.0 reads it: up to its first NUL, then a NUL.
 /// The pattern as 5.0's matcher reads it, a C string: up to its first NUL, then one.
+/// The byte a match of `pat` from `p` must start with, when its first item is one literal byte
+/// that must occur (no `*`, `?` or `-` after it): `do_match` returns no match at once at any
+/// position without it, before it reads the rest of the pattern, so skipping such positions
+/// changes no result and no error.
+fn first_literal(pat: &[u8], p: usize) -> Option<u8> {
+    let (c, ep) = match *pat.get(p)? {
+        b'%' => {
+            let c = *pat.get(p + 1)?;
+            if c == 0 || c.is_ascii_alphanumeric() {
+                return None;
+            }
+            (c, p + 2)
+        }
+        c if c == 0 || c == b')' || SPECIALS.contains(&c) => return None,
+        c => (c, p + 1),
+    };
+    match pat.get(ep) {
+        Some(b'*' | b'?' | b'-') => None,
+        _ => Some(c),
+    }
+}
+
 fn c_pattern(p: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.extend_from_slice(&p[..p.iter().position(|&b| b == 0).unwrap_or(p.len())]);
@@ -903,7 +925,23 @@ fn gsub_in(vm: &mut Vm, nargs: usize, [src, cpat, out, repl_buf]: &mut [Vec<u8>;
     let mut ms = new_state(src, cpat);
     let mut at = 0usize;
     let mut n = 0;
+    let lit = if anchor {
+        None
+    } else {
+        first_literal(cpat, pstart)
+    };
     while n < max_s {
+        // Straight to the next place the first byte occurs: `do_match` fails at once anywhere
+        // else, and those bytes are copied as the loop below would copy them one by one.
+        if let Some(c) = lit {
+            match src[at..].iter().position(|&b| b == c) {
+                Some(k) => {
+                    out.extend_from_slice(&src[at..at + k]);
+                    at += k;
+                }
+                None => break,
+            }
+        }
         ms.level = 0;
         let e = match ms.do_match(at, pstart) {
             Ok(e) => e,
