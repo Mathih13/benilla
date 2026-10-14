@@ -475,6 +475,23 @@ b]])"#),
         return E(s)"#),
     ("fix-vm depth_mixed", r#"local t = setmetatable({}, {__index = function(t, k) local ok, e = pcall(function() return string.gsub("a", "a", function() return t[k] end) end) if not ok then error(e, 0) end return e end})
         return E(function() return t.x end)"#),
+    // ── fix-vm: metamethods are called whatever they are, as 5.1's `callTMres` ──
+    ("fix-vm tm_callable", r#"local h = setmetatable({}, {__call = function(self, a, b) return 42 end})
+        local t = setmetatable({}, {__add = h, __concat = h, __unm = h, __sub = h, __div = h, __mul = h, __pow = h})
+        return S(t + 1, 1 - t, t * 2, t / 2, t ^ 2, t .. "x", "x" .. t, -t, E(function() return t .. {} end))"#),
+    ("fix-vm tm_compare_callable", r#"local h = setmetatable({}, {__call = function(self, a, b) return 1 end})
+        local mt = {__eq = h, __lt = h, __le = h}
+        local q, r = setmetatable({}, mt), setmetatable({}, mt)
+        return S(q == r, q < r, q <= r, q > r, q >= r)"#),
+    ("fix-vm tm_not_callable", r#"return S(E(function() local q = setmetatable({}, {__add = 5}) return q + 1 end),
+        E(function() local q = setmetatable({}, {__concat = 5}) return q .. "x" end),
+        E(function() local q = setmetatable({}, {__unm = true}) return -q end),
+        E(function() local q = setmetatable({}, {__lt = 5}) return q < q end),
+        E(function() local q = setmetatable({}, {__eq = 5}) return q == setmetatable({}, getmetatable(q)) end),
+        E(function() local q = setmetatable({}, {__call = {}}) return q() end),
+        E(function() local q = setmetatable({}, {__index = 5}) return q.x end))"#),
+    ("fix-vm tm_unm_args", r#"local u = setmetatable({}, {__unm = function(a, b) return S(a == b, rawequal(a, b)) end})
+        return -u"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

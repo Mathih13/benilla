@@ -713,7 +713,8 @@ impl Vm {
         Ok(r[0])
     }
 
-    /// `call_binTM`: the first operand's metamethod, else the second's; it must be a function.
+    /// `call_binTM`: the first operand's metamethod, else the second's, called whatever it is
+    /// (a table with `__call` runs; a number raises "attempt to call").
     #[cold]
     #[inline(never)]
     fn bin_tm(&mut self, a: Value, b: Value, name: StrRef) -> Result<Option<Value>, LuaError> {
@@ -721,7 +722,7 @@ impl Vm {
         if tm.is_nil() {
             tm = self.tm(b, name);
         }
-        if !matches!(tm.unpack(), V::Func(_)) {
+        if tm.is_nil() {
             return Ok(None);
         }
         Ok(Some(self.call_tm_res(tm, a, b)?))
@@ -1144,11 +1145,14 @@ impl Vm {
                     // `tryfuncTM`: `__call` goes below the arguments.
                     let tm = self.tm(other, self.names.call);
                     if !matches!(tm.unpack(), V::Func(_)) {
+                        // A name only for a register of the running Lua function, as 5.1's
+                        // `isinstack`: a metamethod is called from above them.
                         let reg = self
                             .frames
                             .last()
                             .filter(|f| !f.proto.is_null())
-                            .map(|f| func_idx - f.base());
+                            .map(|f| func_idx.wrapping_sub(f.base()))
+                            .filter(|&r| r < self.frames.last().map_or(0, |f| f.maxstack as usize));
                         return Err(self.type_error(other, reg, "call"));
                     }
                     self.ensure(func_idx + nargs + 2);
@@ -2131,8 +2135,10 @@ impl Vm {
                         match self.tonumber(x) {
                             Some(n) => r!(a) = Value::Num(-n),
                             None => {
+                                // 5.1.5's `OP_UNM`: `Arith(L, ra, rb, rb, TM_UNM)`, the operand
+                                // passed twice.
                                 let unm = self.names.unm;
-                                match slow!(self.bin_tm(x, Value::Nil, unm))? {
+                                match slow!(self.bin_tm(x, x, unm))? {
                                     Some(v) => r!(a) = v,
                                     None => {
                                         return Err(self.type_error(
