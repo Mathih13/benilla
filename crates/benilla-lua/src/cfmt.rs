@@ -203,7 +203,8 @@ pub fn fmt_float(v: f64, conv: u8, spec: &Spec) -> String {
             s
         }
     };
-    if spec.alt && !body.contains('.') && conv != b'g' && conv != b'G' {
+    // `#`: the point stays, for `%g` too (whose trailing zeros stay as well).
+    if spec.alt && !body.contains('.') {
         match body.find(['e', 'E']) {
             Some(i) => body.insert(i, '.'),
             None => body.push('.'),
@@ -330,6 +331,9 @@ mod tests {
         assert_eq!(fmt_float(f64::INFINITY, b'f', &sp("5")), "  inf");
         assert_eq!(fmt_float(f64::NEG_INFINITY, b'E', &sp("")), "-INF");
         assert_eq!(fmt_float(2.5, b'f', &sp("08.3")), "0002.500");
+        assert_eq!(fmt_float(123456.0, b'g', &sp("#")), "123456.");
+        assert_eq!(fmt_float(1.0, b'g', &sp("#.0")), "1.");
+        assert_eq!(fmt_float(1e20, b'G', &sp("#.0")), "1.E+20");
         assert_eq!(fmt_str(b"abc", &sp("5")), b"  abc");
         assert_eq!(fmt_str(b"abcdef", &sp(".2")), b"ab");
     }

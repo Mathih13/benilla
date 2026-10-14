@@ -419,6 +419,10 @@ b]])"#),
         table.insert(o, E(h))
         table.insert(o, E(function() local G = getfenv(0) setfenv(0, G) return getfenv(0) == G end))
         return table.concat(o, "|")"#),
+    ("fix-libs format_no_value", r#"return S(E(string.format, "%d"), E(string.format, "%s"), E(string.format, "%d %d", 1), E(string.format, "%q"), E(string.format, "%c"), E(string.format, "%f"), E(string.format, "%y"), E(string.format, "%"), E(string.format, "%------d"), E(string.format, "%123d"), E(format, "%d"))"#),
+    ("fix-libs format_alt_g", r#"local z = 0 local m = -z
+        return S(string.format("%#g", 123456), string.format("%#.0g", 1), string.format("%#G", 1e20), string.format("%#g", 0), string.format("%#.3g", 1), string.format("%#g", 1e-10), string.format("%#.0e", 1), string.format("%#.0f", 1), string.format("%#.0G", 1e20), string.format("%#10.1g|%-#8g|", 5, 2.5), string.format("%g %f %e %.3g", m, m, m, m))"#),
+    ("fix-libs format_ulong", r#"local z = 0 local o = {} for _, v in {2^64, 1e300, 1 / z, -1 / z, 0 / z, 2^63, -2^63, -1, 2^65, 2^63 + 2^11, -2^64, -1e300, 2^64 - 2^11} do table.insert(o, E(string.format, "%x %u %o %X", v, v, v, v)) end return table.concat(o, "|")"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

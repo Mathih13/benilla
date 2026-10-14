@@ -34,9 +34,11 @@ pub fn c_int_direct(n: f64) -> i32 {
     }
 }
 
-/// C's `(unsigned long)` cast of a `double` on x86-64, as `string.format`'s `%x` does.
+/// C's `(unsigned long)` cast of a `double` as gcc compiles it for x86-64, as `string.format`'s
+/// `%x` does: from 2^63 up, `cvttsd2si(n - 2^63) ^ 2^63`, which is 0 from 2^64 up and for an
+/// infinity; below, `cvttsd2si(n)`.
 pub fn c_ulong(n: f64) -> u64 {
-    if (TWO63..2.0 * TWO63).contains(&n) {
+    if n >= TWO63 {
         c_integer(n - TWO63) as u64 ^ (1 << 63)
     } else {
         c_integer(n) as u64

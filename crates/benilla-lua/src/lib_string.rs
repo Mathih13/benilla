@@ -211,6 +211,10 @@ fn format_in(vm: &mut Vm, nargs: usize, [f, out]: &mut [Vec<u8>; 2]) -> R<usize>
             continue;
         }
         arg += 1;
+        // `if (++arg > top) luaL_argerror(L, arg, "no value")`, before the item is read.
+        if arg > nargs {
+            return Err(vm.arg_error(arg, "no value"));
+        }
         // `scanformat`: flags, two width digits, a point and two precision digits at most.
         let mut spec = Spec::default();
         let at = |j: usize| f.get(j).copied().unwrap_or(0);
