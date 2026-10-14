@@ -78,9 +78,9 @@ fn fire(lua: &Lua, owner: FrameHandle, script: &str, args: &[&str]) {
     }
 }
 
-/// Replace the spans on screen, `(text frame, y-up rect, link, text)`: each text frame's spans take
-/// its pooled buttons in order, a new one built when the pool runs out, and the buttons left over,
-/// or of a text frame with no span now, hide.
+/// Replace the spans on screen, `(text frame, y-up rect, link, text)`: each ScrollingMessageFrame's
+/// spans take its pooled buttons in order, a new one built when the pool runs out, and the buttons
+/// left over, or of a text frame with no span now, hide. A MessageFrame's spans stay text.
 pub(super) fn set_spans(lua: &Lua, spans: Vec<(FrameHandle, Rect, String, String)>) {
     // One span: its rect, link and text.
     type Span = (Rect, String, String);
