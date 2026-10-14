@@ -346,7 +346,19 @@ impl Table {
         None
     }
 
+    /// `luaH_getnum` then the read: the array part inline, the hash part out of line.
+    #[inline]
     pub fn get_int(&self, k: i32) -> Value {
+        // `k` below 1 wraps past any array length.
+        let i = (k as usize).wrapping_sub(1);
+        if i < self.array.len() {
+            return self.array[i];
+        }
+        self.get_int_hash(k)
+    }
+
+    #[inline(never)]
+    fn get_int_hash(&self, k: i32) -> Value {
         self.find_int(k).map_or(Value::Nil, |s| self.slot(s))
     }
 

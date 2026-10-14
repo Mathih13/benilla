@@ -69,7 +69,13 @@ fn rawgeti(vm: &Vm, t: TableRef, i: i64) -> Value {
 }
 
 fn rawseti(vm: &mut Vm, t: TableRef, i: i64, v: Value) {
-    vm.heap.table_mut(t).set_int(i as i32, v);
+    let tab = vm.heap.table_mut(t);
+    // The array part inline, as `get_int` reads it; `k` below 1 wraps past its length.
+    let k = i as i32;
+    match tab.array.get_mut((k as usize).wrapping_sub(1)) {
+        Some(slot) => *slot = v,
+        None => tab.set_int(k, v),
+    }
 }
 
 fn foreachi(vm: &mut Vm, nargs: usize) -> R<usize> {
@@ -196,8 +202,13 @@ fn concat(vm: &mut Vm, nargs: usize) -> R<usize> {
 }
 
 /// `sort_comp`: the comparator, or `lua_lessthan`.
+#[inline]
 fn comp(vm: &mut Vm, f: Value, a: Value, b: Value) -> R<bool> {
     if f.is_nil() {
+        // Two numbers, the common sort, compared here; anything else as `<` compares it.
+        if let (Some(x), Some(y)) = (a.as_num(), b.as_num()) {
+            return Ok(x < y);
+        }
         vm.less_than(a, b)
     } else {
         Ok(vm.call_value(f, &[a, b], 1)?[0].truthy())
