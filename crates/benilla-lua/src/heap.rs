@@ -697,7 +697,7 @@ impl Heap {
             live[t.owner as usize] = true;
         }
         for (_, f) in self.funcs.iter_live() {
-            if let FuncObj::Lua { proto, .. } = f {
+            if let FuncObj::Lua(LuaFunc { proto, .. }) = f {
                 live[proto.source_id as usize] = true;
             }
         }
