@@ -982,8 +982,7 @@ impl Table {
 
     /// `lua_objlen`: 5.1's `luaH_getn`.
     pub fn raw_len(&self) -> usize {
-        // TODO(fix-libs merge): `.length()`, the `luaH_getn` port on `fix-libs`, for `.border()`.
-        self.lua().vm().heap.table(self.tref()).border()
+        self.lua().vm().heap.table(self.tref()).length()
     }
 
     pub fn len(&self) -> Result<Integer> {
