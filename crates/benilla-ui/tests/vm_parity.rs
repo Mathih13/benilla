@@ -4,12 +4,19 @@
 
 use benilla_ui::script::UiScript;
 
-/// Serializers both VMs run: `S(...)` writes values, `E(f, ...)` writes a protected call.
+/// Serializers both VMs run: `S(...)` writes values, `E(f, ...)` writes a protected call. A number
+/// prints exactly, so a one-ulp difference shows.
 const PRELUDE: &str = r#"
 local function S1(v)
   local t = type(v)
   if t == "string" then return string.format("%q", v)
-  elseif t == "number" or t == "boolean" or t == "nil" then return tostring(v)
+  elseif t == "number" then
+    -- `tostring`'s `%.14g` hides a last-place difference: a value it does not carry exactly
+    -- prints all 17 digits.
+    local s = tostring(v)
+    if v == v and tonumber(s) ~= v then s = string.format("%.17g", v) end
+    return s
+  elseif t == "boolean" or t == "nil" then return tostring(v)
   else return t end
 end
 local function S(...)
