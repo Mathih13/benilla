@@ -1089,24 +1089,36 @@ impl Vm {
                         // first, a string nothing else ever sees.
                         let mut buf = std::mem::take(&mut self.concat_buf);
                         buf.clear();
-                        // The result's length first, a number's text at most 24 bytes: past
-                        // `MAX_STRING`, or room the allocator refuses, is `not enough memory`
-                        // (C's `luaV_concat` allocates the sum and fails there).
-                        let len = (1..=n).fold(0usize, |l, i| {
-                            l.saturating_add(match self.stack[top - i].unpack() {
-                                V::Str(s) => self.heap.str(s).len(),
-                                _ => 24,
-                            })
-                        });
-                        if len > crate::api::MAX_STRING || buf.try_reserve(len).is_err() {
-                            return Err(self.memory_error());
-                        }
+                        // Each piece grows the buffer fallibly, a number's text at most 24 bytes:
+                        // past `MAX_STRING`, or room the allocator refuses, is `not enough
+                        // memory` (C's `luaV_concat` allocates the sum and fails there).
+                        let mut refused = false;
                         for i in (1..=n).rev() {
                             match self.stack[top - i].unpack() {
-                                V::Str(s) => buf.extend_from_slice(self.heap.str(s)),
-                                V::Num(x) => crate::number::push_g14(x, &mut buf),
+                                V::Str(s) => {
+                                    let b = self.heap.str(s);
+                                    if b.len() > buf.capacity() - buf.len()
+                                        && !crate::api::grow_fallibly(&mut buf, b.len())
+                                    {
+                                        refused = true;
+                                        break;
+                                    }
+                                    buf.extend_from_slice(b);
+                                }
+                                V::Num(x) => {
+                                    if 24 > buf.capacity() - buf.len()
+                                        && !crate::api::grow_fallibly(&mut buf, 24)
+                                    {
+                                        refused = true;
+                                        break;
+                                    }
+                                    crate::number::push_g14(x, &mut buf);
+                                }
                                 _ => unreachable!("checked above"),
                             }
+                        }
+                        if refused {
+                            return Err(self.memory_error());
                         }
                         self.stack[top - n] = self.str(&buf);
                         // A large buffer is not kept: one long result would hold its memory.

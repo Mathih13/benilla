@@ -256,3 +256,11 @@ impl Vm {
         matches!(v.unpack(), V::Str(_) | V::Num(_))
     }
 }
+
+/// Room for `extra` more bytes in a string being built, within `MAX_STRING` and what the
+/// allocator grants, growing as `Vec` grows: whether it was granted.
+#[cold]
+#[inline(never)]
+pub(crate) fn grow_fallibly(buf: &mut Vec<u8>, extra: usize) -> bool {
+    buf.len().saturating_add(extra) <= crate::api::MAX_STRING && buf.try_reserve(extra).is_ok()
+}
