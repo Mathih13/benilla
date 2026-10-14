@@ -337,11 +337,21 @@ pub struct Heap {
     pub cur_source: u32,
     /// `intern_with`'s buffer.
     scratch: Vec<u8>,
+    /// A string could not be made: no id was left, or no memory. [`Heap::intern`] answered
+    /// [`Heap::oom_str`] in its place, and the VM raises `not enough memory` where it next checks.
+    pub(crate) oom: bool,
+    /// `not enough memory`, made first and never collected: what a failed intern answers, and the
+    /// error value, which needs no new string.
+    pub(crate) oom_str: StrRef,
+    /// Ids a string may take: [`STR_ID_MASK`], lower in a test.
+    str_id_limit: u32,
+    /// Past this many ids, with none free, a collection is asked for before ids run out.
+    str_gc_at: u32,
 }
 
 impl Default for Heap {
     fn default() -> Self {
-        Heap {
+        let mut h = Heap {
             strs: Arena::new(),
             strt: vec![STRT_EMPTY; 128],
             tables: Arena::new(),
@@ -355,7 +365,13 @@ impl Default for Heap {
             source_ids: Default::default(),
             cur_source: 0,
             scratch: Vec::new(),
-        }
+            oom: false,
+            oom_str: StrRef { id: 0, hash: 0 },
+            str_id_limit: STR_ID_MASK,
+            str_gc_at: STR_ID_MASK / 2,
+        };
+        h.oom_str = h.intern(b"not enough memory");
+        h
     }
 }
 
@@ -384,12 +400,23 @@ impl Heap {
             }
             b = (b + 1) & mask;
         }
+        // A string value holds its id in `STR_ID_BITS`: sixteen million live strings, the last
+        // id left free so no intern slot reads as empty. Deviation: C Lua has no such bound;
+        // past it the string is `not enough memory`, as C's would be when memory runs out.
+        let fresh = self.strs.free.is_empty();
+        if fresh && self.strs.used >= self.str_id_limit {
+            return self.out_of_memory();
+        }
+        if fresh && self.strs.used >= self.str_gc_at {
+            // Ids run short: a collection, at the next check, frees the dead ones first. It
+            // moves the mark to halfway between what lives and the bound; until it runs, the
+            // mark moves halfway on, so the request is not made for every new string.
+            self.threshold = 0;
+            self.str_gc_at = self.strs.used + (self.str_id_limit - self.strs.used) / 2;
+        }
         self.bytes += 32 + s.len();
         let id = self.strs.alloc(StrObj::new(s, hash));
         self.strt[b] = strt_entry(hash, id);
-        // A string value holds its id in `STR_ID_BITS`: sixteen million live strings, the
-        // last id left free so no slot reads as empty.
-        assert!(id < STR_ID_MASK, "more live strings than a value can name");
         if self.strs.live() * 2 > self.strt.len() {
             self.resize_strt(self.strt.len() * 2);
         }
@@ -397,6 +424,29 @@ impl Heap {
             id,
             hash: hash & STR_HASH_MASK,
         }
+    }
+
+    /// A string that cannot be made: the pending error set, a collection asked for, and
+    /// [`Heap::oom_str`] in its place.
+    #[cold]
+    #[inline(never)]
+    fn out_of_memory(&mut self) -> StrRef {
+        self.oom = true;
+        self.threshold = 0;
+        self.oom_str
+    }
+
+    /// Whether a string could not be made since the last check, clearing it: for a host that
+    /// made a string outside a call, where no native return checks for it.
+    pub fn take_oom(&mut self) -> bool {
+        std::mem::take(&mut self.oom)
+    }
+
+    /// Lower the number of string ids, so a test reaches the bound without gigabytes of strings.
+    #[doc(hidden)]
+    pub fn limit_string_ids(&mut self, n: u32) {
+        self.str_id_limit = n.min(STR_ID_MASK);
+        self.str_gc_at = self.str_id_limit / 2;
     }
 
     /// Rebuild the intern table at `size` slots from the live strings.
@@ -567,6 +617,7 @@ impl Heap {
         mode_key: StrRef,
     ) -> usize {
         let mut gray: Vec<Value> = roots.to_vec();
+        gray.push(Value::Str(self.oom_str));
         let mut gray_upvals: Vec<u32> = extra_upvals.to_vec();
         let mut weak_tables: Vec<u32> = Vec::new();
         // Constants of every reached prototype, once each.
@@ -690,6 +741,8 @@ impl Heap {
         let freed = self.strs.free.len();
         live += sweep(&mut self.strs, |s| 32 + s.bytes().len());
         let dead_str = self.strs.free.len() != freed;
+        let live_strs = self.strs.live() as u32;
+        self.str_gc_at = live_strs + (self.str_id_limit.saturating_sub(live_strs)) / 2;
         if dead_str {
             let size = self.strt.len();
             self.resize_strt(size);

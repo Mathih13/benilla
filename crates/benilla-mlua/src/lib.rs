@@ -357,6 +357,9 @@ impl Lua {
 
     pub fn create_string(&self, s: impl AsRef<[u8]>) -> Result<String> {
         let v = self.vm().str(s.as_ref());
+        if self.vm().heap.take_oom() {
+            return Err(Error::MemoryError("not enough memory".into()));
+        }
         Ok(String(self.make_ref(v)))
     }
 

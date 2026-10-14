@@ -477,6 +477,11 @@ impl Vm {
     /// Compile a chunk into a function over the globals.
     pub fn load(&mut self, src: &[u8], chunkname: &[u8]) -> Result<Value, crate::SyntaxError> {
         let proto = crate::compile::compile(src, chunkname, &mut self.heap, self.c_depth)?;
+        // A constant the compiler could not make: 5.1's `LUA_ERRMEM`.
+        if self.heap.oom {
+            self.heap.oom = false;
+            return Err(crate::SyntaxError(b"not enough memory".to_vec()));
+        }
         let env = self.globals;
         let shape = crate::heap::Shape::of(&proto);
         Ok(Value::Func(self.heap.new_func(FuncObj::Lua {
@@ -1105,6 +1110,9 @@ impl Vm {
             total -= n - 1;
             last -= n - 1;
         }
+        if self.heap.oom {
+            return Err(self.memory_error());
+        }
         Ok(())
     }
 
@@ -1329,6 +1337,10 @@ impl Vm {
                     Some(h) => h(self, nargs)?,
                     None => f(self, nargs)?,
                 };
+                // A string the native made could not be: it raises here, in its caller.
+                if self.heap.oom {
+                    return Err(self.memory_error());
+                }
                 self.frames.pop();
                 let first = self.top - n;
                 self.poscall(func_idx, first, n, nres);

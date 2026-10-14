@@ -3,10 +3,19 @@
 
 /// Run `src` in the script host's state on a 2 MB thread; its results as text, or the error.
 fn run(src: &'static str) -> Result<Vec<String>, String> {
+    run_with(src, |_| {})
+}
+
+/// [`run`] in a state `setup` prepared first.
+fn run_with(
+    src: &'static str,
+    setup: impl FnOnce(&mut benilla_lua::Vm) + Send + 'static,
+) -> Result<Vec<String>, String> {
     std::thread::Builder::new()
         .stack_size(2 << 20)
         .spawn(move || {
             let mut vm = benilla_lua::new_script_host_state();
+            setup(&mut vm);
             match vm.exec(src.as_bytes(), b"=t") {
                 Ok(vs) => Ok(vs.into_iter().map(|v| vm.display(v)).collect()),
                 Err(e) => Err(vm.display(e)),
@@ -105,5 +114,48 @@ fn results_beyond_the_c_stack_raise() {
     assert!(
         got[9].ends_with("stack overflow (string slice too long)"),
         "{got:?}"
+    );
+}
+
+/// Past the ids a string value can name, a new string is `not enough memory`, raised where it
+/// was made (a concatenation, a native, the compiler) and caught by the `pcall` around it. Dead
+/// strings give their ids back first: a collection is asked for before the ids run out.
+#[test]
+fn running_out_of_string_ids_is_not_enough_memory() {
+    fn limit(vm: &mut benilla_lua::Vm) {
+        vm.heap.limit_string_ids(50_000);
+    }
+    let src = r#"local t = {}
+        local ok1, e1 = pcall(function() for i = 1, 100000 do t[i] = "s" .. i end end)
+        local n1 = table.getn(t)
+        local ok2, e2 = pcall(function() for i = 1, 100000 do t[i] = tostring(-i) end end)
+        local ok3, e3 = pcall(loadstring, "return 'a new constant'")
+        t = nil
+        collectgarbage()
+        local s = 0
+        for i = 1, 300000 do s = s + string.len("g" .. i) end
+        return ok1, e1, n1 > 40000 and n1 < 50000, ok2, e2, ok3, e3, s"#;
+    let got = run_with(src, limit).unwrap();
+    assert_eq!(
+        got,
+        [
+            "false",
+            "not enough memory",
+            "true",
+            "false",
+            "not enough memory",
+            "true",
+            "nil",
+            "1988895"
+        ],
+        "{got:?}"
+    );
+    // Live strings near the bound and garbage made on top: the collection asked for frees it.
+    let churn = r#"local keep = {} for i = 1, 40000 do keep[i] = "k" .. i end
+        local n = 0 for i = 1, 300000 do if ("g" .. i) ~= "" then n = n + 1 end end
+        return n, table.getn(keep)"#;
+    assert_eq!(
+        run_with(churn, limit),
+        Ok(vec!["300000".into(), "40000".into()])
     );
 }

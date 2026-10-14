@@ -58,7 +58,8 @@ impl Vm {
     /// 5.1's memory error: `not enough memory`, with no position (`luaD_throw(L, LUA_ERRMEM)`).
     #[cold]
     pub fn memory_error(&mut self) -> LuaError {
-        let v = self.str(b"not enough memory");
+        self.heap.oom = false;
+        let v = Value::Str(self.heap.oom_str);
         self.throw(v)
     }
 
