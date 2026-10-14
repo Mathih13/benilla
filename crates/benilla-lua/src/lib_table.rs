@@ -93,7 +93,7 @@ fn foreach(vm: &mut Vm, nargs: usize) -> R<usize> {
     loop {
         let next = match vm.heap.table(t).next(k) {
             Ok(n) => n,
-            Err(crate::table::InvalidKey) => return Err(vm.rt_error("invalid key for `next'")),
+            Err(crate::table::InvalidKey) => return Err(vm.rt_error("invalid key to `next'")),
         };
         let Some((nk, v)) = next else { return Ok(0) };
         // The key stays on the stack across the call, as 5.0's loop keeps it.

@@ -871,7 +871,8 @@ fn gsub_in(vm: &mut Vm, nargs: usize, [src, cpat, out, repl_buf]: &mut [Vec<u8>;
     let p = vm.check_str(nargs, 2)?;
     let srcl = vm.heap.str(s).len();
     let repl = vm.arg(nargs, 2);
-    let max_s = vm.opt_int(nargs, 4, srcl as i32 + 1)?;
+    // `luaL_optint(L, 4, srcl+1)`: the default cast to `int` as C casts it.
+    let max_s = vm.opt_int(nargs, 4, (srcl as i64 + 1) as i32)?;
     // 5.1's `str_gsub`: a string or number, a function, or a table.
     let kind = match repl.unpack() {
         _ if nargs < 3 => None,

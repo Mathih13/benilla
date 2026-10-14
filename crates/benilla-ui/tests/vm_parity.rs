@@ -423,6 +423,13 @@ b]])"#),
     ("fix-libs format_alt_g", r#"local z = 0 local m = -z
         return S(string.format("%#g", 123456), string.format("%#.0g", 1), string.format("%#G", 1e20), string.format("%#g", 0), string.format("%#.3g", 1), string.format("%#g", 1e-10), string.format("%#.0e", 1), string.format("%#.0f", 1), string.format("%#.0G", 1e20), string.format("%#10.1g|%-#8g|", 5, 2.5), string.format("%g %f %e %.3g", m, m, m, m))"#),
     ("fix-libs format_ulong", r#"local z = 0 local o = {} for _, v in {2^64, 1e300, 1 / z, -1 / z, 0 / z, 2^63, -2^63, -1, 2^65, 2^63 + 2^11, -2^64, -1e300, 2^64 - 2^11} do table.insert(o, E(string.format, "%x %u %o %X", v, v, v, v)) end return table.concat(o, "|")"#),
+    ("fix-libs foreach_invalid_key", r#"local t = {a = 1} return S(E(foreach, t, function(k) t[k] = nil for i = 1, 20 do t["x" .. i] = i end end), E(next, {}, "nope"))"#),
+    ("fix-libs chunkid_cr", r#"local o = {}
+        for _, s in {"error('e')\r--x", "error('e')\n--x", "error('e')\r\n--x", "error('e') --" .. string.rep("y", 100), "\rerror('e')", "error('e')", "error('e')\0--x"} do
+          local f, e = loadstring(s) if f then table.insert(o, E(f)) else table.insert(o, e) end
+        end
+        table.insert(o, tostring(({loadstring("x = = 1\r--y")})[2]))
+        return table.concat(o, "|")"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

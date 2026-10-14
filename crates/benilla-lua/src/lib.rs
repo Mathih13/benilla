@@ -252,7 +252,7 @@ strbyte, strchar, strfind, format, gsub = s.byte, s.char, s.find, s.format, s.gs
 strlen, strlower, strrep, strsub, strupper = s.len, s.lower, s.rep, s.sub, s.upper
 "#;
 
-/// `luaO_chunkid`: a chunk name as a message shows it, in a buffer of `bufflen` bytes. 5.0 uses
+/// `luaO_chunkid`: a chunk name as a message shows it, in a buffer of `bufflen` bytes. 5.1 uses
 /// 80 (`MAXSRC`) for compile errors and 60 (`LUA_IDSIZE`) for runtime ones. `=name` is verbatim,
 /// `@file` keeps the file's tail, and anything else is `[string "first line..."]`.
 pub fn chunkid_n(source: &[u8], bufflen: usize) -> Vec<u8> {
@@ -276,9 +276,10 @@ pub fn chunkid_n(source: &[u8], bufflen: usize) -> Vec<u8> {
         }
         _ => {
             let room = bufflen - b" [string \"...\"] ".len() - 1;
+            // `strcspn(source, "\n\r")`: the first line, ended by either.
             let line = source
                 .iter()
-                .position(|&b| b == b'\n')
+                .position(|&b| b == b'\n' || b == b'\r')
                 .unwrap_or(source.len());
             let len = line.min(room);
             let mut out = b"[string \"".to_vec();
@@ -396,6 +397,8 @@ mod tests {
         assert_eq!(chunkid(b"@a/b.lua"), b"a/b.lua");
         assert_eq!(chunkid(b"x = 1\ny = 2"), b"[string \"x = 1...\"]");
         assert_eq!(chunkid(b"x = 1"), b"[string \"x = 1\"]");
+        assert_eq!(chunkid(b"x = 1\ry = 2"), b"[string \"x = 1...\"]");
+        assert_eq!(chunkid(b"\rx"), b"[string \"...\"]");
         let long = [b'a'; 100];
         assert_eq!(chunkid_n(&long, 60).len(), 9 + 43 + 3 + 2);
     }
