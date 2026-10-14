@@ -17,10 +17,19 @@ pub struct LuaError {
     handled: bool,
 }
 
-/// 5.0's `LUA_MAXCCALLS`: nested host-level calls.
+/// 5.1.5's `LUAI_MAXCCALLS`: nested host-level calls (a host call, a metamethod, a library
+/// callback); past it by an eighth, an error handler's own calls are refused too.
 const MAXCCALLS: u32 = 200;
-/// 5.0's `LUA_MAXCALLS`: nested Lua calls.
-const MAXCALLS: usize = 4096;
+/// 5.1.5's `LUAI_MAXCALLS`: the call-info array may not grow past it.
+const MAXCALLS: usize = 20000;
+/// 5.1.5's `BASIC_CI_SIZE`: the call-info array's first size.
+const BASIC_CI_SIZE: usize = 8;
+/// Rust stack the nested host-level calls under one entry may use. C counts only levels, its
+/// frames being small; a Rust level is larger, and much larger unoptimized, so the level count
+/// alone could run a 2 MB thread out of stack. Past this the call raises "C stack overflow" as
+/// at `LUAI_MAXCCALLS`, with the same eighth of margin for a handler. 200 levels of the deepest
+/// library callback use under half of it in an optimized build, so there it never decides.
+const MAX_RUST_STACK: usize = 1 << 20;
 /// 5.0's `MAXTAGLOOP`.
 const MAXTAGLOOP: u32 = 100;
 
@@ -124,6 +133,15 @@ pub struct Vm {
     pub registry: TableRef,
     pub names: Names,
     c_depth: u32,
+    /// 5.1.5's `L->size_ci`: frames fit while `frames.len() + 1 < ci_size`. 5.1 doubles the array
+    /// as calls nest and raises "stack overflow" once a doubling passes `LUAI_MAXCALLS`, so the
+    /// first overflow comes at 16384 frames and, the array cut back to 20000, later ones at
+    /// 20000; the doubled array leaves the error's handler room to run.
+    ci_size: usize,
+    /// Error handlers running (`throw`): only they may use the margin past `MAX_RUST_STACK`.
+    in_handler: u32,
+    /// The Rust stack address where the outermost host-level call entered (`MAX_RUST_STACK`).
+    stack_base: usize,
     /// The handler of each active protected call, innermost last; `None` for `pcall`.
     handlers: Vec<Option<Value>>,
     /// Collect at every safe point: a test switch that finds a value the roots miss.
@@ -267,6 +285,9 @@ impl Vm {
             registry,
             names,
             c_depth: 0,
+            ci_size: BASIC_CI_SIZE,
+            stack_base: 0,
+            in_handler: 0,
             handlers: Vec::new(),
             gc_stress: false,
             retired: Vec::new(),
@@ -420,6 +441,7 @@ impl Vm {
                 self.c_depth = c_depth;
                 self.top = top;
                 self.handlers.truncate(handlers);
+                self.restore_stack_limit();
                 Err(e.value)
             }
         }
@@ -472,7 +494,9 @@ impl Vm {
         if let Some(Some(h)) = self.handlers.last().copied() {
             // The handler runs unprotected; an error inside it is 5.0's "error in error handling".
             self.handlers.push(None);
+            self.in_handler += 1;
             let r = self.call_value(h, &[v], 1);
+            self.in_handler -= 1;
             self.handlers.pop();
             e.value = match r {
                 Ok(vals) => vals.first().copied().unwrap_or(Value::Nil),
@@ -1043,10 +1067,32 @@ impl Vm {
 
     fn call_at_inner(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<(), LuaError> {
         self.c_depth += 1;
-        if self.c_depth >= MAXCCALLS {
-            self.c_depth -= 1;
-            return Err(self.rt_error("C stack overflow"));
+        let marker = 0u8;
+        let here = std::ptr::addr_of!(marker) as usize;
+        if self.c_depth == 1 {
+            self.stack_base = here;
         }
+        let used = self.stack_base.abs_diff(here);
+        if self.c_depth >= MAXCCALLS || used > MAX_RUST_STACK {
+            // 5.1.5's `luaD_call`: the error at the limit, raised at the deeper level so its
+            // handler has room; a handler's calls past the margin raise without a handler.
+            let e = if self.c_depth >= MAXCCALLS + (MAXCCALLS >> 3)
+                || used > MAX_RUST_STACK + (MAX_RUST_STACK >> 3)
+            {
+                self.errerr()
+            } else if self.c_depth == MAXCCALLS || (used > MAX_RUST_STACK && self.in_handler == 0) {
+                self.rt_error("C stack overflow")
+            } else {
+                return self.call_at_body(func_idx, nargs, nres);
+            };
+            self.c_depth -= 1;
+            return Err(e);
+        }
+        self.call_at_body(func_idx, nargs, nres)
+    }
+
+    #[inline(always)]
+    fn call_at_body(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<(), LuaError> {
         let r = match self.precall(func_idx, nargs, nres) {
             Ok(Called::Lua) => {
                 self.frames.last_mut().unwrap().boundary = true;
@@ -1078,6 +1124,7 @@ impl Vm {
             self.frames.truncate(frames);
             self.c_depth = c_depth;
             self.top = func_idx;
+            self.restore_stack_limit();
             e.handled = false;
             return Err(e);
         }
@@ -1113,8 +1160,8 @@ impl Vm {
                 }
             }
         };
-        if self.frames.len() >= MAXCALLS {
-            return Err(self.rt_error("stack overflow"));
+        if self.frames.len() + 1 >= self.ci_size {
+            self.grow_ci()?;
         }
         match self.heap.func(fref) {
             FuncObj::Lua {
@@ -1207,6 +1254,39 @@ impl Vm {
                 self.poscall(func_idx, first, n, nres);
                 Ok(Called::Done)
             }
+        }
+    }
+
+    /// 5.1.5's `growCI`: the call-info array doubles; past `LUAI_MAXCALLS` the call is refused
+    /// with "stack overflow", and a call while it is past the limit (the overflow's handler
+    /// recursing) with no handler at all.
+    #[cold]
+    #[inline(never)]
+    fn grow_ci(&mut self) -> Result<(), LuaError> {
+        if self.ci_size > MAXCALLS {
+            return Err(self.errerr());
+        }
+        self.ci_size *= 2;
+        if self.ci_size > MAXCALLS {
+            return Err(self.rt_error("stack overflow"));
+        }
+        Ok(())
+    }
+
+    /// 5.1.5's `restore_stack_limit`, after a protected call unwinds: an array an overflow grew
+    /// past the limit goes back to it, if the frames still in use leave room.
+    fn restore_stack_limit(&mut self) {
+        if self.ci_size > MAXCALLS && self.frames.len() + 1 < MAXCALLS {
+            self.ci_size = MAXCALLS;
+        }
+    }
+
+    /// 5.1.5's `LUA_ERRERR`: thrown as is, no handler run, its message the one
+    /// `luaD_seterrorobj` writes.
+    fn errerr(&mut self) -> LuaError {
+        LuaError {
+            value: self.str(b"error in error handling"),
+            handled: true,
         }
     }
 
@@ -1548,6 +1628,17 @@ impl Vm {
             .heap
             .collect(&roots, &open, &self.retired, self.names.mode);
         self.heap.threshold = 2 * live;
+        // 5.1.5's `checkstacksizes`, which a cycle runs as it traverses the running thread, in
+        // propagation and again in the atomic step: a call-info array a quarter used halves,
+        // unless an overflow is being handled.
+        for _ in 0..2 {
+            if self.ci_size <= MAXCALLS
+                && 4 * self.frames.len() < self.ci_size
+                && 2 * BASIC_CI_SIZE < self.ci_size
+            {
+                self.ci_size /= 2;
+            }
+        }
     }
 
     // ── the interpreter ──────────────────────────────────────────────────────────────────────
@@ -2118,7 +2209,7 @@ impl Vm {
                             {
                                 // `fi + 1` frames are live: the depth without reading the
                                 // frame list.
-                                if !shape.vararg && self.frames.len() < MAXCALLS {
+                                if !shape.vararg && self.frames.len() + 1 < self.ci_size {
                                     let np = shape.nparams as usize;
                                     let consts = shape.consts;
                                     let nbase = func_idx + 1;

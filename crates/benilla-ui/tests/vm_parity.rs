@@ -439,6 +439,42 @@ b]])"#),
         return table.concat(o, "|")"#),
     ("fix-libs byte_c_stack", r#"local s = string.rep("a", 9000)
         return S(E(function() return table.getn({string.byte(s, 1, -1)}) end), E(function() return table.getn({string.byte(s, 1, 7997)}) end), E(function() return table.getn({string.byte(s, 1, 7998)}) end), E(function() local n = table.getn({string.byte(s, 1, 7990)}) return n end))"#),
+    // ── fix-vm: call depth, 5.1.5's `LUAI_MAXCALLS` and `LUAI_MAXCCALLS` ──
+    ("fix-vm depth_lua", r#"local n = 0
+        local function f() n = n + 1 f() end
+        local o = {}
+        for i = 1, 3 do n = 0 local ok, e = pcall(f) table.insert(o, tostring(ok) .. ":" .. n .. ":" .. e) end
+        return table.concat(o, " ")"#),
+    ("fix-vm depth_deep_ok", r#"local function f(n) if n == 0 then return 0 end return 1 + f(n - 1) end
+        return S(f(5000), f(15000))"#),
+    ("fix-vm depth_pcall", r#"local m = 0
+        local function g() m = m + 1 local ok, e = pcall(g) if not ok then error(e, 0) end end
+        local ok, e = pcall(g) return S(ok, m, e)"#),
+    ("fix-vm depth_index", r#"local t = setmetatable({}, {__index = function(t, k) return t[k] end})
+        return E(function() return t.x end)"#),
+    ("fix-vm depth_gsub", r#"local d = 0
+        local function h(s) d = d + 1 return (string.gsub("a", "a", h)) end
+        local ok, e = pcall(h) return S(ok, d, e)"#),
+    ("fix-vm depth_xpcall", r#"local n = 0
+        local function f() n = n + 1 f() end
+        local ok, e = xpcall(f, function(e) return "H:" .. e end)
+        return S(ok, n, e)"#),
+    ("fix-vm depth_xpcall_handler_recurses", r#"local n, hn = 0, 0
+        local function f() n = n + 1 f() end
+        local function h(e) hn = hn + 1 return h(e) .. "" end
+        local ok, e = xpcall(f, h)
+        return S(ok, n, e)"#),
+    ("fix-vm depth_concat_tm", r#"local mt = {}
+        mt.__concat = function(a, b) return a .. b end
+        local t = setmetatable({}, mt)
+        return E(function() return t .. "x" end)"#),
+    ("fix-vm depth_tostring_tm", r#"local t = setmetatable({}, {})
+        getmetatable(t).__tostring = function(x) return tostring(x) end
+        return E(function() return tostring(t) end)"#),
+    ("fix-vm depth_sort", r#"local function s() table.sort({3, 1, 2}, function(a, b) s() return a < b end) end
+        return E(s)"#),
+    ("fix-vm depth_mixed", r#"local t = setmetatable({}, {__index = function(t, k) local ok, e = pcall(function() return string.gsub("a", "a", function() return t[k] end) end) if not ok then error(e, 0) end return e end})
+        return E(function() return t.x end)"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.
