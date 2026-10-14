@@ -1,10 +1,11 @@
-//! The script host on either VM: every case runs through `UiScript`, and its answer must equal
-//! the one the C Lua build recorded in `vm_parity.golden`. `BENILLA_BLESS=1` rewrites the file;
-//! only the C Lua build may bless it.
+//! The script host against the C Lua 5.1 build it replaced: every case runs through `UiScript`,
+//! and its answer must equal the one that build gave, recorded in `vm_parity.golden` with mlua's
+//! `runtime error: ` and `stack traceback:` wrapper taken out. A new case's answer comes from
+//! the reference, written in by hand.
 
 use benilla_ui::script::UiScript;
 
-/// Serializers both VMs run: `S(...)` writes values, `E(f, ...)` writes a protected call. A number
+/// Serializers every case runs with: `S(...)` writes values, `E(f, ...)` writes a protected call. A number
 /// prints exactly, so a one-ulp difference shows.
 const PRELUDE: &str = r#"
 local function S1(v)
@@ -712,71 +713,11 @@ fn run(src: &str) -> String {
     }
 }
 
+/// `name\tanswer`, one case a line, the answer through `escape_default` onto one line.
 const GOLDEN: &str = "tests/vm_parity.golden";
 
-/// `escape_default` undone: the golden file's one-line answers back to text.
-fn unescape(s: &str) -> String {
-    let mut out = String::new();
-    let mut it = s.chars();
-    while let Some(c) = it.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match it.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('u') => {
-                let hex: String = it.by_ref().skip(1).take_while(|&c| c != '}').collect();
-                out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
-            }
-            Some(c) => out.push(c),
-            None => {}
-        }
-    }
-    out
-}
-
-/// The C Lua build hands Lua an error from a Rust callback through mlua's wrapper:
-/// `runtime error: ` before the message, and a Rust-side `stack traceback:` block after it.
-/// Neither Lua nor the 1.12 client writes either, and benilla's own VM raises the message alone,
-/// so the wrapper is taken out of a golden answer before it is compared; the message must match.
-fn without_mlua_wrapper(s: &str) -> String {
-    let s = s.replace("runtime error: ", "");
-    let mut out = String::new();
-    let mut rest = s.as_str();
-    while let Some(i) = rest.find("\nstack traceback:") {
-        out.push_str(&rest[..i]);
-        rest = &rest[i + "\nstack traceback:".len()..];
-        // The block's lines each open with a tab; one newline after it goes with it.
-        while let Some(r) = rest.strip_prefix("\n\t") {
-            rest = r.find('\n').map_or("", |j| &r[j..]);
-        }
-        rest = rest.strip_prefix('\n').unwrap_or(rest);
-        rest = rest.strip_prefix("stack traceback:").map_or(rest, |r| {
-            // A second block straight after the first, as a rethrown error carries.
-            let mut r = r;
-            while let Some(x) = r.strip_prefix("\n\t") {
-                r = x.find('\n').map_or("", |j| &x[j..]);
-            }
-            r.strip_prefix('\n').unwrap_or(r)
-        });
-    }
-    out.push_str(rest);
-    out
-}
-
-/// `name\tanswer`, one case a line, the answer escaped onto one line.
-fn render(answers: &[(&str, String)]) -> String {
-    answers
-        .iter()
-        .map(|(n, a)| format!("{n}\t{}\n", a.escape_default()))
-        .collect()
-}
-
 #[test]
-fn every_case_answers_as_the_c_lua_build_recorded() {
+fn every_case_answers_as_the_c_lua_build_did() {
     let sweep: Vec<(String, String)> = SWEEP_FNS
         .iter()
         .map(|f| (format!("sweep {f}"), format!("return SWEEP({f:?})")))
@@ -799,13 +740,6 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
     names.dedup();
     assert_eq!(names.len(), cases.len(), "case names are unique");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
-    if std::env::var_os("BENILLA_BLESS").is_some() {
-        if cfg!(feature = "benilla-vm") {
-            panic!("the golden answers come from the C Lua build");
-        }
-        std::fs::write(&path, render(&answers)).expect("write the golden file");
-        return;
-    }
     let golden = std::fs::read_to_string(&path).expect("the golden file");
     let want: std::collections::HashMap<&str, &str> =
         golden.lines().filter_map(|l| l.split_once('\t')).collect();
@@ -814,20 +748,8 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
         let got = got.escape_default().to_string();
         match want.get(name) {
             Some(w) if *w == got => {}
-            Some(w)
-                if without_mlua_wrapper(&unescape(w))
-                    .escape_default()
-                    .to_string()
-                    == got => {}
-            Some(w) => {
-                let w = without_mlua_wrapper(&unescape(w))
-                    .escape_default()
-                    .to_string();
-                failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
-            }
-            None => failures.push(format!(
-                "{name}: no golden answer; bless on the C Lua build"
-            )),
+            Some(w) => failures.push(format!("{name}\n    got:  {got}\n    want: {w}")),
+            None => failures.push(format!("{name}: no golden answer")),
         }
     }
     assert!(

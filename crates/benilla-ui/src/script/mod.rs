@@ -746,7 +746,6 @@ impl UiScript {
     /// An independent copy of this UI, Lua and Rust sides both, as a fresh session: a built state
     /// to start many runs from without building it again. The host's services (the text measurer,
     /// the probes) are shared with the original; an instruction budget is not carried over.
-    #[cfg(feature = "benilla-vm")]
     pub fn fork(&self) -> UiScript {
         let lua = self.lua.fork();
         lua.remove_hook();
