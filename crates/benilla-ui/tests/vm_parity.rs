@@ -397,6 +397,28 @@ b]])"#),
         local d = {} table.setn(d, 2) d[1] = 9 d[2] = 8 d[3] = 7 sort(d)
         local e = {4, 3, 2, 1} e[3] = nil local oke = pcall(table.sort, e)
         return S(E(f, 3, 1, nil), ok, t[1], t[2], t[3], oka, a[1], a[2], a[3], a[4]) .. "|" .. S(b[1], b[2], b[3], b[4], b[5], okc, c[1], c[2], c[4], d[1], d[2], d[3], oke, e[1], e[2], e[4])"#),
+    ("fix-libs fenv", r#"local function f() end
+        local t = {}
+        local o = {S(setfenv(f, t) == f, getfenv(f) == t)}
+        table.insert(o, E(setfenv, nil, t))
+        local e = {__fenv = 1}
+        table.insert(o, E(function() setfenv(f, e) return getfenv(f) == e end))
+        table.insert(o, E(setfenv, tostring, t))
+        table.insert(o, E(setfenv, 1, t))
+        table.insert(o, E(function() return getfenv(0) == _G, getfenv(tostring) == _G, getfenv() == getfenv(1) end))
+        table.insert(o, E(setfenv, 100, t))
+        table.insert(o, E(getfenv, 100))
+        table.insert(o, E(getfenv, -1))
+        table.insert(o, E(setfenv, f))
+        table.insert(o, E(setfenv, f, 1))
+        table.insert(o, E(getfenv, "x"))
+        table.insert(o, E(getfenv, {}))
+        local function g() local env = {S = S} setfenv(1, env) x = 5 return env.x end
+        table.insert(o, E(g))
+        local function h() return getfenv(2) == _G end
+        table.insert(o, E(h))
+        table.insert(o, E(function() local G = getfenv(0) setfenv(0, G) return getfenv(0) == G end))
+        return table.concat(o, "|")"#),
 ];
 
 /// Every library function the sweep calls, each with every argument set in `SWEEP_ARGS`.

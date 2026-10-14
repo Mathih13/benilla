@@ -118,13 +118,18 @@ fn setmetatable(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(vm.ret1(Value::Table(t)))
 }
 
-/// `getfunc`: argument 1 as a function, or the function at that stack level.
-fn getfunc(vm: &mut Vm, nargs: usize) -> R<Value> {
+/// 5.1's `getfunc`: argument 1 as a function, or the function at that stack level, the level
+/// optional (1) for `getfenv` and required for `setfenv`.
+fn getfunc(vm: &mut Vm, nargs: usize, opt: bool) -> R<Value> {
     let a = vm.arg(nargs, 0);
     if let V::Func(_) = a.unpack() {
         return Ok(a);
     }
-    let level = vm.opt_int(nargs, 1, 1)?;
+    let level = if opt {
+        vm.opt_int(nargs, 1, 1)?
+    } else {
+        vm.check_int(nargs, 1)?
+    };
     if level < 0 {
         return Err(vm.arg_error(1, "level must be non-negative"));
     }
@@ -138,42 +143,28 @@ fn getfunc(vm: &mut Vm, nargs: usize) -> R<Value> {
     }
 }
 
-fn fenv(vm: &Vm, f: Value) -> Value {
-    match f.unpack() {
-        V::Func(f) => match vm.heap.func(f) {
-            FuncObj::Lua { env, .. } | FuncObj::Native { env, .. } => Value::Table(*env),
-        },
-        _ => Value::Table(vm.globals),
-    }
-}
-
+/// 5.1's `luaB_getfenv`: a Lua function's environment; a native answers the thread's globals.
 fn getfenv(vm: &mut Vm, nargs: usize) -> R<usize> {
-    let f = getfunc(vm, nargs)?;
-    let env = fenv(vm, f);
-    // `aux_getfenv`: a `__fenv` field answers in the environment's place.
-    let k = vm.str(b"__fenv");
-    let fe = match env.unpack() {
-        V::Table(t) => vm.heap.table(t).get(k),
-        _ => Value::Nil,
+    let f = getfunc(vm, nargs, true)?;
+    let env = match f.unpack() {
+        V::Func(f) => match vm.heap.func(f) {
+            FuncObj::Lua { env, .. } => *env,
+            FuncObj::Native { .. } => vm.globals,
+        },
+        _ => vm.globals,
     };
-    Ok(vm.ret1(if fe.is_nil() { env } else { fe }))
+    Ok(vm.ret1(Value::Table(env)))
 }
 
+/// 5.1's `luaB_setfenv`: a numeric 0 sets the thread's globals and answers nothing; else the
+/// function's environment is set and the function answered; a native refuses.
 fn setfenv(vm: &mut Vm, nargs: usize) -> R<usize> {
     let t = vm.check_table(nargs, 2)?;
+    let f = getfunc(vm, nargs, false)?;
     let first = vm.arg(nargs, 0);
     if vm.tonumber(first) == Some(0.0) {
-        // The thread's own globals.
         vm.globals = t;
         return Ok(0);
-    }
-    let f = getfunc(vm, nargs)?;
-    let env = fenv(vm, f);
-    let k = vm.str(b"__fenv");
-    if let V::Table(e) = env.unpack() {
-        if !vm.heap.table(e).get(k).is_nil() {
-            return Err(vm.error_at(1, "`setfenv' cannot change a protected environment"));
-        }
     }
     match f.unpack() {
         V::Func(fr) => match vm.heap.func_mut(fr) {
@@ -182,12 +173,12 @@ fn setfenv(vm: &mut Vm, nargs: usize) -> R<usize> {
                 vm.fenv_gen = vm.fenv_gen.wrapping_add(1);
             }
             FuncObj::Native { .. } => {
-                return Err(vm.error_at(1, "`setfenv' cannot change environment of given function"))
+                return Err(vm.error_at(1, "`setfenv' cannot change environment of given object"))
             }
         },
-        _ => unreachable!(),
+        _ => unreachable!("getfunc answers a function"),
     }
-    Ok(0)
+    Ok(vm.ret1(f))
 }
 
 fn next(vm: &mut Vm, nargs: usize) -> R<usize> {
