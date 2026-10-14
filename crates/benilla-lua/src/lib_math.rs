@@ -27,9 +27,9 @@ pub(crate) fn native(name: &str) -> Option<crate::heap::NativeFn> {
         "log" => |vm, n| un(vm, n, f64::ln),
         "log10" => |vm, n| un(vm, n, f64::log10),
         "exp" => |vm, n| un(vm, n, f64::exp),
-        "deg" => |vm, n| un(vm, n, f64::to_degrees),
+        "deg" => |vm, n| un(vm, n, deg),
         "pow" => |vm, n| bin_rev(vm, n, f64::powf),
-        "rad" => |vm, n| un(vm, n, f64::to_radians),
+        "rad" => |vm, n| un(vm, n, rad),
         "random" => random,
         "randomseed" => randomseed,
         _ => return None,
@@ -59,9 +59,9 @@ pub fn open(vm: &mut Vm) {
         ("log", |vm, n| un(vm, n, f64::ln)),
         ("log10", |vm, n| un(vm, n, f64::log10)),
         ("exp", |vm, n| un(vm, n, f64::exp)),
-        ("deg", |vm, n| un(vm, n, f64::to_degrees)),
+        ("deg", |vm, n| un(vm, n, deg)),
         ("pow", |vm, n| bin_rev(vm, n, f64::powf)),
-        ("rad", |vm, n| un(vm, n, f64::to_radians)),
+        ("rad", |vm, n| un(vm, n, rad)),
         ("random", random),
         ("randomseed", randomseed),
     ];
@@ -80,6 +80,20 @@ pub fn open(vm: &mut Vm) {
     let pow = vm.new_native("__pow", |vm, n| bin(vm, n, f64::powf));
     vm.set_global("__pow", pow);
     open_bit(vm);
+}
+
+/// 5.1's `RADIANS_PER_DEGREE`, `PI/180.0`.
+const RADIANS_PER_DEGREE: f64 = std::f64::consts::PI / 180.0;
+
+/// `math_deg`: a division by `RADIANS_PER_DEGREE`, which rounds otherwise than Rust's
+/// `to_degrees` (a product with `180/PI`) for about one value in nine.
+fn deg(x: f64) -> f64 {
+    x / RADIANS_PER_DEGREE
+}
+
+/// `math_rad`: a product with `RADIANS_PER_DEGREE`.
+fn rad(x: f64) -> f64 {
+    x * RADIANS_PER_DEGREE
 }
 
 fn un(vm: &mut Vm, nargs: usize, f: fn(f64) -> f64) -> R<usize> {
@@ -215,7 +229,7 @@ fn random(vm: &mut Vm, nargs: usize) -> R<usize> {
             if u < 1 {
                 return Err(vm.arg_error(1, "interval is empty"));
             }
-            ((r * u as f64).floor() as i32 + 1) as f64
+            (r * u as f64).floor() + 1.0
         }
         2 => {
             let l = vm.check_int(nargs, 1)?;
@@ -223,7 +237,8 @@ fn random(vm: &mut Vm, nargs: usize) -> R<usize> {
             if l > u {
                 return Err(vm.arg_error(2, "interval is empty"));
             }
-            ((r * (u as f64 - l as f64 + 1.0)).floor() as i32 + l) as f64
+            // `floor(r*(u-l+1))+l`: the width in C's `int`, which wraps.
+            (r * u.wrapping_sub(l).wrapping_add(1) as f64).floor() + l as f64
         }
         _ => return Err(vm.error_at(1, "wrong number of arguments")),
     };
