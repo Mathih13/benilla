@@ -29,8 +29,10 @@ Five restore what 5.1 changed or removed:
 | `lparser.c` | `recfield`'s `cc->nh++` inside its `TK_NAME` arm, 5.0's placement | a `[expr] = value` constructor field credits neither `OP_NEWTABLE` size hint in 5.0, so the table is born on the dummy node |
 
 Three delete what 5.1 added, all in `lparser.c`, all byte-read out of the client's own parser
-(`simpleexp 0x6fd240`, `getunopr 0x6fe0a0`, `getbinopr 0x6fe0c0`), all landing on 5.0's own
-`unexpected symbol` at `prefixexp 0x6fde40`:
+(`simpleexp 0x6fd240`, `getunopr 0x6fe0a0`, `getbinopr 0x6fe0c0`). `...` and `#` land on 5.0's
+own `unexpected symbol` at `prefixexp 0x6fde40`. `%` ends the expression before it, so the error is
+whatever comes next expects: `` unexpected symbol near `%' `` after `x = 5`, and
+`` `<eof>' expected near `%' `` after `return 5`.
 
 | change | why |
 |---|---|
@@ -38,10 +40,12 @@ Three delete what 5.1 added, all in `lparser.c`, all byte-read out of the client
 | no length operator (`getunopr`'s `case '#'`) | the client's `getunopr` tests exactly two tokens (`-`, `not`) and its `OPR_NOUNOPR` is 2, a three-member enum; 5.0 asks a table with `table.getn` and a string with `string.len` |
 | no modulo operator (`getbinopr`'s `case '%'`) | the client's `getbinopr` switch is based at `'*'` (0x2A), so `%` (0x25) is below its range and reaches `OPR_NOBINOPR` = 14, a fifteen-member `BinOpr`; 5.0 spells it `math.mod` |
 
-The deletions are safe because nothing the reference runs uses those constructs: a comment- and
-string-stripping scan of the 1.12 FrameXML (177 files), GlueXML, Blizzard's own addons and the
-corpus finds zero sites of all three. No chunk of benilla's own Lua may use a construct the client's
-parser rejects.
+The deletions change nothing for the stock interface: a comment- and string-stripping scan of the
+1.12 FrameXML (177 files), GlueXML and Blizzard's own addons finds zero sites of all three. In the
+addon corpus they reject 18 chunks, all from code written for a later client: 17 in
+AckisRecipeList and its Ace3 libraries, and one in a later Tablet-2.0 bundled with FuBar_AtlasFu.
+The C build rejected the same chunks, and `tests/front_end.rs` names each with its message. No chunk of
+benilla's own Lua may use a construct the client's parser rejects.
 
 ## The generic-for, in detail
 
