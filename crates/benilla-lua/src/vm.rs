@@ -1413,7 +1413,10 @@ impl Vm {
         let p = unsafe { caller.proto.as_ref() }?;
         let pc = caller.pc().checked_sub(1)?;
         match p.code.get(pc)? {
-            Op::Call(a, ..) | Op::TailCall(a, ..) => objname_in(p, &self.heap, pc, *a as usize),
+            // 5.1's `getfuncname`: the generic for's call names its generator.
+            Op::Call(a, ..) | Op::TailCall(a, ..) | Op::TForLoop(a, _) => {
+                objname_in(p, &self.heap, pc, *a as usize)
+            }
             _ => None,
         }
     }
@@ -1434,7 +1437,10 @@ impl Vm {
         let p = unsafe { caller.proto.as_ref() }?;
         let pc = caller.pc().checked_sub(1)?;
         match p.code.get(pc)? {
-            Op::Call(a, ..) | Op::TailCall(a, ..) => objname_in(p, &self.heap, pc, *a as usize),
+            // 5.1's `getfuncname`: the generic for's call names its generator.
+            Op::Call(a, ..) | Op::TailCall(a, ..) | Op::TForLoop(a, _) => {
+                objname_in(p, &self.heap, pc, *a as usize)
+            }
             _ => None,
         }
     }
@@ -2372,7 +2378,7 @@ impl Vm {
     }
 }
 
-/// 5.0's `getobjname` over a prototype: a local's name, else what a symbolic run from the start
+/// 5.1's `getobjname` over a prototype: a local's name, else what a symbolic run from the start
 /// says last wrote `reg` before `pc`.
 fn objname_in(p: &Proto, heap: &Heap, pc: usize, reg: usize) -> Option<(&'static str, Vec<u8>)> {
     if let Some(n) = p.local_name(reg as Reg, pc) {
@@ -2392,7 +2398,7 @@ fn objname_in(p: &Proto, heap: &Heap, pc: usize, reg: usize) -> Option<(&'static
             V::Str(s) => Some(("global", heap.str(s).to_vec())),
             _ => None,
         },
-        Op::Move(a, b) if (b as usize) < (a as usize) => objname_in(p, heap, last, b as usize),
+        Op::Move(a, b) if (b as usize) < (a as usize) => objname_in(p, heap, pc, b as usize),
         Op::GetUpval(_, u) => Some((
             "upvalue",
             p.upval_names
@@ -2407,14 +2413,15 @@ fn objname_in(p: &Proto, heap: &Heap, pc: usize, reg: usize) -> Option<(&'static
     }
 }
 
-/// The instruction that last wrote `reg` before `lastpc`, running the code from the start and
-/// following forward jumps that land at or before `lastpc`, as 5.0's `luaG_symbexec` does.
+/// 5.1's `symbexec`: the instruction that last wrote `reg` before `lastpc`, running the code
+/// from the start and taking each forward jump that lands at or before `lastpc`. As in 5.1, a
+/// test counts as writing the register it tests, and a fused test takes its jump.
 fn symbexec(p: &Proto, lastpc: usize, reg: usize) -> Option<usize> {
     let mut last = None;
     let mut pc = 0;
     while pc < lastpc {
         let op = p.code[pc];
-        let writes = |a: Reg, n: usize| (a as usize..a as usize + n).contains(&reg);
+        let writes = |a: Reg| a as usize == reg;
         let hit = match op {
             Op::Move(a, _)
             | Op::LoadK(a, _)
@@ -2440,20 +2447,32 @@ fn symbexec(p: &Proto, lastpc: usize, reg: usize) -> Option<usize> {
             | Op::Unm(a, _)
             | Op::Not(a, _)
             | Op::Concat(a, ..)
-            | Op::Closure(a, _) => writes(a, 1),
+            | Op::JmpIf(a, ..)
+            | Op::TestSet(a, ..)
+            | Op::ForPrep(a, _)
+            | Op::ForLoop(a, _)
+            | Op::ForLoopUp(a, _)
+            | Op::Closure(a, _) => writes(a),
             Op::LoadNil(a, b) => (a as usize..=b as usize).contains(&reg),
-            Op::SelfOp(a, ..) | Op::SelfField(a, ..) => writes(a, 2),
+            Op::SelfOp(a, ..) | Op::SelfField(a, ..) => writes(a) || reg == a as usize + 1,
             Op::Call(a, ..) | Op::TailCall(a, ..) => reg >= a as usize,
-            Op::ForPrep(a, _) => writes(a, 3),
-            Op::ForLoop(a, _) | Op::ForLoopUp(a, _) => writes(a, 1) || reg == a as usize + 3,
-            Op::TForLoop(a, n) => reg >= a as usize + 2 && reg < a as usize + 3 + n as usize,
+            Op::TForLoop(a, _) => reg >= a as usize + 2,
             _ => false,
         };
         if hit {
             last = Some(pc);
         }
         let jump = match op {
-            Op::Jmp(off) | Op::TForPrep(_, off) | Op::ForPrep(_, off) => Some(off),
+            Op::Jmp(off)
+            | Op::TForPrep(_, off)
+            | Op::ForPrep(_, off)
+            | Op::ForLoop(_, off)
+            | Op::ForLoopUp(_, off)
+            | Op::JmpIf(_, _, off)
+            | Op::TestSet(_, _, _, off)
+            | Op::JmpCmp(_, _, _, off)
+            | Op::JmpCmpK(_, _, _, off)
+            | Op::JmpCmpKR(_, _, _, off) => Some(off),
             _ => None,
         };
         if let Some(off) = jump {
