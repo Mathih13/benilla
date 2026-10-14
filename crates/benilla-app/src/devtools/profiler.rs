@@ -10,7 +10,7 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 
 use super::hot_reload::HotReload;
-use super::owners::owner_names;
+use super::owners::owners_of;
 use crate::debug_panel::{overlay_text, EguiDemand, OVERLAY_FILL, OVERLAY_TEXT_DIM};
 
 /// How often time is sampled, and how often the heap is counted.
@@ -58,7 +58,8 @@ pub(super) fn toggle(
     let Some(script) = script else { return };
     prof.open = !prof.open;
     demand.profiler = prof.open;
-    let vm = script.lua().raw_vm();
+    // SAFETY: plain `Vm` calls only; no Lua runs and no other `Lua` API is reached while held.
+    let vm = unsafe { script.lua().raw_vm() };
     vm.set_profiling(prof.open);
     info!(
         "devtools: addon profiler {}",
@@ -88,7 +89,8 @@ pub(super) fn sample(
     }
     let Some(script) = script else { return };
     if prof.session != script.session() {
-        script.lua().raw_vm().set_profiling(true);
+        // SAFETY: one plain `Vm` call.
+        unsafe { script.lua().raw_vm() }.set_profiling(true);
         *prof = AddonProfiler {
             open: true,
             session: script.session(),
@@ -102,8 +104,9 @@ pub(super) fn sample(
         return;
     }
     prof.next = now + SAMPLE_SECS;
-    let vm = script.lua().raw_vm();
-    let owners = owner_names(&vm.heap.sources);
+    // SAFETY: reads of the profile and the heap; no Lua runs and no other `Lua` API is reached.
+    let vm = unsafe { script.lua().raw_vm() };
+    let owners = owners_of(&vm.heap);
     let ns = vm
         .profile
         .as_ref()
@@ -123,7 +126,8 @@ pub(super) fn sample(
     prof.frames = 0;
     prof.total_us = per.values().sum();
     push(&mut prof.total_history, prof.total_us);
-    for owner in &owners {
+    // A free source slot has no owner.
+    for owner in owners.iter().filter(|o| !o.is_empty()) {
         prof.rows.entry(owner.clone()).or_default();
     }
     for (name, row) in prof.rows.iter_mut() {

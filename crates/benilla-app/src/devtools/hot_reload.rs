@@ -20,9 +20,12 @@ pub(super) const LOG_LINES: usize = 6;
 pub(crate) struct HotReload {
     /// The VM session the files below were read from.
     session: u64,
-    /// Each source id's file on disk, for a chunk the loader read from the addon folder; the list
-    /// grows with the VM's.
+    /// Each source id's file on disk, for a chunk the loader read from the addon folder, as of
+    /// source epoch `epoch` (`Heap::sources_epoch`): a freed slot may hold another chunk later.
     files: Vec<Option<PathBuf>>,
+    epoch: u64,
+    /// Each chunk name's file, resolved once.
+    resolved: HashMap<Box<[u8]>, Option<PathBuf>>,
     mtimes: HashMap<PathBuf, SystemTime>,
     next_poll: f32,
     /// The latest reloads, newest last: the time, the line and whether it applied.
@@ -42,12 +45,27 @@ pub(super) fn poll(time: Res<Time>, script: Option<NonSend<UiScript>>, mut hr: R
     if hr.session != script.session() {
         hr.session = script.session();
         hr.files.clear();
+        hr.epoch = u64::MAX;
         hr.mtimes.clear();
     }
-    let sources = &script.lua().raw_vm().heap.sources;
-    for name in &sources[hr.files.len()..] {
-        hr.files
-            .push(file_of(&root, &String::from_utf8_lossy(name)));
+    // SAFETY: reads of the heap's source table; no Lua runs and no other `Lua` API is reached.
+    let heap = &unsafe { script.lua().raw_vm() }.heap;
+    if hr.epoch != heap.sources_epoch() {
+        hr.epoch = heap.sources_epoch();
+        let resolved = &mut hr.resolved;
+        hr.files = heap
+            .sources
+            .iter()
+            .map(|name| {
+                let name = name.as_ref()?;
+                if let Some(p) = resolved.get(&name[..]) {
+                    return p.clone();
+                }
+                let p = file_of(&root, &String::from_utf8_lossy(name));
+                resolved.insert(Box::from(&name[..]), p.clone());
+                p
+            })
+            .collect();
     }
     let mut changed = Vec::new();
     for (id, path) in hr.files.iter().enumerate() {
@@ -90,13 +108,16 @@ fn reload(script: &UiScript, root: &Path, id: usize, path: &Path) -> (String, bo
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned();
-    let lua = script.lua();
-    let vm = lua.raw_vm();
-    let name = vm.heap.sources[id].clone();
     let Ok(bytes) = std::fs::read(path) else {
         return (format!("{shown}: unreadable"), false);
     };
     let src = benilla_ui::source::chunk(&bytes);
+    // SAFETY: a source lookup and a hot reload through this one reference; nothing else reaches
+    // the `Lua` API until it is let go.
+    let vm = unsafe { script.lua().raw_vm() };
+    let Some(name) = vm.heap.source_name(id as u32).cloned() else {
+        return (format!("{shown}: no longer loaded"), false);
+    };
     match vm.hot_reload(&name, src) {
         // A file of top-level code only: nothing to swap, and it does not rerun.
         Ok(r) if r.swapped.is_empty() && r.reshaped.is_empty() && r.added.is_empty() => (
