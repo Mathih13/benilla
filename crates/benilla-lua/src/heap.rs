@@ -914,21 +914,26 @@ impl Heap {
                     if weak != 0 {
                         weak_tables.push(t.0);
                     }
-                    // Strings are values, never cleared from a weak table: always marked.
-                    gray.extend(tab.array.iter().copied().filter(|v| {
-                        is_collectable(*v) && (!wv || matches!(v.unpack(), V::Str(_)))
-                    }));
+                    // Strings are values, never cleared from a weak table: always marked, here,
+                    // since they hold nothing. A table's contents are live objects. Any other
+                    // collectable goes gray unless the table holds it weakly.
+                    let strs = &mut self.strs;
+                    let mut reach = |v: Value, weak: bool| match v.unpack() {
+                        V::Str(s) => {
+                            strs.mark(s.id);
+                        }
+                        V::Table(_) | V::Func(_) | V::User(_) if !weak => gray.push(v),
+                        _ => {}
+                    };
+                    for &v in &tab.array {
+                        reach(v, wv);
+                    }
                     for n in &tab.node {
                         if n.val.is_nil() {
                             continue;
                         }
-                        // A weak entry's strings stay: strings are values, never cleared.
-                        if !wk || matches!(n.key.unpack(), V::Str(_)) {
-                            gray.push(n.key);
-                        }
-                        if !wv || matches!(n.val.unpack(), V::Str(_)) {
-                            gray.push(n.val);
-                        }
+                        reach(n.key, wk);
+                        reach(n.val, wv);
                     }
                     self.tables.get_mut(t.0).weak = weak;
                 }
