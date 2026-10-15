@@ -6,7 +6,6 @@
 
 use std::rc::Rc;
 
-use crate::ast::Bytes;
 use crate::compile::{BinOpr, BlockCnt, Exp, FuncState, Kind, UnOpr, NO_JUMP, R};
 use crate::heap::Heap;
 use crate::lex::{Lexer, Tok};
@@ -169,9 +168,10 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn str_checkname(&mut self) -> R<Bytes> {
+    /// `str_checkname`: the name just read, as the source spells it.
+    fn str_checkname(&mut self) -> R<&'a [u8]> {
         self.check(Tok::Name)?;
-        let name: Bytes = Rc::from(self.lx.name());
+        let name = self.lx.name();
         self.next()?;
         Ok(name)
     }
@@ -179,7 +179,7 @@ impl<'a> Parser<'a> {
     /// `checkname`: a name as a string constant.
     fn checkname(&mut self) -> R<Exp> {
         let name = self.str_checkname()?;
-        Ok(Exp::new(Kind::K(self.string_k(&name)?)))
+        Ok(Exp::new(Kind::K(self.string_k(name)?)))
     }
 
     /// `errorlimit`, raised with no token.
@@ -291,7 +291,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `singlevaraux`: a local, an upvalue or (`None`) a global, at function `level`.
-    fn singlevaraux(&mut self, level: usize, name: &Bytes, base: bool) -> R<Option<Kind>> {
+    fn singlevaraux(&mut self, level: usize, name: &[u8], base: bool) -> R<Option<Kind>> {
         if let Some(v) = self.searchvar(level, name) {
             if !base {
                 self.markupval(level, v);
@@ -325,18 +325,18 @@ impl<'a> Parser<'a> {
         };
         let fs = &mut self.fs[level];
         fs.upvals.push(key);
-        fs.upval_names.push(name.clone());
+        fs.upval_names.push(Rc::from(name));
         fs.upval_decls.push(decl);
         Ok(Some(Kind::Upval((fs.upvals.len() - 1) as u16)))
     }
 
     /// `singlevar`: the name just read. Answers its kind and the name.
-    fn singlevar(&mut self) -> R<(Exp, Bytes)> {
+    fn singlevar(&mut self) -> R<(Exp, &'a [u8])> {
         let name = self.str_checkname()?;
         let top = self.fs.len() - 1;
-        let k = match self.singlevaraux(top, &name, true)? {
+        let k = match self.singlevaraux(top, name, true)? {
             Some(k) => k,
-            None => Kind::Global(self.string_k(&name)?),
+            None => Kind::Global(self.string_k(name)?),
         };
         Ok((Exp::new(k), name))
     }
@@ -414,7 +414,7 @@ impl<'a> Parser<'a> {
                 match self.tok() {
                     Tok::Name => {
                         let n = self.str_checkname()?;
-                        self.new_localvar(&n, nparams)?;
+                        self.new_localvar(n, nparams)?;
                         nparams += 1;
                     }
                     Tok::Dots => {
@@ -632,7 +632,7 @@ impl<'a> Parser<'a> {
         let mut nvars = 4;
         while self.testnext(Tok::Char(b','))? {
             let n = self.str_checkname()?;
-            self.new_localvar(&n, nvars)?;
+            self.new_localvar(n, nvars)?;
             nvars += 1;
         }
         self.checknext(Tok::In)?;
@@ -648,8 +648,8 @@ impl<'a> Parser<'a> {
         self.next()?;
         let varname = self.str_checkname()?;
         match self.tok() {
-            Tok::Char(b'=') => self.fornum(&varname, line)?,
-            Tok::Char(b',') | Tok::In => self.forlist(&varname)?,
+            Tok::Char(b'=') => self.fornum(varname, line)?,
+            Tok::Char(b',') | Tok::In => self.forlist(varname)?,
             _ => return Err(self.lx.error("`=' or `in' expected")),
         }
         self.check_match(Tok::End, Tok::For, line)?;
@@ -688,12 +688,12 @@ impl<'a> Parser<'a> {
 
     fn localfunc(&mut self) -> R<()> {
         let name = self.str_checkname()?;
-        self.new_localvar(&name, 0)?;
+        self.new_localvar(name, 0)?;
         let v = Exp::new(Kind::Local(self.fsr().freereg));
         self.reserveregs(1)?;
         self.adjustlocalvars(1);
         let mut key = b"local ".to_vec();
-        key.extend_from_slice(&name);
+        key.extend_from_slice(name);
         let line = self.lx.line;
         let mut b = self.body(false, line, Some(key))?;
         self.storevar(&v, &mut b)?;
@@ -709,7 +709,7 @@ impl<'a> Parser<'a> {
         let mut nvars = 0;
         loop {
             let n = self.str_checkname()?;
-            self.new_localvar(&n, nvars)?;
+            self.new_localvar(n, nvars)?;
             nvars += 1;
             if !self.testnext(Tok::Char(b','))? {
                 break;
@@ -749,7 +749,7 @@ impl<'a> Parser<'a> {
             };
             let field = self.field(&mut v)?;
             name.push(sep);
-            name.extend_from_slice(&field);
+            name.extend_from_slice(field);
             if needself {
                 break;
             }
@@ -891,11 +891,11 @@ impl<'a> Parser<'a> {
     // ── expressions ──────────────────────────────────────────────────────────────────────────
 
     /// `field`: `.name` or `:name` on a value made a register. Answers the name.
-    fn field(&mut self, v: &mut Exp) -> R<Bytes> {
+    fn field(&mut self, v: &mut Exp) -> R<&'a [u8]> {
         self.exp2anyreg(v)?;
         self.next()?;
         let name = self.str_checkname()?;
-        let mut key = Exp::new(Kind::K(self.string_k(&name)?));
+        let mut key = Exp::new(Kind::K(self.string_k(name)?));
         self.indexed(v, &mut key)?;
         Ok(name)
     }
@@ -920,10 +920,10 @@ impl<'a> Parser<'a> {
             if let Some(p) = &cc.prefix {
                 let mut n = p.clone();
                 n.push(b'.');
-                n.extend_from_slice(&name);
+                n.extend_from_slice(name);
                 hint = Some(n);
             }
-            Exp::new(Kind::K(self.string_k(&name)?))
+            Exp::new(Kind::K(self.string_k(name)?))
         } else {
             self.yindex()?
         };
@@ -1118,7 +1118,7 @@ impl<'a> Parser<'a> {
                     let field = self.field(&mut v)?;
                     if let Some(n) = &mut name {
                         n.push(b'.');
-                        n.extend_from_slice(&field);
+                        n.extend_from_slice(field);
                     }
                     continue;
                 }
