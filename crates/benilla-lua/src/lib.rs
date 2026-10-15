@@ -326,7 +326,10 @@ mod tests {
             "t:1: unexpected symbol near `...'"
         );
         assert_eq!(err("for x do end"), "t:1: `=' or `in' expected near `do'");
-        assert_eq!(err("x = 1..2"), "t:1: malformed number near `1..2'");
+        assert_eq!(
+            err("x = 1..2"),
+            "t:1: ambiguous syntax (decimal point x string concatenation) near `1..'"
+        );
         assert_eq!(err("x = \"a\nb\""), "t:1: unfinished string near `\"a'");
         assert_eq!(err("x = [[a"), "t:1: unfinished long string near `<eof>'");
         assert_eq!(err("x = 1\x01"), "t:1: unexpected symbol near `char(1)'");
@@ -348,10 +351,13 @@ mod tests {
             err("x = [=x"),
             "t:1: invalid long string delimiter near `[='"
         );
-        assert_eq!(err("x = 3x"), "t:1: malformed number near `3x'");
+        // The numeral stops at the `x`, which then opens a statement.
+        assert_eq!(err("x = 3x"), "t:1: `=' expected near `<eof>'");
+        assert_eq!(err("x = 3e"), "t:1: malformed number near `3e'");
     }
 
-    /// 5.1's lexer with level-0 nesting: `\r` ends lines, `[=[` has levels, `0x10` is sixteen.
+    /// 5.1's lexer with level-0 nesting and the client's numerals: `\r` ends lines, `[=[` has
+    /// levels, and `0x10` is 0 then the name `x10`.
     #[test]
     fn the_lexer_is_the_script_hosts() {
         // The string constant a chunk returns.
@@ -371,7 +377,8 @@ mod tests {
         assert_eq!(one(b"return [[a [[b]] c]]"), b"a [[b]] c");
         assert_eq!(one(b"return [=[a]]b]=]"), b"a]]b");
         assert_eq!(err("x = 'a\rb'"), "t:1: unfinished string near `'a'");
-        assert!(check(b"x = 0x10", b"=t").is_ok());
+        assert_eq!(err("x = 0x10"), "t:1: `=' expected near `<eof>'");
+        assert!(check(b"a=1b=2", b"=t").is_ok());
         assert_eq!(err("x = 1\ry = +"), "t:2: unexpected symbol near `+'");
         assert_eq!(err("x = 1\r\ny = +"), "t:2: unexpected symbol near `+'");
     }

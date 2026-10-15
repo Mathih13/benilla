@@ -188,8 +188,25 @@ const CASES: &[(&str, &str)] = &[
     ("nan_print", "local n = 0/0 return S(tostring(n) == tostring(n), string.format('%d', 3.7), string.format('%x', 255), string.format('%5.2s|', 'abc'))"),
     ("tonumber_edges", r#"return S(tonumber("inf"), tonumber("-inf"), tonumber("nan") ~= nil, tonumber("1e"), tonumber("0x"), tonumber(" 0x1A "), tonumber("0x1p4"), tonumber("1e+"), tonumber(".5"), tonumber("5."), tonumber("- 1"), tonumber("1 2"), tonumber(""), tonumber("  "), tonumber("0x10", 10), tonumber("10", 36), tonumber("z", 36))"#),
     ("tonumber_base_edges", r#"return S(tonumber("-1", 16), tonumber("0x10", 16), tonumber(" ff ", 16), tonumber("ffffffffffffffffffff", 16), tonumber("1z", 36), tonumber("8", 8), tonumber("", 16), tonumber("-ff", 16), tonumber("+7", 8))"#),
-    ("numeral_lexing", "return S(1e10, .5, 5., 3e-2, 0x7fffffff, 1E2, 0xA0, 2^53 + 1)"),
-    ("coerce_edges", r#"return S("0x10" * 1, " 2 " * " 3 ", E(function() return "1e" + 1 end), E(function() return "inf" + 0 end), 10 .. "", 1e100 .. "", -0.0 .. "", 2^63 .. "")"#),
+    ("numeral_lexing", "return S(1e10, .5, 5., 3e-2, 1E2, 2^53 + 1, 1.5e+3, .5E-1, 2., 5.e2)"),
+    ("numeral_reader", r#"local o = {}
+        for _, src in ipairs({"return 0x10", "return 0xA0", "a = 0x10()", "a=1b=2 return a, b",
+            "return 1..2", "return 1.2.3", "return 3e", "return 3e+", "return .5.3", "return 1d2",
+            "return 1e", "return 1.e5", "return 1 .. 2", "return 1._", "return 1x", "return 0X1",
+            "return 1e5e5", "return 1.5.", "return ..5", "x = 3.. 'a'", "return 1E-x",
+            "return 'a' .\0 'b'", "return 'a' ..\0 'b'"}) do
+          local f, e = loadstring(src, "=t")
+          if f then
+            local ok, a, b = pcall(f)
+            table.insert(o, "ok " .. tostring(ok) .. " " .. tostring(a) .. " " .. tostring(b))
+          else
+            table.insert(o, e)
+          end
+        end
+        return table.concat(o, " | ")"#),
+    ("tonumber_d_exponent", r#"return S(tonumber("1d2"), tonumber("-2.5D-1"), tonumber(" 1d+1 "), tonumber("1" .. string.rep("0", 70) .. "d-70"), tonumber("1d"), tonumber("1D+"), tonumber("1f2"), tonumber("+3"), tonumber("-.5"), tonumber("1e400"), tonumber("0X1A"), tonumber("-0x2"), tonumber("infinity"), tonumber(".e1"), tonumber("5.d1"), tonumber("1d2 x"), tonumber("1d2\0x"))"#),
+    ("coerce_d_and_hex", r#"return S("1d2" + 0, "2" + 1, E(function() return "0x2" + 1 end), E(function() return "nan" * 1 end), " 5.D1 " * 2, E(string.rep, "x", "0x2"), string.rep("x", "2d0"))"#),
+    ("coerce_edges", r#"return S(E(function() return "0x10" * 1 end), " 2 " * " 3 ", E(function() return "1e" + 1 end), E(function() return "inf" + 0 end), 10 .. "", 1e100 .. "", -0.0 .. "", 2^63 .. "")"#),
     // ── Syntax errors and the lexer's edges, through `loadstring` ──
     ("syntax_errors", r#"local o = {}
         for _, src in ipairs({"x = 1 +", "local function", "x = #t", "x = a % b",
@@ -394,7 +411,7 @@ b]])"#),
     ("fix-libs ldexp", r#"local z = 0 local inf = 1 / z local f = function(x) return string.format("%.17g", x) end
         return S(f(math.ldexp(0.5, 1024)), f(math.ldexp(1, -1074)), f(math.ldexp(2^-1074, 1074)), f(math.ldexp(1, -1075)), f(math.ldexp(3, -1075)), f(math.ldexp(1, 1024)), f(math.ldexp(1, -2000)), f(math.ldexp(2^-1074, 2098)), f(math.ldexp(1.5, -1074)), f(math.ldexp(inf, -5000)), f(math.ldexp(5, 2^40)), f(ldexp(0.75, -1073)), f(math.ldexp(1, 2^31)))"#),
     ("fix-libs hex_float", r#"local f = function(x) return string.format("%.17g", x or -1) end
-        return S(f(tonumber("0x1p-1074")), f(tonumber("0x1000000000000p-1070")), f(tonumber("0x1p1023")), f(tonumber("0x1p1024")), f(tonumber("0x.1p-1070")), f(tonumber("0x1p-1075")), f(tonumber("0x3p-1075")), f(tonumber("0x1.8p-1074")), f(tonumber("0x1fffffffffffffp-1126")), f(tonumber("0x123456789abcdef0123p-1100")), f(tonumber("0x1p-1080")), f("0x1p-1074" + 0))"#),
+        return S(f(tonumber("0x1p-1074")), f(tonumber("0x1000000000000p-1070")), f(tonumber("0x1p1023")), f(tonumber("0x1p1024")), f(tonumber("0x.1p-1070")), f(tonumber("0x1p-1075")), f(tonumber("0x3p-1075")), f(tonumber("0x1.8p-1074")), f(tonumber("0x1fffffffffffffp-1126")), f(tonumber("0x123456789abcdef0123p-1100")), f(tonumber("0x1p-1080")), E(function() return f("0x1p-1074" + 0) end))"#),
     ("fix-libs str_nul", r#"return S(tonumber("1\0"), tonumber("12\0 "), tonumber("1\0x"), E(function() return "1\0" + 1 end), E(function() return "0x10\0" + 0 end), tonumber("\0"), tonumber(" 5\0abc"), tonumber("ff\0", 16), tonumber("0x1\0"), tonumber("\0 1"), tonumber("1e\0"), tonumber("1 \0 x"))"#),
     ("fix-libs sort_objlen", r#"local function f(...) table.sort(arg) return arg[1], arg[2], arg[3] end
         local t = {3, 1, 2, n = 5} local ok = pcall(table.sort, t)

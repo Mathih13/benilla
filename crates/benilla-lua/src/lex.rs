@@ -1,7 +1,7 @@
 //! The lexer: Lua 5.1's `llex.c` as benilla's script host has always run it, built with
 //! `LUA_COMPAT_LSTR` 2 (`third_party/lua-src/BENILLA.md`): `\n`, `\r` and their pairs end a line,
 //! long brackets have levels (`[=[ ]=]`) and a level-0 one nests `[[` as 5.0's did, and a numeral
-//! reads every letter after it, so `0x10` is sixteen. Source is bytes.
+//! is read as the client reads it, decimal only. Source is bytes.
 
 use crate::chunkid;
 
@@ -331,10 +331,13 @@ impl<'a> Lexer<'a> {
                 0x7E /* ~ */ => return Ok(self.two(Tok::Ne, b'~')),
                 0x22 | 0x27 => return self.string(c as u8),
                 0x2E /* . */ => {
+                    // `check_next(ls, ".")` is `strchr(".", c)`, which also finds the NUL that
+                    // ends its set: a NUL byte after a `.` reads as another `.`.
+                    let dot = |c: i32| c == b'.' as i32 || c == 0;
                     self.pos += 1;
-                    if self.ch() == b'.' as i32 {
+                    if dot(self.ch()) {
                         self.pos += 1;
-                        if self.ch() == b'.' as i32 {
+                        if dot(self.ch()) {
                             self.pos += 1;
                             return Ok(Self::tok(Tok::Dots));
                         }
@@ -546,18 +549,34 @@ impl<'a> Lexer<'a> {
         Ok(t)
     }
 
-    /// 5.1's `read_numeral`: digits and points, an exponent sign after an `e`, then any letters,
-    /// digits and underscores, all read by `luaO_str2d`. So `0x10` is sixteen, and `1..2` a
-    /// malformed number.
+    /// The client's numeral reader (`0x6ffd20`, 5.0's `read_numeral`): digits, one `.` (a second
+    /// right after it is its own error, `0x8721dc`), digits, then `e`/`E`, a sign and digits. A
+    /// letter after a number starts the next token, so `0x10` is 0 then the name `x10`.
     fn numeral(&mut self, comma: bool) -> Result<Token, SyntaxError> {
         self.buff.clear();
         if comma {
             self.buff.push(b'.');
         }
-        while is_digit(self.ch()) || self.ch() == b'.' as i32 {
-            self.buff.push(self.ch() as u8);
+        let digits = |l: &mut Self| {
+            while is_digit(l.ch()) {
+                l.buff.push(l.ch() as u8);
+                l.pos += 1;
+            }
+        };
+        digits(self);
+        if self.ch() == b'.' as i32 {
+            self.buff.push(b'.');
             self.pos += 1;
+            if self.ch() == b'.' as i32 {
+                self.buff.push(b'.');
+                self.pos += 1;
+                return Err(self.lex_error(
+                    "ambiguous syntax (decimal point x string concatenation)",
+                    false,
+                ));
+            }
         }
+        digits(self);
         if self.ch() == b'e' as i32 || self.ch() == b'E' as i32 {
             self.buff.push(self.ch() as u8);
             self.pos += 1;
@@ -565,10 +584,7 @@ impl<'a> Lexer<'a> {
                 self.buff.push(self.ch() as u8);
                 self.pos += 1;
             }
-        }
-        while is_alpha(self.ch()) || is_digit(self.ch()) || self.ch() == b'_' as i32 {
-            self.buff.push(self.ch() as u8);
-            self.pos += 1;
+            digits(self);
         }
         match crate::number::str2d(&self.buff) {
             Some(n) => {

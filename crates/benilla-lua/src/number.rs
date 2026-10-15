@@ -1,5 +1,5 @@
-//! Numbers to and from text as benilla's Lua 5.1 build read and wrote them over glibc: 5.1's
-//! `luaO_str2d` over `strtod`, `tonumber`'s `strtoul` with a 64-bit `unsigned long`, and
+//! Numbers to and from text as benilla's Lua 5.1 build read and wrote them over glibc: the
+//! client's `luaO_str2d` and `strtod`, `tonumber`'s `strtoul` with a 64-bit `unsigned long`, and
 //! `lua_number2str`'s `%.14g`.
 
 /// C's `isspace`.
@@ -7,185 +7,73 @@ fn is_space(b: u8) -> bool {
     matches!(b, 0x20 | 0x09..=0x0D)
 }
 
-/// 5.1's `luaO_str2d`: `strtod` must read something; a stop at an `x` is retried as hex through
-/// `strtoul`; only whitespace may follow, up to the C string's end at its first NUL.
+/// The 1.12.1 client's `luaO_str2d` (`0x6f5900`): its `strtod` (`0x741e39`) and a trailing-space
+/// skip, up to the C string's end at its first NUL. That `strtod` reads a decimal numeral only (no
+/// hexadecimal, `inf` or `nan`), and its exponent marker is `e`, `E`, `d` or `D` (`0x4112d1`).
 pub fn str2d(s: &[u8]) -> Option<f64> {
     let s = &s[..s.iter().position(|&b| b == 0).unwrap_or(s.len())];
-    let (mut v, mut end) = strtod(s)?;
-    if matches!(s.get(end), Some(b'x' | b'X')) {
-        let (n, e) = strtoul(s, 16);
-        v = n as f64;
-        end = e;
+    let end = decimal_end(s)?;
+    if !s[end..].iter().all(|&b| is_space(b)) {
+        return None;
     }
-    s[end..].iter().all(|&b| is_space(b)).then_some(v)
-}
-
-fn starts_ci(s: &[u8], word: &[u8]) -> bool {
-    s.len() >= word.len() && s[..word.len()].eq_ignore_ascii_case(word)
-}
-
-/// glibc's `strtod`: the value and the index after the last byte read, or `None` when nothing
-/// numeric was read (`endptr == s`). Reads `inf`, `infinity`, `nan[(...)]`, hex with an optional
-/// binary exponent, and decimal with an exponent that counts only with a digit.
-pub fn strtod(s: &[u8]) -> Option<(f64, usize)> {
     let mut i = 0;
-    while i < s.len() && is_space(s[i]) {
+    while is_space(s[i]) {
         i += 1;
     }
-    let neg = matches!(s.get(i), Some(b'-'));
+    let mut text = String::from_utf8_lossy(&s[i..end]).replace(['d', 'D'], "e");
+    // `1.` and `.5` parse in Rust once the dangling dot has a digit on each side.
+    if let Some(dot) = text.find('.') {
+        if !text[..dot].ends_with(|c: char| c.is_ascii_digit()) {
+            text.insert(dot, '0');
+        }
+        let dot = text.find('.').unwrap();
+        if !text[dot + 1..].starts_with(|c: char| c.is_ascii_digit()) {
+            text.insert(dot + 1, '0');
+        }
+    }
+    text.parse().ok()
+}
+
+/// The end of the client's `strtod` numeral at the head of `s` (`0x4111f0`): spaces, a sign,
+/// digits with at most one `.`, then an exponent marker, a sign and digits only when a digit
+/// follows. `None` when it has no digit.
+fn decimal_end(s: &[u8]) -> Option<usize> {
+    let digit = |i: usize| s.get(i).is_some_and(u8::is_ascii_digit);
+    let mut i = 0;
+    while s.get(i).is_some_and(|&b| is_space(b)) {
+        i += 1;
+    }
     if matches!(s.get(i), Some(b'+' | b'-')) {
         i += 1;
     }
-    let sign = |v: f64| if neg { -v } else { v };
-    let rest = &s[i..];
-    if starts_ci(rest, b"infinity") {
-        return Some((sign(f64::INFINITY), i + 8));
-    }
-    if starts_ci(rest, b"inf") {
-        return Some((sign(f64::INFINITY), i + 3));
-    }
-    if starts_ci(rest, b"nan") {
-        let mut j = i + 3;
-        if s.get(j) == Some(&b'(') {
-            let mut k = j + 1;
-            while k < s.len() && (s[k].is_ascii_alphanumeric() || s[k] == b'_') {
-                k += 1;
-            }
-            if s.get(k) == Some(&b')') {
-                j = k + 1;
-            }
-        }
-        return Some((sign(f64::NAN), j));
-    }
-    let hexd = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_hexdigit());
-    if rest.first() == Some(&b'0')
-        && matches!(rest.get(1), Some(b'x' | b'X'))
-        && (hexd(rest.get(2)) || (rest.get(2) == Some(&b'.') && hexd(rest.get(3))))
-    {
-        let (v, n) = hex_float(&rest[2..]);
-        return Some((sign(v), i + 2 + n));
-    }
-    let start = i;
-    let mut j = i;
     let mut digits = 0;
-    while j < s.len() && s[j].is_ascii_digit() {
-        j += 1;
+    while digit(i) {
+        i += 1;
         digits += 1;
     }
-    if j < s.len() && s[j] == b'.' {
-        j += 1;
-        while j < s.len() && s[j].is_ascii_digit() {
-            j += 1;
+    if s.get(i) == Some(&b'.') {
+        i += 1;
+        while digit(i) {
+            i += 1;
             digits += 1;
         }
     }
     if digits == 0 {
         return None;
     }
-    let mut end = j;
-    if matches!(s.get(j), Some(b'e' | b'E')) {
-        let mut k = j + 1;
-        if matches!(s.get(k), Some(b'+' | b'-')) {
-            k += 1;
-        }
-        let at = k;
-        while k < s.len() && s[k].is_ascii_digit() {
-            k += 1;
-        }
-        if k > at {
-            end = k;
-        }
-    }
-    let mut text = String::from_utf8_lossy(&s[start..end]).into_owned();
-    // `1.` and `.5` parse in Rust once the dangling dot has a digit on each side.
-    if text.starts_with('.') {
-        text.insert(0, '0');
-    }
-    text = text.replacen(".e", ".0e", 1).replacen(".E", ".0E", 1);
-    if text.ends_with('.') {
-        text.push('0');
-    }
-    let v: f64 = text.parse().ok()?;
-    Some((sign(v), end))
-}
-
-/// The digits after `0x`: `h[.h][p[+-]d]`, the value and the bytes read.
-fn hex_float(s: &[u8]) -> (f64, usize) {
-    let mut m: u128 = 0;
-    let mut exp: i64 = 0;
-    let mut sticky = false;
-    let mut i = 0;
-    let mut seen_point = false;
-    while i < s.len() {
-        let c = s[i];
-        if c == b'.' && !seen_point {
-            seen_point = true;
-        } else if let Some(d) = (c as char).to_digit(16) {
-            if m >> 120 == 0 {
-                m = m << 4 | d as u128;
-                if seen_point {
-                    exp -= 4;
-                }
-            } else {
-                // Past 120 bits a digit only rounds: kept as a sticky bit.
-                sticky |= d != 0;
-                if !seen_point {
-                    exp += 4;
-                }
-            }
-        } else {
-            break;
-        }
-        i += 1;
-    }
-    if matches!(s.get(i), Some(b'p' | b'P')) {
+    if matches!(s.get(i), Some(b'e' | b'E' | b'd' | b'D')) {
         let mut k = i + 1;
-        let neg = s.get(k) == Some(&b'-');
         if matches!(s.get(k), Some(b'+' | b'-')) {
             k += 1;
         }
-        let at = k;
-        let mut e: i64 = 0;
-        while k < s.len() && s[k].is_ascii_digit() {
-            e = (e * 10 + (s[k] - b'0') as i64).min(1 << 20);
-            k += 1;
-        }
-        if k > at {
-            exp += if neg { -e } else { e };
+        if digit(k) {
+            while digit(k) {
+                k += 1;
+            }
             i = k;
         }
     }
-    let m = m | sticky as u128;
-    (scale_exact(m, exp), i)
-}
-
-/// `m * 2^exp` rounded once, to nearest even, as glibc's `strtod` rounds a hex float. A result
-/// below the normal range keeps only the bits the subnormal grid holds, so it is not rounded
-/// twice.
-fn scale_exact(m: u128, exp: i64) -> f64 {
-    if m == 0 {
-        return 0.0;
-    }
-    let exp = exp.clamp(-1 << 24, 1 << 24);
-    let bits = 128 - m.leading_zeros() as i64;
-    // The top bit at 2^-1022 or above.
-    if exp + bits > -1022 {
-        // Normal or beyond: one rounding to 53 bits, then an exact power of two (or infinity).
-        return ldexp(m as f64, exp as i32);
-    }
-    // Subnormal: the units of 2^-1074 the value holds, rounded on the bits below.
-    let drop = -1074 - exp;
-    let q = if drop <= 0 {
-        m << -drop
-    } else if drop >= 128 {
-        0
-    } else {
-        let q = m >> drop;
-        let r = m - (q << drop);
-        let half = 1u128 << (drop - 1);
-        q + (r > half || (r == half && q & 1 == 1)) as u128
-    };
-    ldexp(q as f64, -1074)
+    Some(i)
 }
 
 /// C's `ldexp` (`scalbn`): `x * 2^n` with one rounding, in steps that neither overflow nor
@@ -380,37 +268,45 @@ mod tests {
     }
 
     #[test]
-    fn str2d_is_glibc_strtod() {
+    fn str2d_is_the_clients_strtod() {
         assert_eq!(str2d(b"10"), Some(10.0));
         assert_eq!(str2d(b"  1.5e3  "), Some(1500.0));
         assert_eq!(str2d(b".5"), Some(0.5));
+        assert_eq!(str2d(b"-.5"), Some(-0.5));
         assert_eq!(str2d(b"5."), Some(5.0));
-        assert_eq!(str2d(b"0x10"), Some(16.0));
-        assert_eq!(str2d(b" 0x1A "), Some(26.0));
-        assert_eq!(str2d(b"0x1p4"), Some(16.0));
-        assert_eq!(str2d(b"0x.8"), Some(0.5));
-        assert_eq!(str2d(b"inf"), Some(f64::INFINITY));
-        assert_eq!(str2d(b"-Infinity"), Some(f64::NEG_INFINITY));
-        assert!(str2d(b"nan").unwrap().is_nan());
-        assert_eq!(
-            str2d(b"1e"),
-            None,
-            "an exponent needs a digit, and then `e` trails"
-        );
-        assert_eq!(str2d(b"0x"), None);
-        assert_eq!(str2d(b"1d5"), None, "glibc reads no `d` exponent");
-        assert_eq!(str2d(b"- 1"), None);
-        assert_eq!(str2d(b""), None);
+        assert_eq!(str2d(b"+3"), Some(3.0));
+        assert_eq!(str2d(b"5.e2"), Some(500.0));
+        assert_eq!(str2d(b"1d2"), Some(100.0), "`d` is an exponent marker");
+        assert_eq!(str2d(b"-2.5D-1"), Some(-0.25));
+        assert_eq!(str2d(b" 1d+1 "), Some(10.0));
+        let long = format!("1{}d-70", "0".repeat(70));
+        assert_eq!(str2d(long.as_bytes()), Some(1.0));
+        for text in [
+            &b"0x10"[..],
+            b"0X1A",
+            b"0x1p4",
+            b"-0x2",
+            b" 0x10 ",
+            b"0x",
+            b"inf",
+            b"-Infinity",
+            b"nan",
+            b"1e",
+            b"1d",
+            b"1f2",
+            b"1e+",
+            b".",
+            b"- 1",
+            b"1 2",
+            b"",
+            b"  ",
+            b"\0 1",
+        ] {
+            assert_eq!(str2d(text), None, "{:?}", String::from_utf8_lossy(text));
+        }
         assert_eq!(str2d(b"1e400"), Some(f64::INFINITY));
         assert_eq!(str2d(b"1\0x"), Some(1.0), "a C string ends at its NUL");
         assert_eq!(str2d(b"12\0 "), Some(12.0));
-        assert_eq!(str2d(b"\0 1"), None);
-        assert_eq!(str2d(b"0x1p-1074"), Some(f64::from_bits(1)));
-        assert_eq!(str2d(b"0x1p-1075"), Some(0.0), "a tie rounds to even");
-        assert_eq!(str2d(b"0x3p-1075"), Some(f64::from_bits(2)));
-        assert_eq!(str2d(b"0x1000000000000p-1070"), Some(f64::MIN_POSITIVE));
-        assert_eq!(str2d(b"0x1p1023"), Some(f64::from_bits(0x7fe << 52)));
-        assert_eq!(str2d(b"0x1p1024"), Some(f64::INFINITY));
     }
 
     /// `ldexp` against the C library the build links.
