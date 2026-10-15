@@ -57,10 +57,33 @@ pub(crate) struct Inner {
     /// The VM every access goes through: the owned one, or the `&mut Vm` a running callback was
     /// handed.
     cur: Cell<*mut Vm>,
-    app: RefCell<HashMap<TypeId, Rc<dyn Any>>>,
+    app: RefCell<AppMap>,
     /// Shared by a state and its forks: a host closure the fork copied still holds handles made
     /// on the original, and while a callback of the family runs they resolve through its VM.
     family: u64,
+}
+
+/// The host data, by type: callbacks read it on every call.
+type AppMap = HashMap<TypeId, Rc<dyn Any>, std::hash::BuildHasherDefault<TypeIdHasher>>;
+
+/// A `TypeId` is already a hash of its type, so the map takes its bits as they are.
+#[derive(Default)]
+struct TypeIdHasher(u64);
+
+impl std::hash::Hasher for TypeIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+
+    fn write_u64(&mut self, x: u64) {
+        self.0 ^= x;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl Drop for Inner {
@@ -202,7 +225,7 @@ impl Lua {
         let lua = Lua(Rc::new(Inner {
             owned: ptr,
             cur: Cell::new(ptr),
-            app: RefCell::new(HashMap::new()),
+            app: RefCell::new(AppMap::default()),
             family,
         }));
         let host: std::rc::Weak<dyn Any> = Rc::downgrade(&lua.0) as std::rc::Weak<dyn Any>;
