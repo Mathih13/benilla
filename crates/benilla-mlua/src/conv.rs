@@ -46,6 +46,19 @@ pub trait FromLuaMulti: Sized {
     fn from_lua_args(values: MultiValue, lua: &Lua) -> Result<Self> {
         Self::from_lua_multi(values, lua)
     }
+
+    /// `from_lua_args` of a callback's arguments as the VM holds them, rooted on its stack for
+    /// the whole call: an element read in place (`FromLua::from_raw`) makes no handle.
+    #[doc(hidden)]
+    fn from_raw_args(args: &[benilla_lua::Value], lua: &Lua) -> Result<Self> {
+        Self::from_lua_args(args.iter().map(|&v| lua.wrap(v)).collect(), lua)
+    }
+
+    /// `from_lua_multi` of values rooted for the whole conversion, as `from_raw_args`.
+    #[doc(hidden)]
+    fn from_raw_multi(values: &[benilla_lua::Value], lua: &Lua) -> Result<Self> {
+        Self::from_lua_multi(values.iter().map(|&v| lua.wrap(v)).collect(), lua)
+    }
 }
 
 fn conversion(from: &'static str, to: &str, message: Option<&str>) -> Error {
@@ -491,6 +504,19 @@ impl<T: FromLua> FromLuaMulti for T {
     fn from_lua_args(mut values: MultiValue, lua: &Lua) -> Result<Self> {
         T::from_lua(values.pop_front().unwrap_or(Value::Nil), lua).map_err(|e| bad_arg(1, e))
     }
+
+    fn from_raw_args(args: &[benilla_lua::Value], lua: &Lua) -> Result<Self> {
+        T::from_raw(first_raw(args), lua).map_err(|e| bad_arg(1, e))
+    }
+
+    fn from_raw_multi(values: &[benilla_lua::Value], lua: &Lua) -> Result<Self> {
+        T::from_raw(first_raw(values), lua)
+    }
+}
+
+/// The first of `values`, or nil: `pop_front().unwrap_or(Value::Nil)` over VM values.
+fn first_raw(values: &[benilla_lua::Value]) -> benilla_lua::Value {
+    values.first().copied().unwrap_or(benilla_lua::Value::Nil)
 }
 
 impl IntoLuaMulti for MultiValue {
@@ -525,6 +551,14 @@ impl IntoLuaMulti for () {
 
 impl FromLuaMulti for () {
     fn from_lua_multi(_: MultiValue, _: &Lua) -> Result<Self> {
+        Ok(())
+    }
+
+    fn from_raw_args(_: &[benilla_lua::Value], _: &Lua) -> Result<Self> {
+        Ok(())
+    }
+
+    fn from_raw_multi(_: &[benilla_lua::Value], _: &Lua) -> Result<Self> {
         Ok(())
     }
 }
@@ -576,6 +610,14 @@ macro_rules! tuple {
                 $( let $name = $name::from_lua(values.pop_front().unwrap_or(Value::Nil), lua)
                     .map_err(|e| bad_arg($idx + 1, e))?; )*
                 let last = $last::from_lua_multi(values, lua).map_err(|e| bad_arg($lidx + 1, e))?;
+                Ok(($($name,)* last,))
+            }
+
+            fn from_raw_args(args: &[benilla_lua::Value], lua: &Lua) -> Result<Self> {
+                $( let $name = $name::from_raw(first_raw(args.get($idx..).unwrap_or(&[])), lua)
+                    .map_err(|e| bad_arg($idx + 1, e))?; )*
+                let rest = args.get($lidx..).unwrap_or(&[]);
+                let last = $last::from_raw_multi(rest, lua).map_err(|e| bad_arg($lidx + 1, e))?;
                 Ok(($($name,)* last,))
             }
         }

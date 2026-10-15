@@ -478,14 +478,9 @@ impl Lua {
                 // A panic becomes a Lua error here, as mlua's `callback_error` makes one, so it
                 // never unwinds through the interpreter.
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let args: MultiValue = lua
-                        .vm()
-                        .args(nargs)
-                        .to_vec()
-                        .into_iter()
-                        .map(|v| lua.wrap(v))
-                        .collect();
-                    let a = A::from_lua_args(args, &lua)?;
+                    // The arguments stay on the VM's stack, rooted, for the whole call.
+                    let args = lua.vm().args(nargs).to_vec();
+                    let a = A::from_raw_args(&args, &lua)?;
                     let rets = func(&lua, a)?.into_lua_multi(&lua)?;
                     // mlua's `check_stack` for the results, against 5.1's `LUAI_MAXCSTACK`.
                     if nargs + rets.len() >= MAXCSTACK {
