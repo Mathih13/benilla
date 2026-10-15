@@ -14,9 +14,9 @@ use crate::{
 pub trait IntoLua: Sized {
     fn into_lua(self, lua: &Lua) -> Result<Value>;
 
-    /// This value as the VM's, with no handle made: for a type whose conversion runs no Lua and
-    /// whose VM value lives as long as the caller needs it (a scalar, a fresh string the caller
-    /// uses before Lua runs, a borrowed handle). Any other type hands itself back for
+    /// This value as the VM's, with no handle made, for a type whose conversion runs no Lua: a
+    /// scalar, a string, a handle. The caller uses the value before any Lua runs, which is when
+    /// the collector could free what no handle holds. Any other type hands itself back for
     /// `into_lua`.
     #[doc(hidden)]
     fn into_raw(self, _: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
@@ -75,6 +75,10 @@ impl IntoLua for Value {
     fn into_lua(self, _: &Lua) -> Result<Value> {
         Ok(self)
     }
+
+    fn into_raw(self, lua: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+        Ok(Ok(lua.unwrap(&self)))
+    }
 }
 
 impl IntoLua for &Value {
@@ -99,6 +103,10 @@ macro_rules! handle {
             fn into_lua(self, _: &Lua) -> Result<Value> {
                 Ok(Value::$t(self))
             }
+
+            fn into_raw(self, lua: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+                Ok(Ok(lua.unref(&self.0)))
+            }
         }
 
         impl IntoLua for &$t {
@@ -119,6 +127,10 @@ handle!(Function);
 impl IntoLua for String {
     fn into_lua(self, _: &Lua) -> Result<Value> {
         Ok(Value::String(self))
+    }
+
+    fn into_raw(self, lua: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+        Ok(Ok(lua.unref(&self.0)))
     }
 }
 

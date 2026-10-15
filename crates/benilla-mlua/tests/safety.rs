@@ -234,3 +234,22 @@ fn a_key_made_for_a_set_survives_the_value_conversion() {
     assert_eq!(t.get::<f64>("a key no one else holds").unwrap(), 7.0);
     assert_eq!(t.raw_get::<f64>("another such key").unwrap(), 8.0);
 }
+
+#[test]
+fn a_value_handed_over_by_value_survives_a_collecting_newindex() {
+    let lua = Lua::new();
+    // The collection frees what nothing roots; the new tables take the freed slots.
+    let t: Table = lua
+        .load(
+            "return setmetatable({}, {__newindex = function(t, k, v) \
+             collectgarbage() for i = 1, 64 do local _ = {} end rawset(t, k, v) end})",
+        )
+        .eval()
+        .unwrap();
+    let fresh = lua.create_table().unwrap();
+    fresh.set("inner", 5).unwrap();
+    t.set(lua.create_string("a fresh key").unwrap(), fresh)
+        .unwrap();
+    let back: Table = t.raw_get("a fresh key").unwrap();
+    assert_eq!(back.get::<i64>("inner").unwrap(), 5);
+}

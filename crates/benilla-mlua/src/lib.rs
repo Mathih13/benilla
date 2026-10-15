@@ -433,8 +433,8 @@ impl Lua {
     }
 
     /// A key and a value as VM values, converted in that order as `raw_value` converts them. A
-    /// key made without a handle is a collector root while the value's conversion, which may
-    /// run Lua, is made through one.
+    /// key read without a handle is a collector root while the value's conversion, which may
+    /// run Lua, is made through `into_lua`.
     #[allow(clippy::type_complexity)]
     pub(crate) fn raw_pair<K: IntoLua, V2: IntoLua>(
         &self,
