@@ -171,7 +171,7 @@ impl<'a> Parser<'a> {
 
     fn str_checkname(&mut self) -> R<Bytes> {
         self.check(Tok::Name)?;
-        let name: Bytes = Rc::from(&self.lx.cur.bytes[..]);
+        let name: Bytes = Rc::from(self.lx.name());
         self.next()?;
         Ok(name)
     }
@@ -1060,7 +1060,8 @@ impl<'a> Parser<'a> {
             }
             Tok::Char(b'{') => self.constructor(None)?,
             Tok::String => {
-                let k = self.string_k(&self.lx.cur.bytes.clone())?;
+                let bytes = std::mem::take(&mut self.lx.cur.bytes);
+                let k = self.string_k(&bytes)?;
                 self.next()?;
                 Exp::new(Kind::K(k))
             }
@@ -1149,7 +1150,8 @@ impl<'a> Parser<'a> {
         let v = match self.tok() {
             Tok::Number => Exp::new(Kind::KNum(self.lx.cur.num)),
             Tok::String => {
-                let k = self.string_k(&self.lx.cur.bytes.clone())?;
+                let bytes = std::mem::take(&mut self.lx.cur.bytes);
+                let k = self.string_k(&bytes)?;
                 Exp::new(Kind::K(k))
             }
             Tok::Nil => Exp::new(Kind::Nil),

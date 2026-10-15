@@ -121,9 +121,11 @@ impl Tok {
 #[derive(Clone, Debug)]
 pub struct Token {
     pub tok: Tok,
-    /// A name's or string's bytes; empty otherwise.
+    /// A string's bytes; empty otherwise.
     pub bytes: Vec<u8>,
     pub num: f64,
+    /// A name's place in the source, which [`Lexer::name`] reads.
+    name: (usize, usize),
 }
 
 /// A compile error, rendered as 5.1's `luaX_lexerror` does: `chunkid:line: msg near `tok'`.
@@ -183,6 +185,7 @@ impl<'a> Lexer<'a> {
                 tok: Tok::Eof,
                 bytes: Vec::new(),
                 num: 0.0,
+                name: (0, 0),
             },
             ahead: None,
             buff: Vec::new(),
@@ -231,7 +234,7 @@ impl<'a> Lexer<'a> {
     pub fn error(&self, msg: &str) -> SyntaxError {
         let near = match self.cur.tok {
             Tok::Char(0) => return self.error_at(msg.as_bytes(), None),
-            Tok::Name => self.cur.bytes.clone(),
+            Tok::Name => self.name().to_vec(),
             Tok::String | Tok::Number => self.buff.clone(),
             t => t.text(),
         };
@@ -274,7 +277,14 @@ impl<'a> Lexer<'a> {
             tok,
             bytes: Vec::new(),
             num: 0.0,
+            name: (0, 0),
         }
+    }
+
+    /// The current token's bytes when it is a name, read in the source.
+    pub fn name(&self) -> &'a [u8] {
+        let (start, end) = self.cur.name;
+        &self.src[start..end]
     }
 
     fn lex(&mut self) -> Result<Token, SyntaxError> {
@@ -342,16 +352,18 @@ impl<'a> Lexer<'a> {
                         return self.numeral(false);
                     } else if is_alpha(c) || c == b'_' as i32 {
                         let start = self.pos;
-                        while is_alpha(self.ch()) || is_digit(self.ch()) || self.ch() == b'_' as i32
-                        {
-                            self.pos += 1;
-                        }
-                        let word = &self.src[start..self.pos];
+                        let rest = &self.src[start..];
+                        let len = rest
+                            .iter()
+                            .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+                            .unwrap_or(rest.len());
+                        self.pos = start + len;
+                        let word = &rest[..len];
                         if let Some(r) = reserved(word) {
                             return Ok(Self::tok(r));
                         }
                         let mut t = Self::tok(Tok::Name);
-                        t.bytes = word.to_vec();
+                        t.name = (start, self.pos);
                         return Ok(t);
                     } else {
                         // Any other byte, a control one too, is a one-byte token for the parser
