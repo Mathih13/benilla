@@ -2,6 +2,8 @@
 //! client's `luaO_str2d` and `strtod`, `tonumber`'s `strtoul` with a 64-bit `unsigned long`, and
 //! `lua_number2str`'s `%.14g`.
 
+use std::fmt::Write;
+
 /// C's `isspace`.
 fn is_space(b: u8) -> bool {
     matches!(b, 0x20 | 0x09..=0x0D)
@@ -16,22 +18,48 @@ pub fn str2d(s: &[u8]) -> Option<f64> {
     if !s[end..].iter().all(|&b| is_space(b)) {
         return None;
     }
-    let mut i = 0;
-    while is_space(s[i]) {
-        i += 1;
+    let mut num = &s[..end];
+    while is_space(num[0]) {
+        num = &num[1..];
     }
-    let mut text = String::from_utf8_lossy(&s[i..end]).replace(['d', 'D'], "e");
-    // `1.` and `.5` parse in Rust once the dangling dot has a digit on each side.
-    if let Some(dot) = text.find('.') {
-        if !text[..dot].ends_with(|c: char| c.is_ascii_digit()) {
-            text.insert(dot, '0');
+    let neg = num[0] == b'-';
+    if matches!(num[0], b'+' | b'-') {
+        num = &num[1..];
+    }
+    let mark = num
+        .iter()
+        .position(|b| matches!(b, b'e' | b'E' | b'd' | b'D'))
+        .unwrap_or(num.len());
+    let (mant, exp) = num.split_at(mark);
+    // The exponent, saturated far past any double's range.
+    let mut e: i64 = 0;
+    if let Some(&sign) = exp.get(1) {
+        for &c in exp[1..].iter().filter(|c| c.is_ascii_digit()) {
+            e = (e * 10 + (c - b'0') as i64).min(1 << 40);
         }
-        let dot = text.find('.').unwrap();
-        if !text[dot + 1..].starts_with(|c: char| c.is_ascii_digit()) {
-            text.insert(dot + 1, '0');
+        if sign == b'-' {
+            e = -e;
         }
     }
-    text.parse().ok()
+    let int_len = mant.iter().position(|&b| b == b'.').unwrap_or(mant.len());
+    let mut digits = mant.iter().copied().filter(u8::is_ascii_digit).peekable();
+    let mut lead = 0;
+    while digits.next_if_eq(&b'0').is_some() {
+        lead += 1;
+    }
+    let v = if digits.peek().is_none() {
+        0.0
+    } else {
+        // `0.<digits> * 10^scale`, the digits whole and the exponent small: Rust's parser drops
+        // exponent digits past 65536 where glibc's `strtod` offsets them against the digits.
+        let scale = (int_len as i64 - lead + e).clamp(-1000, 1000);
+        let mut text = String::with_capacity(mant.len() + 8);
+        text.push_str("0.");
+        text.extend(digits.map(char::from));
+        let _ = write!(text, "e{scale}");
+        text.parse().ok()?
+    };
+    Some(if neg { -v } else { v })
 }
 
 /// The end of the client's `strtod` numeral at the head of `s` (`0x4111f0`): spaces, a sign,
@@ -305,6 +333,14 @@ mod tests {
             assert_eq!(str2d(text), None, "{:?}", String::from_utf8_lossy(text));
         }
         assert_eq!(str2d(b"1e400"), Some(f64::INFINITY));
+        assert_eq!(str2d(b"-0"), Some(-0.0));
+        assert!(str2d(b"-0").unwrap().is_sign_negative());
+        assert_eq!(str2d(b"0.000e99999999999"), Some(0.0));
+        // A seven-digit exponent offset by as many digits, which glibc reads exactly.
+        let z = "0".repeat(699_999);
+        assert_eq!(str2d(format!("0.{z}1e700000").as_bytes()), Some(1.0));
+        assert_eq!(str2d(format!("1{z}0e-700000").as_bytes()), Some(1.0));
+        assert_eq!(str2d(b"1e-99999999999999999999"), Some(0.0));
         assert_eq!(str2d(b"1\0x"), Some(1.0), "a C string ends at its NUL");
         assert_eq!(str2d(b"12\0 "), Some(12.0));
     }
