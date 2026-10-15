@@ -1,6 +1,6 @@
 # The grammar benilla-lua parses
 
-benilla's script host runs Lua 5.1.5 with eight changes, so that it accepts exactly the grammar
+benilla's script host runs Lua 5.1.5 with ten changes, so that it accepts exactly the grammar
 the 1.12.1 client's Lua accepts, no more and no less. Until benilla-lua replaced it, that language
 was a patched copy of the C Lua (`third_party/lua-src`, in the git history); benilla-lua implements
 the same language directly. A grammar difference in either direction is invisible to every
@@ -16,7 +16,7 @@ for k, v in someTable do ... end        -- no pairs(), no iterator function
 dependency), across 1,163 sites. On stock Lua 5.1 it raises `attempt to call a table value`, the
 first session-start error for 60 of the 218.
 
-## The eight changes
+## The ten changes
 
 Five restore what 5.1 changed or removed:
 
@@ -46,6 +46,17 @@ addon corpus they reject 18 chunks, all from code written for a later client: 17
 AckisRecipeList and its Ace3 libraries, and one in a later Tablet-2.0 bundled with FuBar_AtlasFu.
 The C build rejected the same chunks, and `tests/front_end.rs` names each with its message. No chunk of
 benilla's own Lua may use a construct the client's parser rejects.
+
+Two narrow what 5.1 reads as a number, in `lobject.c` and `llex.c` (`number.rs` and `lex.rs`
+here):
+
+| change | why |
+|---|---|
+| `luaO_str2d` reads a decimal numeral only: 5.1's hexadecimal branch deleted, `inf` and `nan` refused, and `d`/`D` taken as the exponent marker | the client's `luaO_str2d` (`0x6f5900`) is its `strtod` (`0x741e39`, decimal only, its exponent marker `e`, `E`, `d` or `D` at `0x4112d1`) and a trailing-space skip, so `tonumber("1d2")` is 100 there, `tonumber("0x10")` is nil and `"0x2" + 1` raises; every coercion goes through it (arithmetic, `tonumber`, a binding's numeric argument) |
+| `read_numeral` is 5.0's, the client's numeral reader (`0x6ffd20`): digits, one `.` (a second right after it is `ambiguous syntax (decimal point x string concatenation)`, `0x8721dc`), digits, then `e`/`E`, an optional sign and digits | 5.1's took every further `.`, letter and `_` into the numeral, so `a=1b=2` was a malformed number where the client compiles `a=1 b=2`, and `1.2.3` was one where the client reads `1.2` then `.3`; a source `0x10` is the number 0 then the name `x10` |
+
+Neither changes what compiles in the stock interface or the addon corpus: `tests/front_end.rs`
+rejects the same chunks with and without them.
 
 ## The generic-for, in detail
 
