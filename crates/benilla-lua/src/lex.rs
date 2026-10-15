@@ -351,14 +351,14 @@ impl<'a> Lexer<'a> {
                     } else if is_digit(c) {
                         return self.numeral(false);
                     } else if is_alpha(c) || c == b'_' as i32 {
-                        let start = self.pos;
-                        let rest = &self.src[start..];
-                        let len = rest
-                            .iter()
-                            .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
-                            .unwrap_or(rest.len());
-                        self.pos = start + len;
-                        let word = &rest[..len];
+                        let (src, start) = (self.src, self.pos);
+                        let mut end = start + 1;
+                        while end < src.len() && (src[end].is_ascii_alphanumeric() || src[end] == b'_')
+                        {
+                            end += 1;
+                        }
+                        self.pos = end;
+                        let word = &src[start..end];
                         if let Some(r) = reserved(word) {
                             return Ok(Self::tok(r));
                         }
