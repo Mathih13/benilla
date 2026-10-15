@@ -408,6 +408,55 @@ impl Lua {
         Ok(t)
     }
 
+    /// `s` interned, with no handle: [`IntoLua::into_raw`] of a string.
+    pub(crate) fn raw_string(&self, s: &[u8]) -> Result<benilla_lua::Value> {
+        let v = self.vm().str(s);
+        if self.vm().heap.take_oom() {
+            return Err(Error::MemoryError("not enough memory".into()));
+        }
+        Ok(v)
+    }
+
+    /// `x` as a VM value, without a handle when its type allows (`IntoLua::into_raw`), else
+    /// through one, which the second field holds for as long as the caller keeps it.
+    pub(crate) fn raw_value<T: IntoLua>(
+        &self,
+        x: T,
+    ) -> Result<(benilla_lua::Value, Option<Value>)> {
+        match x.into_raw(self) {
+            Ok(r) => Ok((r?, None)),
+            Err(x) => {
+                let v = x.into_lua(self)?;
+                Ok((self.unwrap(&v), Some(v)))
+            }
+        }
+    }
+
+    /// A key and a value as VM values, converted in that order as `raw_value` converts them. A
+    /// key made without a handle is a collector root while the value's conversion, which may
+    /// run Lua, is made through one.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn raw_pair<K: IntoLua, V2: IntoLua>(
+        &self,
+        key: K,
+        value: V2,
+    ) -> Result<((benilla_lua::Value, benilla_lua::Value), [Option<Value>; 2])> {
+        let (kx, k) = self.raw_value(key)?;
+        let (vx, v) = match value.into_raw(self) {
+            Ok(r) => (r?, None),
+            Err(value) => {
+                let hold = k.is_none().then(|| self.vm().root(kx));
+                let v = value.into_lua(self);
+                if let Some(h) = hold {
+                    self.vm().unroot(h);
+                }
+                let v = v?;
+                (self.unwrap(&v), Some(v))
+            }
+        };
+        Ok(((kx, vx), [k, v]))
+    }
+
     pub fn create_string(&self, s: impl AsRef<[u8]>) -> Result<String> {
         let v = self.vm().str(s.as_ref());
         if self.vm().heap.take_oom() {
@@ -991,9 +1040,7 @@ impl Table {
     /// `t[key] = value`, with metamethods.
     pub fn set(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()> {
         let lua = &self.lua();
-        let k = key.into_lua(lua)?;
-        let v = value.into_lua(lua)?;
-        let (kx, vx) = (lua.unwrap(&k), lua.unwrap(&v));
+        let ((kx, vx), _held) = lua.raw_pair(key, value)?;
         let t = self.0.get();
         lua.vm()
             .protected(|vm| vm.setindex(t, kx, vx, None))
@@ -1003,14 +1050,14 @@ impl Table {
     /// `t[key]`, with metamethods.
     pub fn get<V2: FromLua>(&self, key: impl IntoLua) -> Result<V2> {
         let lua = &self.lua();
-        let k = key.into_lua(lua)?;
-        let kx = lua.unwrap(&k);
+        let (kx, _held) = lua.raw_value(key)?;
         let t = self.0.get();
+        // The key goes to an `__index` function as an argument, which roots it.
         let v = lua
             .vm()
             .protected(|vm| vm.index(t, kx, None))
             .map_err(|e| lua.error_from(e))?;
-        V2::from_lua(lua.wrap(v), lua)
+        V2::from_raw(v, lua)
     }
 
     pub fn contains_key(&self, key: impl IntoLua) -> Result<bool> {
@@ -1019,9 +1066,7 @@ impl Table {
 
     pub fn raw_set(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()> {
         let lua = &self.lua();
-        let k = key.into_lua(lua)?;
-        let v = value.into_lua(lua)?;
-        let (kx, vx) = (lua.unwrap(&k), lua.unwrap(&v));
+        let ((kx, vx), _held) = lua.raw_pair(key, value)?;
         let t = self.tref();
         lua.vm().heap.table_mut(t).set(kx, vx).map_err(|e| match e {
             benilla_lua::table::KeyError::Nil => Error::runtime("table index is nil"),
@@ -1031,10 +1076,9 @@ impl Table {
 
     pub fn raw_get<V2: FromLua>(&self, key: impl IntoLua) -> Result<V2> {
         let lua = &self.lua();
-        let k = key.into_lua(lua)?;
-        let kx = lua.unwrap(&k);
+        let (kx, _held) = lua.raw_value(key)?;
         let v = lua.vm().heap.table(self.tref()).get(kx);
-        V2::from_lua(lua.wrap(v), lua)
+        V2::from_raw(v, lua)
     }
 
     pub fn raw_remove(&self, key: impl IntoLua) -> Result<()> {

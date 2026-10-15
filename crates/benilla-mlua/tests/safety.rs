@@ -199,3 +199,38 @@ fn a_destructor_run_by_the_collector_can_use_the_state() {
         "the destructor ran inside the interpreter's collection"
     );
 }
+
+/// A value whose conversion collects garbage, as a conversion that runs Lua may.
+struct Collects(f64);
+
+impl benilla_mlua::IntoLua for Collects {
+    fn into_lua(self, lua: &Lua) -> benilla_mlua::Result<Value> {
+        lua.gc_collect()?;
+        // Strings made after the collection take the ids it freed.
+        for i in 0..64 {
+            lua.create_string(format!("filler {i}"))?;
+        }
+        Ok(Value::Number(self.0))
+    }
+}
+
+#[test]
+fn a_key_made_for_a_set_survives_the_value_conversion() {
+    let lua = Lua::new();
+    let t = lua.create_table().unwrap();
+    t.set("a key no one else holds", Collects(7.0)).unwrap();
+    t.raw_set(String::from("another such key"), Collects(8.0))
+        .unwrap();
+    let keys: Vec<String> = t
+        .clone()
+        .pairs::<String, f64>()
+        .map(|kv| kv.unwrap().0)
+        .collect();
+    assert!(
+        keys.contains(&"a key no one else holds".to_string()),
+        "{keys:?}"
+    );
+    assert!(keys.contains(&"another such key".to_string()), "{keys:?}");
+    assert_eq!(t.get::<f64>("a key no one else holds").unwrap(), 7.0);
+    assert_eq!(t.raw_get::<f64>("another such key").unwrap(), 8.0);
+}

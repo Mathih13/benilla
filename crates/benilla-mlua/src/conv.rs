@@ -13,10 +13,26 @@ use crate::{
 
 pub trait IntoLua: Sized {
     fn into_lua(self, lua: &Lua) -> Result<Value>;
+
+    /// This value as the VM's, with no handle made: for a type whose conversion runs no Lua and
+    /// whose VM value lives as long as the caller needs it (a scalar, a fresh string the caller
+    /// uses before Lua runs, a borrowed handle). Any other type hands itself back for
+    /// `into_lua`.
+    #[doc(hidden)]
+    fn into_raw(self, _: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+        Err(self)
+    }
 }
 
 pub trait FromLua: Sized {
     fn from_lua(value: Value, lua: &Lua) -> Result<Self>;
+
+    /// `from_lua` of the VM value `v`, which the caller keeps alive: a type that reads it in
+    /// place answers without making a handle, and anything else goes through `from_lua`.
+    #[doc(hidden)]
+    fn from_raw(v: benilla_lua::Value, lua: &Lua) -> Result<Self> {
+        Self::from_lua(lua.wrap(v), lua)
+    }
 }
 
 pub trait IntoLuaMulti: Sized {
@@ -52,6 +68,10 @@ impl IntoLua for &Value {
     fn into_lua(self, _: &Lua) -> Result<Value> {
         Ok(self.clone())
     }
+
+    fn into_raw(self, lua: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+        Ok(Ok(lua.unwrap(self)))
+    }
 }
 
 impl FromLua for Value {
@@ -72,6 +92,10 @@ macro_rules! handle {
             fn into_lua(self, _: &Lua) -> Result<Value> {
                 Ok(Value::$t(self.clone()))
             }
+
+            fn into_raw(self, lua: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+                Ok(Ok(lua.unref(&self.0)))
+            }
         }
     };
 }
@@ -88,6 +112,10 @@ impl IntoLua for String {
 impl IntoLua for &String {
     fn into_lua(self, _: &Lua) -> Result<Value> {
         Ok(Value::String(self.clone()))
+    }
+
+    fn into_raw(self, lua: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+        Ok(Ok(lua.unref(&self.0)))
     }
 }
 
@@ -144,6 +172,10 @@ impl IntoLua for bool {
     fn into_lua(self, _: &Lua) -> Result<Value> {
         Ok(Value::Boolean(self))
     }
+
+    fn into_raw(self, _: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+        Ok(Ok(benilla_lua::Value::Bool(self)))
+    }
 }
 
 impl FromLua for bool {
@@ -153,6 +185,10 @@ impl FromLua for bool {
             Value::Boolean(b) => b,
             _ => true,
         })
+    }
+
+    fn from_raw(v: benilla_lua::Value, _: &Lua) -> Result<Self> {
+        Ok(v.truthy())
     }
 }
 
@@ -177,6 +213,11 @@ macro_rules! int {
                     Err(_) => Value::Number(self as f64),
                 })
             }
+
+            // `Integer(i)` is the VM's `i as f64`, which is `self as f64`.
+            fn into_raw(self, _: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+                Ok(Ok(benilla_lua::Value::Num(self as f64)))
+            }
         }
 
         impl FromLua for $t {
@@ -198,6 +239,15 @@ macro_rules! int {
                 };
                 out.ok_or_else(|| conversion(ty, stringify!($t), Some("out of range")))
             }
+
+            // A number in range converts as `from_lua` converts it, `Integer` or `Number`;
+            // anything else, an error included, goes through `from_lua`.
+            fn from_raw(v: benilla_lua::Value, lua: &Lua) -> Result<Self> {
+                if let Some(x) = v.as_num().and_then(float_to_int::<$t>) {
+                    return Ok(x);
+                }
+                Self::from_lua(lua.wrap(v), lua)
+            }
         }
     )*};
 }
@@ -210,6 +260,10 @@ macro_rules! float {
             fn into_lua(self, _: &Lua) -> Result<Value> {
                 Ok(Value::Number(self as f64))
             }
+
+            fn into_raw(self, _: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+                Ok(Ok(benilla_lua::Value::Num(self as f64)))
+            }
         }
 
         impl FromLua for $t {
@@ -218,6 +272,13 @@ macro_rules! float {
                 lua.coerce_number(v)?.map(|n| n as $t).ok_or_else(|| {
                     conversion(ty, stringify!($t), Some("expected number or string coercible to number"))
                 })
+            }
+
+            fn from_raw(v: benilla_lua::Value, lua: &Lua) -> Result<Self> {
+                match v.as_num() {
+                    Some(n) => Ok(n as $t),
+                    None => Self::from_lua(lua.wrap(v), lua),
+                }
             }
         }
     )*};
@@ -231,17 +292,29 @@ impl IntoLua for std::string::String {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
         Ok(Value::String(lua.create_string(self)?))
     }
+
+    fn into_raw(self, lua: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+        Ok(lua.raw_string(self.as_bytes()))
+    }
 }
 
 impl IntoLua for &std::string::String {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
         Ok(Value::String(lua.create_string(self)?))
     }
+
+    fn into_raw(self, lua: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+        Ok(lua.raw_string(self.as_bytes()))
+    }
 }
 
 impl IntoLua for &str {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
         Ok(Value::String(lua.create_string(self)?))
+    }
+
+    fn into_raw(self, lua: &Lua) -> std::result::Result<Result<benilla_lua::Value>, Self> {
+        Ok(lua.raw_string(self.as_bytes()))
     }
 }
 
@@ -290,6 +363,16 @@ impl FromLua for std::string::String {
             .ok_or_else(|| conversion(ty, "String", Some("expected string or number")))?;
         Ok((*s.to_str()?).to_owned())
     }
+
+    // A UTF-8 string read in place; a number to coerce, or an error, through `from_lua`.
+    fn from_raw(v: benilla_lua::Value, lua: &Lua) -> Result<Self> {
+        if let Some(s) = v.as_str() {
+            if let Ok(s) = std::str::from_utf8(lua.vm().heap.str(s)) {
+                return Ok(s.to_owned());
+            }
+        }
+        Self::from_lua(lua.wrap(v), lua)
+    }
 }
 
 impl FromLua for Box<str> {
@@ -321,6 +404,13 @@ impl<T: FromLua> FromLua for Option<T> {
             Value::Nil => Ok(None),
             v => T::from_lua(v, lua).map(Some),
         }
+    }
+
+    fn from_raw(v: benilla_lua::Value, lua: &Lua) -> Result<Self> {
+        if v.is_nil() {
+            return Ok(None);
+        }
+        T::from_raw(v, lua).map(Some)
     }
 }
 
