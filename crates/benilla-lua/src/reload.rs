@@ -139,3 +139,72 @@ impl Vm {
         Ok(report)
     }
 }
+
+impl Vm {
+    /// New code for chunks run as functions, as an XML handler's body is: every live closure of
+    /// a main function running the code `old` compiles to, whose prototype `select` accepts,
+    /// runs `new` from its next call, compiled under that closure's own chunk name. A main
+    /// function captures nothing, so nothing carries over or can mismatch. Answers the closures
+    /// swapped; a syntax error in either source changes nothing.
+    pub fn hot_reload_mains(
+        &mut self,
+        old: &[u8],
+        new: &[u8],
+        select: impl Fn(&Proto) -> bool,
+    ) -> Result<usize, SyntaxError> {
+        const PROBE: &[u8] = b"=[hot reload]";
+        let want = crate::compile::compile(old, PROBE, &mut self.heap, 0)?;
+        crate::compile::compile(new, PROBE, &mut self.heap, 0)?;
+        let digest = want.code_digest();
+        let mut names: Vec<Bytes> = Vec::new();
+        for f in self.heap.funcs_mut() {
+            if let FuncObj::Lua(LuaFunc { proto, .. }) = f {
+                if proto.key.is_empty()
+                    && proto.code.len() == want.code.len()
+                    && select(proto)
+                    && proto.code_digest() == digest
+                    && !names.contains(&proto.source)
+                {
+                    names.push(proto.source.clone());
+                }
+            }
+        }
+        let mut fresh: HashMap<Bytes, Rc<Proto>> = HashMap::new();
+        for name in names {
+            let p = crate::compile::compile(new, &name, &mut self.heap, 0)?;
+            fresh.insert(name, p);
+        }
+        if self.frames_empty() {
+            self.retired.clear();
+        }
+        let mut retired = Vec::new();
+        for f in self.heap.funcs_mut() {
+            let FuncObj::Lua(LuaFunc {
+                proto,
+                upvals,
+                shape,
+                ..
+            }) = f
+            else {
+                continue;
+            };
+            let Some(new) = fresh.get(&proto.source) else {
+                continue;
+            };
+            if !proto.key.is_empty() || proto.code_digest() != digest {
+                continue;
+            }
+            debug_assert!(
+                upvals.is_empty() && new.upvals.is_empty(),
+                "a main function"
+            );
+            *shape = crate::heap::Shape::of(new);
+            let old_proto = std::mem::replace(proto, new.clone());
+            let old_ups = std::mem::replace(upvals, crate::heap::Upvals::new(Vec::new()));
+            retired.push((old_proto, old_ups));
+        }
+        let n = retired.len();
+        self.retired.extend(retired);
+        Ok(n)
+    }
+}
