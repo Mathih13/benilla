@@ -3,24 +3,26 @@
 //! cloned, inspected and restored.
 
 pub mod api;
-pub mod ast;
-pub mod cfmt;
-pub mod compile;
+mod cfmt;
+mod compile;
 pub mod heap;
-pub mod lex;
-pub mod lib_base;
-pub mod lib_math;
-pub mod lib_string;
-pub mod lib_table;
-pub mod number;
-pub mod parse;
+mod lex;
+mod lib_base;
+mod lib_math;
+mod lib_string;
+mod lib_table;
+mod number;
+mod parse;
 pub mod proto;
 pub mod reload;
 pub mod table;
 pub mod value;
 pub mod vm;
 
+pub use compile::compile;
 pub use lex::SyntaxError;
+pub use lib_base::tostring_value;
+pub use number::fmt_g14;
 pub use value::Value;
 pub use vm::{LuaError, Vm};
 

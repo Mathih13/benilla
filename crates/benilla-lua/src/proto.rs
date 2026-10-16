@@ -1,7 +1,9 @@
 //! Compiled functions: 5.1.5's register machine, with each test fused with the jump after it
 //! and the common operand shapes given ops of their own.
 
-use crate::ast::Bytes;
+/// Byte strings the compiler, the heap and hot reload share: names, sources, function keys.
+pub type Bytes = std::rc::Rc<[u8]>;
+
 use crate::value::Value;
 
 pub type Reg = u8;

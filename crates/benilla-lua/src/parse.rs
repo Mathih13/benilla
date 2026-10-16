@@ -176,12 +176,6 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
-    /// `checkname`: a name as a string constant.
-    fn checkname(&mut self) -> R<Exp> {
-        let name = self.str_checkname()?;
-        Ok(Exp::new(Kind::K(self.string_k(name)?)))
-    }
-
     /// `errorlimit`, raised with no token.
     fn errorlimit(&self, limit: usize, what: &str) -> crate::SyntaxError {
         let line = self.fsr().linedefined;

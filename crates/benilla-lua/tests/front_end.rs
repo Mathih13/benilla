@@ -299,8 +299,7 @@ fn every_chunk_compiles_as_the_fork_compiles_it() {
         match (ours, fork) {
             (Ok(_), Ok(f)) => {
                 both_ok += 1;
-                let p = benilla_lua::compile::compile(&c.bytes, chunkname.as_bytes(), &mut heap, 0)
-                    .unwrap();
+                let p = benilla_lua::compile(&c.bytes, chunkname.as_bytes(), &mut heap, 0).unwrap();
                 let fork_shape = c_shape(&f.dump(false));
                 if let Some(d) = shape_diff(&our_shape(&p, &heap), &fork_shape, "") {
                     shape_diff_list.push(format!("{}: {d}", c.name));

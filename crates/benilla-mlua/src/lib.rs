@@ -991,7 +991,7 @@ impl Value {
             Value::Nil => "nil".into(),
             Value::Boolean(b) => b.to_string(),
             Value::Integer(i) => i.to_string(),
-            Value::Number(n) => benilla_lua::number::fmt_g14(*n),
+            Value::Number(n) => benilla_lua::fmt_g14(*n),
             Value::String(s) => s.to_string_lossy(),
             other => format!("{}: {:p}", other.type_name(), other.to_pointer()),
         })
@@ -1341,7 +1341,7 @@ impl ObjectLike for Table {
         let t = self.0.get();
         let s = lua
             .vm()
-            .protected(|vm| benilla_lua::lib_base::tostring_value(vm, t))
+            .protected(|vm| benilla_lua::tostring_value(vm, t))
             .map_err(|e| lua.error_from(e))?;
         Ok(lua.vm().display(s))
     }

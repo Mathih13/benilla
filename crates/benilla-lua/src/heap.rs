@@ -463,11 +463,11 @@ pub struct Heap {
     /// and a new chunk takes a free slot: `None` is a free one. Id 0 is the host's and never
     /// freed. A profile's time for an id carries on into the chunk that takes its slot:
     /// [`Heap::source_seq`] tells the two apart.
-    pub sources: Vec<Option<crate::ast::Bytes>>,
+    pub sources: Vec<Option<crate::proto::Bytes>>,
     /// The rest of the sources' bookkeeping, boxed: the heap sits inside the VM, whose layout
     /// the interpreter loop's code is sensitive to.
     src: Box<SourceBook>,
-    source_ids: std::collections::HashMap<crate::ast::Bytes, u32>,
+    source_ids: std::collections::HashMap<crate::proto::Bytes, u32>,
     /// The chunk whose code runs now; a new table is charged to it.
     pub cur_source: u32,
     /// `intern_with`'s buffer.
@@ -674,7 +674,7 @@ impl Heap {
     // ── tables ───────────────────────────────────────────────────────────────────────────────
 
     /// The id of chunk name `name`, made on first sight, in a freed slot if there is one.
-    pub fn source_id(&mut self, name: &crate::ast::Bytes) -> u32 {
+    pub fn source_id(&mut self, name: &crate::proto::Bytes) -> u32 {
         if let Some(&id) = self.source_ids.get(name) {
             return id;
         }
@@ -740,13 +740,13 @@ impl Heap {
     }
 
     /// The chunk name of source `id`, if the slot holds one.
-    pub fn source_name(&self, id: u32) -> Option<&crate::ast::Bytes> {
+    pub fn source_name(&self, id: u32) -> Option<&crate::proto::Bytes> {
         self.sources.get(id as usize)?.as_ref()
     }
 
     /// The live sources in the order they were first compiled: `(id, name)`.
-    pub fn sources_in_order(&self) -> Vec<(u32, &crate::ast::Bytes)> {
-        let mut v: Vec<(u32, &crate::ast::Bytes)> = self
+    pub fn sources_in_order(&self) -> Vec<(u32, &crate::proto::Bytes)> {
+        let mut v: Vec<(u32, &crate::proto::Bytes)> = self
             .sources
             .iter()
             .enumerate()
