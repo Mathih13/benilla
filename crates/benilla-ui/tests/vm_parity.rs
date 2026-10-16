@@ -554,6 +554,19 @@ b]])"#),
           R(f .. "for k in f, nil, nil, 42 do return tostring(k) end"),
           R(f .. "local function g(x) return 'g' .. tostring(x) end for k in f, nil, nil, 42 do return g(k) end"),
           R(f .. "for k in f, nil, nil, 42, 43 do return k, 5 end"))"#),
+    // A generic `for` over `next` with a fourth value: the body's first local reads the register
+    // above the loop's variables, which the call to `next` leaves as `OP_TFORLOOP` and
+    // `lua_next` wrote it.
+    ("fix-vm tforloop_next_registers", r#"local function R(src) return E(loadstring(src, "=t")) end
+        local t = "local t, o = {10, 20}, {} "
+        return S(R(t .. "for k in next, t, nil, 42 do local y = k table.insert(o, type(y)) end return table.concat(o, ' ')"),
+          R(t .. "for k in next, t, nil, 42, 43 do local y, z = k table.insert(o, tostring(z)) end return table.concat(o, ' ')"),
+          R(t .. "for k, v in next, t, nil, 42 do local y = k table.insert(o, tostring(y)) end return table.concat(o, ' ')"),
+          R(t .. "for k, v, w in next, t, nil, 42 do local y = k table.insert(o, tostring(y) .. tostring(w)) end return table.concat(o, ' ')"),
+          R(t .. "for k, v, w, x in next, t, nil, 42 do local y = k table.insert(o, tostring(y) .. tostring(x)) end return table.concat(o, ' ')"),
+          R(t .. "for k in pairs(t) do end for k in next, t, nil, 42 do local y = k table.insert(o, type(y)) end return table.concat(o, ' ')"),
+          R(t .. "local function f() local a, b, c, d, e, g, h, i, j, l = 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' end "
+            .. "local function h() for k, v, w, x in next, t, nil, 42 do local y = k table.insert(o, tostring(y)) end end f() h() return table.concat(o, ' ')"))"#),
     // ── r2-vm: error handlers as 5.1's `luaG_errormsg` runs them ──
     ("r2-vm handler_reenters", r#"local n = 0
         local ok, e = xpcall(function() error("a", 0) end, function(m) n = n + 1 error("b", 0) end)

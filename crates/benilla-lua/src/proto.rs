@@ -313,6 +313,11 @@ pub struct Proto {
     pub nparams: u8,
     /// `...`: the extras become the `arg` table in register `nparams`.
     pub vararg: bool,
+    /// The function has a generic `for` over more than three values, whose body can read the
+    /// register above its variables before anything writes it: its frame starts with every
+    /// register nil, as `luaD_precall` starts every frame. Elsewhere the code writes each
+    /// register before it reads it, so the VM skips the clearing.
+    pub clears: bool,
     pub maxstack: u16,
     pub source: Bytes,
     pub line_defined: u32,

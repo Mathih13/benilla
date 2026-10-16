@@ -642,6 +642,10 @@ impl<'a> Parser<'a> {
         self.checknext(Tok::In)?;
         let line = self.lx.line;
         let (nexps, mut e) = self.explist1()?;
+        // Values past the third keep their registers: the body can read one unwritten.
+        if nexps > 3 {
+            self.fs().clears = true;
+        }
         self.adjust_assign(3, nexps, &mut e)?;
         self.checkstack(3)?;
         self.forbody(base, line, nvars - 3, None)

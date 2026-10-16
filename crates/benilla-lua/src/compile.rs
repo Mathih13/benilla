@@ -234,6 +234,8 @@ pub(crate) struct FuncState {
     pub linedefined: u32,
     pub nparams: u8,
     pub vararg: bool,
+    /// [`Proto::clears`].
+    pub clears: bool,
     pub source: Bytes,
     pub key: Key,
     /// How many children so far have each name, cut as a key cuts it.
@@ -268,6 +270,7 @@ impl FuncState {
             linedefined,
             nparams: 0,
             vararg: false,
+            clears: false,
             source,
             key,
             child_names: HashMap::new(),
@@ -330,6 +333,7 @@ impl FuncState {
             upval_decls: self.upval_decls,
             nparams: self.nparams,
             vararg: self.vararg,
+            clears: self.clears,
             maxstack: self.maxstack as u16 + 1,
             source_id: heap.source_id(&self.source),
             source: self.source,

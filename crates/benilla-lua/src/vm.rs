@@ -1484,12 +1484,22 @@ impl Vm {
                 } else if nargs > np {
                     fill_from = base + np;
                 }
-                // Missing parameters are nil. The registers above are not cleared, as C Lua
-                // clears them: the compiler writes each before reading it, and the collector
-                // skips a stale handle (`Heap::collect`).
+                // Missing parameters are nil. The registers above are cleared, as C Lua clears
+                // them, only where the code can read one it has not written (`Proto::clears`);
+                // the collector skips a stale handle (`Heap::collect`).
                 let params_end = base + np;
                 if fill_from < params_end {
                     for v in &mut self.stack[fill_from..params_end] {
+                        *v = Value::Nil;
+                    }
+                }
+                if proto.clears {
+                    let from = if proto.vararg {
+                        base + np + 1
+                    } else {
+                        base + np
+                    };
+                    for v in &mut self.stack[from..frame_top] {
                         *v = Value::Nil;
                     }
                 }
@@ -2640,7 +2650,7 @@ impl Vm {
                             {
                                 // `fi + 1` frames are live: the depth without reading the
                                 // frame list.
-                                if !shape.vararg && self.frames.len() < self.ci_limit {
+                                if !shape.precall && self.frames.len() < self.ci_limit {
                                     let np = shape.nparams as usize;
                                     let consts = shape.consts;
                                     let nbase = func_idx + 1;
@@ -2842,14 +2852,33 @@ impl Vm {
                         // call would do, minus the frame. An invalid key takes the call, which
                         // raises from inside `next` as before.
                         if r!(a) == self.builtin_next && !self.builtin_next.is_nil() {
-                            if let V::Table(t) = (r!(a + 1)).unpack() {
+                            let state = r!(a + 1);
+                            if let V::Table(t) = state.unpack() {
                                 if let Ok(step) = self.heap.table(t).next(r!(a + 2)) {
-                                    let (k, v) = step.unwrap_or((Value::Nil, Value::Nil));
-                                    r!(cb) = k;
-                                    if nv >= 2 {
-                                        r!(cb + 1) = v;
-                                        for i in 2..nv {
-                                            r!(cb + i) = Value::Nil;
+                                    // The registers from `cb` up as the call leaves them: the
+                                    // state and control copied to `cb + 1` and `cb + 2`, then
+                                    // `lua_next` writes the key over the control and the value
+                                    // above it (or `next` one nil there), and `nv` results move
+                                    // down to `cb`, nil past those given. A body can read one
+                                    // past its variables (`Proto::clears`).
+                                    let (k, v, n) = match step {
+                                        Some((k, v)) => (k, v, 2),
+                                        None => (Value::Nil, Value::Nil, 1),
+                                    };
+                                    let left = [k, state, k, v];
+                                    let res = [k, v];
+                                    for i in 0..nv.max(if n == 2 { 4 } else { 3 }) {
+                                        let x = if i < nv {
+                                            if i < n {
+                                                res[i]
+                                            } else {
+                                                Value::Nil
+                                            }
+                                        } else {
+                                            left[i]
+                                        };
+                                        if cb + i < maxstack!() {
+                                            r!(cb + i) = x;
                                         }
                                     }
                                     if k.is_nil() {

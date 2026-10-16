@@ -88,7 +88,8 @@ pub(crate) struct Shape {
     /// The chunk the function was compiled from (`Heap::sources`).
     pub(crate) source: u32,
     pub(crate) nparams: u8,
-    pub(crate) vararg: bool,
+    /// A call enters through `Vm::precall`: the function takes `...` or clears its registers.
+    pub(crate) precall: bool,
     pub(crate) maxstack: u16,
     /// The first instruction, so a call starts its frame without reaching the prototype.
     /// Valid as long as the prototype, which the closure holds.
@@ -102,7 +103,7 @@ impl Shape {
         Shape {
             source: p.source_id,
             nparams: p.nparams,
-            vararg: p.vararg,
+            precall: p.vararg || p.clears,
             maxstack: p.maxstack,
             code: p.code.as_ptr(),
             consts: p.consts.as_ptr(),
