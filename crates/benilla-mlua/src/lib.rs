@@ -490,25 +490,28 @@ impl Lua {
                 // A panic becomes a Lua error here, as mlua's `callback_error` makes one, so it
                 // never unwinds through the interpreter.
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // The arguments stay on the VM's stack, rooted, for the whole call.
-                    let args = lua.vm().args(nargs).to_vec();
-                    let a = A::from_raw_args(&args, &lua)?;
-                    let rets = func(&lua, a)?.into_lua_multi(&lua)?;
+                    // The arguments stay on the VM's stack, rooted, for the whole call; a copy
+                    // is read, since converting one reaches the VM. Most calls take a few.
+                    let mut few = [benilla_lua::Value::Nil; 8];
+                    let many;
+                    let args: &[benilla_lua::Value] = if nargs <= few.len() {
+                        few[..nargs].copy_from_slice(lua.vm().args(nargs));
+                        &few[..nargs]
+                    } else {
+                        many = lua.vm().args(nargs).to_vec();
+                        &many
+                    };
+                    let a = A::from_raw_args(args, &lua)?;
+                    // Pushed inside the guard: another state's value panics here.
+                    let n = func(&lua, a)?.push_results(&lua)?;
                     // mlua's `check_stack` for the results, against 5.1's `LUAI_MAXCSTACK`.
-                    if nargs + rets.len() >= MAXCSTACK {
+                    if nargs + n >= MAXCSTACK {
                         return Err(Error::StackError);
                     }
-                    // Converted inside the guard: another state's value panics here.
-                    Ok(rets.iter().map(|v| lua.unwrap(v)).collect::<Vec<_>>())
+                    Ok(n)
                 }));
                 let out = match res {
-                    Ok(Ok(rets)) => {
-                        let vm = lua.vm();
-                        for &x in &rets {
-                            vm.push(x);
-                        }
-                        Ok(rets.len())
-                    }
+                    Ok(Ok(n)) => Ok(n),
                     Ok(Err(e)) => {
                         let vm = lua.vm();
                         let msg = vm.str(e.lua_message().as_bytes());

@@ -37,6 +37,18 @@ pub trait FromLua: Sized {
 
 pub trait IntoLuaMulti: Sized {
     fn into_lua_multi(self, lua: &Lua) -> Result<MultiValue>;
+
+    /// A callback's results, pushed onto the VM's stack as they convert; answers how many. A
+    /// single value or a tuple goes without the `MultiValue` in between.
+    #[doc(hidden)]
+    fn push_results(self, lua: &Lua) -> Result<usize> {
+        let m = self.into_lua_multi(lua)?;
+        for v in m.iter() {
+            let x = lua.unwrap(v);
+            lua.vm().push(x);
+        }
+        Ok(m.len())
+    }
 }
 
 pub trait FromLuaMulti: Sized {
@@ -506,6 +518,13 @@ impl<T: IntoLua> IntoLuaMulti for T {
         m.push_back(self.into_lua(lua)?);
         Ok(m)
     }
+
+    fn push_results(self, lua: &Lua) -> Result<usize> {
+        let v = self.into_lua(lua)?;
+        let x = lua.unwrap(&v);
+        lua.vm().push(x);
+        Ok(1)
+    }
 }
 
 impl<T: FromLua> FromLuaMulti for T {
@@ -559,6 +578,10 @@ impl IntoLuaMulti for () {
     fn into_lua_multi(self, _: &Lua) -> Result<MultiValue> {
         Ok(MultiValue::new())
     }
+
+    fn push_results(self, _: &Lua) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 impl FromLuaMulti for () {
@@ -607,6 +630,15 @@ macro_rules! tuple {
                 $( m.push_back(self.$idx.into_lua(lua)?); )*
                 m.extend(self.$lidx.into_lua_multi(lua)?);
                 Ok(m)
+            }
+
+            fn push_results(self, lua: &Lua) -> Result<usize> {
+                $(
+                    let v = self.$idx.into_lua(lua)?;
+                    let x = lua.unwrap(&v);
+                    lua.vm().push(x);
+                )*
+                Ok($lidx + self.$lidx.push_results(lua)?)
             }
         }
 
