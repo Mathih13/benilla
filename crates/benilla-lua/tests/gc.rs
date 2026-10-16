@@ -117,3 +117,16 @@ fn the_builtin_next_outlives_its_globals() {
         );
     }
 }
+
+/// A vararg call's `arg` table is an allocation like any other: a loop of nothing but vararg
+/// calls collects as it goes (5.1.5's `adjust_varargs` checks the collector).
+#[test]
+fn vararg_calls_collect_as_they_go() {
+    let mut vm = benilla_lua::new_state();
+    run(&mut vm, "local function f(...) return arg.n end for i = 1, 200000 do f(i, i) end");
+    let tables = vm.heap.counts()[1];
+    assert!(
+        tables < 50000,
+        "200000 `arg` tables should not wait for a collection, {tables} live"
+    );
+}

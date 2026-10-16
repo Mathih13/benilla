@@ -1428,6 +1428,10 @@ impl Vm {
                     tailcalls: 0,
                     boundary: false,
                 });
+                // 5.1.5's `adjust_varargs` checks the collector for the `arg` table it makes.
+                if proto.vararg {
+                    self.check_gc();
+                }
                 Ok(Called::Lua)
             }
             FuncObj::Native { .. } => {
