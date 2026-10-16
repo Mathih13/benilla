@@ -1,6 +1,7 @@
 //! The script host on either VM: every case runs through `UiScript`, and its answer must equal
-//! the one the C Lua build recorded in `vm_parity.golden`. `BENILLA_BLESS=1` rewrites the file;
-//! only the C Lua build may bless it.
+//! the one the C Lua build recorded in `vm_parity.golden` (`vm_parity_surface.golden` for the
+//! cases that list every global). `BENILLA_BLESS=1` rewrites both; only the C Lua build may bless
+//! them.
 
 use benilla_ui::script::UiScript;
 
@@ -714,6 +715,11 @@ fn run(src: &str) -> String {
 
 const GOLDEN: &str = "tests/vm_parity.golden";
 
+/// The cases that list every global: their answers move with each binding the script host
+/// gains, not with the VM, so they live in a file of their own that a binding change re-blesses.
+const SURFACE_GOLDEN: &str = "tests/vm_parity_surface.golden";
+const SURFACE_CASES: &[&str] = &["pairs_globals", "global_surface"];
+
 /// `escape_default` undone: the golden file's one-line answers back to text.
 fn unescape(s: &str) -> String {
     let mut out = String::new();
@@ -775,6 +781,32 @@ fn render(answers: &[(&str, String)]) -> String {
         .collect()
 }
 
+/// Each answer against its golden line; a difference goes into `failures`.
+fn compare(golden: &str, answers: &[(&str, String)], failures: &mut Vec<String>) {
+    let want: std::collections::HashMap<&str, &str> =
+        golden.lines().filter_map(|l| l.split_once('\t')).collect();
+    for (name, got) in answers {
+        let got = got.escape_default().to_string();
+        match want.get(name) {
+            Some(w) if *w == got => {}
+            Some(w)
+                if without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string()
+                    == got => {}
+            Some(w) => {
+                let w = without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string();
+                failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
+            }
+            None => failures.push(format!(
+                "{name}: no golden answer; bless on the C Lua build"
+            )),
+        }
+    }
+}
+
 #[test]
 fn every_case_answers_as_the_c_lua_build_recorded() {
     let sweep: Vec<(String, String)> = SWEEP_FNS
@@ -798,37 +830,22 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), cases.len(), "case names are unique");
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
+    let (surface, vm): (Vec<_>, Vec<_>) = answers
+        .into_iter()
+        .partition(|(name, _)| SURFACE_CASES.contains(name));
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     if std::env::var_os("BENILLA_BLESS").is_some() {
         if cfg!(feature = "benilla-vm") {
             panic!("the golden answers come from the C Lua build");
         }
-        std::fs::write(&path, render(&answers)).expect("write the golden file");
+        std::fs::write(dir.join(GOLDEN), render(&vm)).expect("write the golden file");
+        std::fs::write(dir.join(SURFACE_GOLDEN), render(&surface)).expect("write the golden file");
         return;
     }
-    let golden = std::fs::read_to_string(&path).expect("the golden file");
-    let want: std::collections::HashMap<&str, &str> =
-        golden.lines().filter_map(|l| l.split_once('\t')).collect();
     let mut failures = Vec::new();
-    for (name, got) in &answers {
-        let got = got.escape_default().to_string();
-        match want.get(name) {
-            Some(w) if *w == got => {}
-            Some(w)
-                if without_mlua_wrapper(&unescape(w))
-                    .escape_default()
-                    .to_string()
-                    == got => {}
-            Some(w) => {
-                let w = without_mlua_wrapper(&unescape(w))
-                    .escape_default()
-                    .to_string();
-                failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
-            }
-            None => failures.push(format!(
-                "{name}: no golden answer; bless on the C Lua build"
-            )),
-        }
+    for (file, answers) in [(GOLDEN, &vm), (SURFACE_GOLDEN, &surface)] {
+        let golden = std::fs::read_to_string(dir.join(file)).expect("the golden file");
+        compare(&golden, answers, &mut failures);
     }
     assert!(
         failures.is_empty(),
