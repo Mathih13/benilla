@@ -48,6 +48,7 @@ impl Vm {
     #[allow(clippy::mutable_key_type)] // as `walk`
     pub fn hot_reload(&mut self, chunkname: &[u8], src: &[u8]) -> Result<Report, SyntaxError> {
         let root = crate::compile::compile(src, chunkname, &mut self.heap, 0)?;
+        self.heap.charge(root.tree_bytes());
         let mut fresh = HashMap::new();
         walk(&root, &mut fresh);
         let mut report = Report::default();

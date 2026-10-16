@@ -337,6 +337,22 @@ pub struct Proto {
 }
 
 impl Proto {
+    /// The bytes 5.1 allocates for this function's prototype, for the collector's count: the
+    /// `Proto` and its code, constants, nested prototype list, line info, locals and upvalue names.
+    pub fn bytes(&self) -> usize {
+        120 + 4 * self.code.len()
+            + 16 * self.consts.len()
+            + 8 * self.protos.len()
+            + 4 * self.lines.len()
+            + 16 * self.locvars.len()
+            + 8 * self.upval_names.len()
+    }
+
+    /// [`Proto::bytes`] of this function and every one nested in it.
+    pub fn tree_bytes(&self) -> usize {
+        self.bytes() + self.protos.iter().map(|q| q.tree_bytes()).sum::<usize>()
+    }
+
     /// The local in register `reg` at `pc`, if one is active there.
     pub fn local_name(&self, reg: Reg, pc: usize) -> Option<&Bytes> {
         self.locvars

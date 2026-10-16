@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use crate::proto::Proto;
-use crate::table::Table;
+use crate::table::{Growth, Table};
 use crate::value::{FuncRef, StrRef, TableRef, UserRef, Value, STR_HASH_MASK, STR_ID_BITS, V};
 
 /// A native function. Its arguments are the `nargs` values below the top of the stack; it pushes
@@ -449,7 +449,7 @@ pub struct Heap {
     strs: Arena<StrObj>,
     /// The intern table: open addressing, linear probing, at most half full.
     strt: Vec<u32>,
-    tables: Arena<Table>,
+    tables: Tables,
     funcs: Arena<FuncObj>,
     upvals: Arena<UpvalObj>,
     users: Arena<UserObj>,
@@ -485,6 +485,41 @@ pub struct Heap {
     str_gc_at: u32,
     /// Host closures the last collection freed, not yet dropped (`Vm::full_gc`).
     pub(crate) freed_hosts: Vec<FuncObj>,
+}
+
+/// The tables and the growth their resizes made that `Heap::bytes` does not hold yet, which
+/// every table the heap made adds to. A clone's tables add to the clone's own.
+struct Tables {
+    arena: Arena<Table>,
+    growth: Rc<std::cell::Cell<isize>>,
+}
+
+impl Clone for Tables {
+    fn clone(&self) -> Tables {
+        let growth = Rc::new(std::cell::Cell::new(self.growth.get()));
+        let mut arena = self.arena.clone();
+        for t in &mut arena.items {
+            if t.growth.0.is_some() {
+                t.growth = Growth(Some(growth.clone()));
+            }
+        }
+        Tables { arena, growth }
+    }
+}
+
+impl std::ops::Deref for Tables {
+    type Target = Arena<Table>;
+    #[inline(always)]
+    fn deref(&self) -> &Arena<Table> {
+        &self.arena
+    }
+}
+
+impl std::ops::DerefMut for Tables {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Arena<Table> {
+        &mut self.arena
+    }
 }
 
 /// [`Heap::sources`]' bookkeeping.
@@ -529,7 +564,10 @@ impl Default for Heap {
             identity: Identity::default(),
             strs: Arena::new(),
             strt: vec![STRT_EMPTY; 128],
-            tables: Arena::new(),
+            tables: Tables {
+                arena: Arena::new(),
+                growth: Default::default(),
+            },
             funcs: Arena::new(),
             upvals: Arena::new(),
             users: Arena::new(),
@@ -603,7 +641,7 @@ impl Heap {
         let Some(obj) = StrObj::new(s, hash) else {
             return self.out_of_memory();
         };
-        self.bytes += 32 + s.len();
+        self.bytes += str_bytes(s);
         let id = self.strs.alloc(obj);
         self.strt[b] = strt_entry(hash, id);
         if self.strs.live() * 2 > self.strt.len() {
@@ -640,6 +678,7 @@ impl Heap {
 
     /// Rebuild the intern table at `size` slots from the live strings.
     fn resize_strt(&mut self, size: usize) {
+        self.bytes = (self.bytes + strt_bytes(size)).saturating_sub(strt_bytes(self.strt.len()));
         let mut strt = vec![STRT_EMPTY; size];
         let mask = size - 1;
         for (i, o) in self.strs.iter_live() {
@@ -792,6 +831,7 @@ impl Heap {
     pub fn new_table(&mut self, narray: usize, nhash: usize) -> TableRef {
         let mut t = Table::new(narray, nhash);
         t.owner = self.cur_source;
+        t.growth = Growth(Some(self.tables.growth.clone()));
         self.bytes += t.bytes();
         TableRef(self.tables.alloc(t))
     }
@@ -809,7 +849,7 @@ impl Heap {
     // ── functions and upvalues ───────────────────────────────────────────────────────────────
 
     pub fn new_func(&mut self, f: FuncObj) -> FuncRef {
-        self.bytes += 48;
+        self.bytes += func_bytes(&f);
         FuncRef(self.funcs.alloc(f))
     }
 
@@ -900,8 +940,9 @@ impl Heap {
         // Constants of every reached prototype, once each.
         // A number no other collection, in any VM, has used: prototypes are shared by forks.
         let epoch = GC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let mut proto_bytes = 0;
         for (p, ups) in code {
-            mark_proto(p, &mut gray, epoch);
+            mark_proto(p, &mut gray, epoch, &mut proto_bytes);
             gray_upvals.extend_from_slice(ups);
         }
         loop {
@@ -973,7 +1014,7 @@ impl Heap {
                         }) => {
                             gray.push(Value::Table(*env));
                             gray_upvals.extend_from_slice(upvals);
-                            mark_proto(proto, &mut gray, epoch);
+                            mark_proto(proto, &mut gray, epoch, &mut proto_bytes);
                         }
                         FuncObj::Native { upvals, env, .. } => {
                             gray.push(Value::Table(*env));
@@ -994,7 +1035,11 @@ impl Heap {
         }
         // Weak tables drop entries whose collectable key or value died.
         for t in weak_tables {
-            let (tables, funcs, users) = (&self.tables.state, &self.funcs.state, &self.users.state);
+            let (tables, funcs, users) = (
+                &self.tables.arena.state,
+                &self.funcs.state,
+                &self.users.state,
+            );
             let marked = |st: &Vec<u8>, i: u32| st.get(i as usize) == Some(&MARKED);
             let alive = |v: Value| match v.unpack() {
                 V::Table(r) => marked(tables, r.0),
@@ -1002,7 +1047,7 @@ impl Heap {
                 V::User(r) => marked(users, r.0),
                 _ => true,
             };
-            let tab = &mut self.tables.items[t as usize];
+            let tab = &mut self.tables.arena.items[t as usize];
             for v in tab.array.iter_mut() {
                 if !alive(*v) {
                     *v = Value::Nil;
@@ -1022,14 +1067,14 @@ impl Heap {
         let freed = &mut self.freed_hosts;
         live += sweep(
             &mut self.funcs,
-            |_| 48,
+            func_bytes,
             |f| matches!(f, FuncObj::Native { host: Some(_), .. }),
             |f| freed.push(f),
         );
         live += sweep(&mut self.upvals, |_| 24, |_| false, drop);
         live += sweep(&mut self.users, |_| 32, |_| false, drop);
         let strs_before = self.strs.live();
-        live += sweep(&mut self.strs, |s| 32 + s.bytes().len(), |_| false, drop);
+        live += sweep(&mut self.strs, |s| str_bytes(s.bytes()), |_| false, drop);
         let dead_str = self.strs.live() != strs_before;
         let live_strs = self.strs.live() as u32;
         self.str_gc_at = live_strs + (self.str_id_limit.saturating_sub(live_strs)) / 2;
@@ -1039,17 +1084,25 @@ impl Heap {
         }
         // A key whose node is dead (nil value) may name a freed object; 5.0 keeps such keys for
         // `next` and never reads them. They stay as stale handles, compared by identity only.
-        crate::table::take_growth();
+        // Every live table's size is counted whole above, its uncounted growth with it.
+        self.tables.growth.set(0);
+        live += proto_bytes + strt_bytes(self.strt.len());
         self.bytes = live;
         live
+    }
+
+    /// `n` more bytes the collector counts, as C's allocator would: compiled code, the stack.
+    pub(crate) fn charge(&mut self, n: usize) {
+        self.bytes += n;
     }
 
     /// The live byte estimate: what the last collection found, what was made since, and what
     /// tables grew by since.
     pub fn bytes(&mut self) -> usize {
-        self.bytes = self
-            .bytes
-            .saturating_add_signed(crate::table::take_growth());
+        let g = self.tables.growth.replace(0);
+        if g != 0 {
+            self.bytes = self.bytes.saturating_add_signed(g);
+        }
         self.bytes
     }
 
@@ -1076,6 +1129,24 @@ impl Heap {
     }
 }
 
+/// The intern table's bytes in the collector's count: 5.1's string table, a pointer a slot.
+fn strt_bytes(slots: usize) -> usize {
+    8 * slots
+}
+
+/// A string's bytes in the collector's count: 5.1's `TString` and its text.
+fn str_bytes(s: &[u8]) -> usize {
+    32 + s.len()
+}
+
+/// A closure's bytes in the collector's count: 5.1's `Closure` and its upvalues.
+fn func_bytes(f: &FuncObj) -> usize {
+    match f {
+        FuncObj::Lua(l) => 40 + 8 * l.upvals.len(),
+        FuncObj::Native { upvals, .. } => 40 + 16 * upvals.len(),
+    }
+}
+
 /// The function a handle to no live function calls.
 fn dead_function(vm: &mut crate::vm::Vm, _: usize) -> Result<usize, crate::vm::LuaError> {
     Err(vm.rt_error("attempt to call a dead function"))
@@ -1092,14 +1163,15 @@ fn is_collectable(v: Value) -> bool {
 static GC_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Constants of `p` and its nested prototypes, once per collection.
-fn mark_proto(p: &Rc<Proto>, gray: &mut Vec<Value>, epoch: u32) {
+fn mark_proto(p: &Rc<Proto>, gray: &mut Vec<Value>, epoch: u32, bytes: &mut usize) {
     if p.gc_mark.get() == epoch {
         return;
     }
     p.gc_mark.set(epoch);
+    *bytes += p.bytes();
     gray.extend(p.consts.iter().copied().filter(|v| is_collectable(*v)));
     for q in &p.protos {
-        mark_proto(q, gray, epoch);
+        mark_proto(q, gray, epoch, bytes);
     }
 }
 
@@ -1174,7 +1246,10 @@ mod tests {
         }
         let mode = h.intern(b"__mode");
         h.collect(&[Value::Table(keep)], &[], &[], mode);
-        assert!(h.tables.items.len() <= 4 * ARENA_FIRST, "the arena shrank");
+        assert!(
+            h.tables.arena.items.len() <= 4 * ARENA_FIRST,
+            "the arena shrank"
+        );
         let t = h.new_table(0, 0);
         assert!(
             (t.0 as usize) < ARENA_FIRST,
@@ -1183,6 +1258,6 @@ mod tests {
         );
         h.collect(&[Value::Table(keep), Value::Table(t)], &[], &[], mode);
         assert_eq!(h.table(keep).array.len(), 0, "the kept table is intact");
-        assert!(h.tables.used as usize <= ARENA_FIRST);
+        assert!(h.tables.arena.used as usize <= ARENA_FIRST);
     }
 }

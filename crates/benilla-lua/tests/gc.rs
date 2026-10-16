@@ -196,3 +196,77 @@ fn a_call_with_globals_puts_them_back() {
         vm.unroot(h);
     }
 }
+
+fn kb(vm: &mut benilla_lua::Vm) -> f64 {
+    run(vm, "return gcinfo()").parse().unwrap()
+}
+
+/// The collector counts memory as C's allocator does, as it grows: a table's resizes, a
+/// compiled chunk's code, the value stack. Garbage that grows after it is made still brings the
+/// collection that frees it.
+#[test]
+fn the_count_follows_every_growth_and_paces_the_collector() {
+    let mut vm = benilla_lua::new_state();
+    vm.full_gc();
+    let tables = vm.heap.counts()[1];
+    run(
+        &mut vm,
+        "for i = 1, 300 do local t = {} for j = 1, 4000 do t[j] = j end end",
+    );
+    let left = vm.heap.counts()[1] - tables;
+    assert!(left < 50, "{left} garbage tables of 64 KB still live");
+
+    // One table grown with no other written after it: its growth is counted where the
+    // collector checks, so the next table made collects it.
+    vm.full_gc();
+    let tables = vm.heap.counts()[1];
+    run(
+        &mut vm,
+        "local g = {} for j = 1, 200000 do g[j] = j end g = nil local x = {}",
+    );
+    assert_eq!(
+        vm.heap.counts()[1] - tables,
+        1,
+        "the grown table still live"
+    );
+
+    let before = kb(&mut vm);
+    run(&mut vm, "Big = {} for j = 1, 100000 do Big[j] = j end");
+    let grown = kb(&mut vm) - before;
+    assert!(grown >= 1500.0, "a 100000-slot table counted as {grown} KB");
+
+    run(
+        &mut vm,
+        "Src = 'local x = 0 ' .. string.rep('x = x + 1 ', 20000)",
+    );
+    let before = kb(&mut vm);
+    run(&mut vm, "Chunk = loadstring(Src)");
+    let compiled = kb(&mut vm) - before;
+    assert!(
+        compiled >= 100.0,
+        "40000 instructions counted as {compiled} KB"
+    );
+
+    let before = kb(&mut vm);
+    run(
+        &mut vm,
+        "local function r(n) if n > 0 then return 1 + r(n - 1) end return 0 end r(10000)",
+    );
+    let stack = kb(&mut vm) - before;
+    assert!(
+        stack >= 500.0,
+        "a stack 10000 calls deep counted as {stack} KB"
+    );
+}
+
+/// A snapshot counts its own tables' growth, and the state it was taken from does not.
+#[test]
+fn a_snapshot_counts_its_own_growth() {
+    let mut vm = benilla_lua::new_state();
+    run(&mut vm, "collectgarbage(-1) Big = {}");
+    let mut snap = vm.clone();
+    let (before, snap_before) = (kb(&mut vm), kb(&mut snap));
+    run(&mut snap, "for j = 1, 100000 do Big[j] = j end");
+    assert!(kb(&mut snap) - snap_before >= 1500.0);
+    assert_eq!(kb(&mut vm), before, "the snapshot's growth counted here");
+}

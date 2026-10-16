@@ -19,18 +19,20 @@ const EMPTY: Node = Node {
     next: -1,
 };
 
-thread_local! {
-    /// Bytes tables grew or shrank by since the heap last drained it ([`take_growth`]). A table
-    /// cannot reach its heap, and only resizes, which are rare, touch it.
-    // ponytail: per thread, not per heap; two VMs interleaving on one thread may charge each
-    // other a resize until the next collection recounts both. A heap-owned counter would need
-    // every table write to go through the heap.
-    static GROWN: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
-}
+/// A heap's bytes of table growth not yet in its count: shared by every table the heap made, so a
+/// resize is counted where it happens, by the heap that made the table, and a write pays nothing
+/// for it. A table made outside a heap counts nowhere.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Growth(pub(crate) Option<std::rc::Rc<std::cell::Cell<isize>>>);
 
-/// The bytes tables grew by since the last call (negative when they shrank).
-pub(crate) fn take_growth() -> isize {
-    GROWN.replace(0)
+impl Growth {
+    pub(crate) const NONE: Growth = Growth(None);
+
+    fn add(&self, n: isize) {
+        if let Some(c) = &self.0 {
+            c.set(c.get() + n);
+        }
+    }
 }
 
 /// 5.1's `MAXBITS`: `2^MAXBITS` (`MAXASIZE`) is the largest array index kept in the array part.
@@ -64,6 +66,8 @@ pub struct Table {
     /// so a step after such a change finds the key where 5.0 would.
     hint_key: std::cell::Cell<Value>,
     hint_pos: std::cell::Cell<u32>,
+    /// Where its resizes are counted, as C's allocator counts each one.
+    pub(crate) growth: Growth,
 }
 
 /// The result of a key lookup: where its slot is, if it has one.
@@ -133,6 +137,7 @@ impl Table {
             owner: 0,
             hint_key: std::cell::Cell::new(Value::Nil),
             hint_pos: std::cell::Cell::new(0),
+            growth: Growth::NONE,
         };
         t.array.resize(narray, Value::Nil);
         t.set_node_vector(nhash);
@@ -155,6 +160,7 @@ impl Table {
             owner: 0,
             hint_key: std::cell::Cell::new(Value::Nil),
             hint_pos: std::cell::Cell::new(0),
+            growth: Growth::NONE,
         }
     }
 
@@ -541,7 +547,7 @@ impl Table {
         let before = self.bytes() as isize;
         self.resize_parts(nasize, nhsize);
         // 5.1's `luaM_reallocvector` charges `totalbytes` for both parts.
-        GROWN.set(GROWN.get() + self.bytes() as isize - before);
+        self.growth.add(self.bytes() as isize - before);
     }
 
     fn resize_parts(&mut self, nasize: usize, nhsize: usize) {

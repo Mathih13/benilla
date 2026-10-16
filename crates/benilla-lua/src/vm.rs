@@ -30,6 +30,9 @@ const BASIC_CI_SIZE: usize = 8;
 /// at `LUAI_MAXCCALLS`, with the same eighth of margin for a handler. 200 levels of the deepest
 /// library callback use under half of it in an optimized build, so there it never decides.
 const MAX_RUST_STACK: usize = 1 << 20;
+/// A stack slot in the collector's count: 5.1's `TValue`, which C's allocator counts as the
+/// stack grows.
+const STACK_SLOT_BYTES: usize = 16;
 /// 5.1.5's `MAXTAGLOOP`: the steps `luaV_gettable` and `luaV_settable` take along a chain of
 /// `__index` or `__newindex` tables before `loop in gettable`.
 const MAXTAGLOOP: u32 = 100;
@@ -423,6 +426,7 @@ impl Vm {
             rand: crate::lib_math::GlibcRand::seeded(1),
             identity: Default::default(),
         };
+        vm.heap.charge(STACK_SLOT_BYTES * vm.stack.len());
         vm.heap.threshold = 2 * vm.heap.bytes().max(32 * 1024);
         vm
     }
@@ -539,6 +543,7 @@ impl Vm {
     /// Compile a chunk into a function over the globals.
     pub fn load(&mut self, src: &[u8], chunkname: &[u8]) -> Result<Value, crate::SyntaxError> {
         let proto = crate::compile::compile(src, chunkname, &mut self.heap, self.c_depth)?;
+        self.heap.charge(proto.tree_bytes());
         // A constant the compiler could not make: 5.1's `LUA_ERRMEM`.
         if self.heap.oom {
             self.heap.oom = false;
@@ -869,7 +874,10 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn grow(&mut self, n: usize) {
+        let old = self.stack.len();
         self.stack.resize(n.next_power_of_two(), Value::Nil);
+        self.heap
+            .charge(STACK_SLOT_BYTES * (self.stack.len() - old));
     }
 
     #[inline]
@@ -2047,7 +2055,9 @@ impl Vm {
         }
         let live = self
             .heap
-            .collect(&roots, &open, &self.retired, self.names.mode);
+            .collect(&roots, &open, &self.retired, self.names.mode)
+            + STACK_SLOT_BYTES * self.stack.len();
+        self.heap.charge(STACK_SLOT_BYTES * self.stack.len());
         self.heap.threshold = 2 * live;
         // 5.1.5's `checkstacksizes`, which a cycle runs as it traverses the running thread, in
         // propagation and again in the atomic step: a call-info array a quarter used halves,
