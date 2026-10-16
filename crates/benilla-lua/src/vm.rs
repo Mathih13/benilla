@@ -30,7 +30,8 @@ const BASIC_CI_SIZE: usize = 8;
 /// at `LUAI_MAXCCALLS`, with the same eighth of margin for a handler. 200 levels of the deepest
 /// library callback use under half of it in an optimized build, so there it never decides.
 const MAX_RUST_STACK: usize = 1 << 20;
-/// 5.0's `MAXTAGLOOP`.
+/// 5.1.5's `MAXTAGLOOP`: the steps `luaV_gettable` and `luaV_settable` take along a chain of
+/// `__index` or `__newindex` tables before `loop in gettable`.
 const MAXTAGLOOP: u32 = 100;
 
 #[derive(Clone, Copy)]
@@ -972,7 +973,7 @@ impl Vm {
     pub fn index(&mut self, t: Value, key: Value, reg: Option<usize>) -> Result<Value, LuaError> {
         let mut t = t;
         let mut reg = reg;
-        for _ in 0..=MAXTAGLOOP {
+        for _ in 0..MAXTAGLOOP {
             let tm = match t.unpack() {
                 V::Table(tr) => {
                     let tab = self.heap.table(tr);
@@ -1018,7 +1019,7 @@ impl Vm {
     ) -> Result<(), LuaError> {
         let mut t = t;
         let mut reg = reg;
-        for _ in 0..=MAXTAGLOOP {
+        for _ in 0..MAXTAGLOOP {
             let tm = match t.unpack() {
                 V::Table(tr) => {
                     let slot = match self.heap.table_mut(tr).slot_for(key) {

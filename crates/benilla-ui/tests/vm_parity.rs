@@ -567,6 +567,18 @@ b]])"#),
           R(t .. "for k in pairs(t) do end for k in next, t, nil, 42 do local y = k table.insert(o, type(y)) end return table.concat(o, ' ')"),
           R(t .. "local function f() local a, b, c, d, e, g, h, i, j, l = 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' end "
             .. "local function h() for k, v, w, x in next, t, nil, 42 do local y = k table.insert(o, tostring(y)) end end f() h() return table.concat(o, ' ')"))"#),
+    // `__index` and `__newindex` chains: 5.1.5's `luaV_gettable` and `luaV_settable` take 100 steps.
+    ("fix-vm tag_loop", r#"local function chain(n, field)
+          local last = {x = "found"}
+          for i = 1, n do last = setmetatable({}, {[field] = last}) end
+          return last
+        end
+        local o = {}
+        for _, n in {98, 99, 100, 101} do
+          table.insert(o, E(function() return chain(n, "__index").x end))
+          table.insert(o, E(function() local t = chain(n, "__newindex") t.y = 1 return "set" end))
+        end
+        return table.concat(o, "|")"#),
     // ── r2-vm: error handlers as 5.1's `luaG_errormsg` runs them ──
     ("r2-vm handler_reenters", r#"local n = 0
         local ok, e = xpcall(function() error("a", 0) end, function(m) n = n + 1 error("b", 0) end)

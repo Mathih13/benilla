@@ -200,6 +200,7 @@ perf-fix gsub_literal_errors	\"err t:32: malformed pattern (ends with `%\')\",\"
 r2-front_forlist_extra_values	\"ok 7\",\"err t:1: attempt to perform arithmetic on local `y\' (a nil value)\",\"ok 23\"
 fix-front_forlist_return	\"ok nil,1\",\"ok nil,1,5\",\"ok nil,\\\"1\\\"\",\"ok \\\"g1\\\"\",\"ok nil,nil\"
 fix-vm tforloop_next_registers	\"ok \\\"table table\\\"\",\"ok \\\"1 2\\\"\",\"ok \\\"1 2\\\"\",\"ok \\\"10nil 20nil\\\"\",\"ok \\\"nilnil nilnil\\\"\",\"ok \\\"table table\\\"\",\"ok \\\"nil nil\\\"\"
+fix-vm tag_loop	ok \"found\"|ok \"set\"|ok \"found\"|ok \"set\"|err t:39: loop in gettable|err t:40: loop in settable|err t:39: loop in gettable|err t:40: loop in settable
 r2-vm handler_reenters	false,\"error in error handling\",221
 r2-vm handler_raises_once	false,\"H:again\",2
 r2-vm handler_not_function	false,\"error in error handling\",false,\"error in error handling\",true,1
