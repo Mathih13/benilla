@@ -54,7 +54,7 @@ fn creature_line_law() {
     s.run(
         r#"
         local a = CreateFrame("Button", "UF1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         assert(tt:SetUnit("target") == 1, "SetUnit returns 1 on a live unit")
         assert(TTTextLeft1:GetText() == "Timber Wolf")
@@ -108,7 +108,7 @@ fn a_pending_name_titles_unknownobject_and_the_answer_replaces_it() {
         r#"
         UNKNOWNOBJECT = "Unknown"   -- GlobalStrings.lua:4444, enUS
         local a = CreateFrame("Button", "UF1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         assert(tt:SetUnit("target") == 1, "a resolved unit shows, name or no name")
         assert(TTTextLeft1:GetText() == UNKNOWNOBJECT,
@@ -216,7 +216,7 @@ fn the_tooltip_title_is_the_pvp_name() {
         PVP_MEDAL1 = "Guardian of Stormwind"
         PVP_RANK_CIVILIAN = "Civilian"
         local a = CreateFrame("Button", "UF1"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
     "#,
     )
@@ -313,7 +313,7 @@ fn faction_line_and_civilian_gate() {
     s.run(
         r#"
         local a = CreateFrame("Button", "UF9"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetUnit("target")
         assert(TTTextLeft2:GetText() == "[LEVEL 20]", "friendly creature: no type word; got " .. TTTextLeft2:GetText())
@@ -404,7 +404,7 @@ fn level_line_variants() {
     s.run(
         r#"
         local a = CreateFrame("Button", "UF2"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
         tt:SetUnit("target")
         assert(TTTextLeft2:GetText() == "[LEVEL_CLASS_TYPE 32 Human Rogue [PLAYER]]", "got " .. TTTextLeft2:GetText())
@@ -514,7 +514,7 @@ fn a_players_level_line_ignores_the_snapshots_creature_type() {
     s.run(
         r#"
         local a = CreateFrame("Button", "UF3"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
-        local tt = CreateFrame("GameTooltip", "TT")
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
         tt:SetOwner(a, "ANCHOR_RIGHT")
     "#,
     )
@@ -548,6 +548,64 @@ fn a_players_level_line_ignores_the_snapshots_creature_type() {
     assert!(s.take_errors().is_empty());
 }
 
+/// A creature of type 10, "Not specified", has no word in the level line (`0x52a2c1`-`0x52a2c6`
+/// skip the type row), where `UnitCreatureType` still answers it (`0x51a2dc`): the line reads
+/// without a class slot, for a hostile unit as for a neutral one, and an ordinary type shows its
+/// word beside it.
+#[test]
+fn a_type_ten_creature_has_no_word_in_the_level_line_but_unitcreaturetype_answers_it() {
+    let mut s = script();
+    seed_level_strings(&mut s);
+    s.set_screen_size(800.0, 600.0);
+    s.set_player_req_state(PlayerReqState {
+        level: 60,
+        ..Default::default()
+    });
+    s.run(
+        r#"
+        local a = CreateFrame("Button", "UF2"); a:SetPoint("CENTER", 0, 0); a:SetWidth(10); a:SetHeight(10)
+        local tt = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")
+        tt:SetOwner(a, "ANCHOR_RIGHT")
+    "#,
+    )
+    .unwrap();
+    let creature = |reaction: u8, id: u32, word: &str| UnitState {
+        guid: 0xF130_0000_0000_0109,
+        exists: true,
+        has_object: true,
+        name: Some("Wisp".into()),
+        level: 60,
+        reaction,
+        creature_type: id,
+        creature_type_name: Some(word.into()),
+        ..Default::default()
+    };
+    for reaction in [2, 4] {
+        s.set_unit("target", Some(creature(reaction, 10, "Not specified")));
+        s.run(
+            r#"
+            TT:SetOwner(UF2, "ANCHOR_RIGHT"); TT:SetUnit("target")
+            assert(TTTextLeft2:GetText() == "[LEVEL 60]", "got " .. TTTextLeft2:GetText())
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("reaction {reaction}: {e}"));
+        assert_eq!(
+            s.eval::<String>(r#"return UnitCreatureType("target")"#)
+                .unwrap(),
+            "Not specified"
+        );
+        s.set_unit("target", Some(creature(reaction, 7, "Humanoid")));
+        s.run(
+            r#"
+            TT:SetOwner(UF2, "ANCHOR_RIGHT"); TT:SetUnit("target")
+            assert(TTTextLeft2:GetText() == "[LEVEL_CLASS 60 Humanoid]", "got " .. TTTextLeft2:GetText())
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("reaction {reaction}: {e}"));
+    }
+    assert!(s.take_errors().is_empty());
+}
+
 /// `world_tooltip_unit` fires the default anchor, renders, then fires `UPDATE_MOUSEOVER_UNIT`.
 #[test]
 fn world_hover_drive_and_health_watcher() {
@@ -561,7 +619,7 @@ fn world_hover_drive_and_health_watcher() {
         -- handler must do the REAL seating (a counter-only stub is exactly the hole that let the
         -- unwired live handler park the plate at screen center).
         UIParent = CreateFrame("Frame", "UIParent"); UIParent:SetAllPoints()
-        local tt = CreateFrame("GameTooltip", "GameTooltip")
+        local tt = CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate")
         tt:Hide()
         -- The XML wiring, test-side: default anchor + the reaction recolor + a status bar child.
         tt:SetScript("OnTooltipSetDefaultAnchor", function()
@@ -648,7 +706,7 @@ fn world_hover_drive_and_health_watcher() {
 fn minimap_blip_tooltip_shows_follows_and_hides() {
     let mut s = script();
     s.set_screen_size(800.0, 600.0);
-    s.run(r#"CreateFrame("GameTooltip", "GameTooltip")"#)
+    s.run(r#"CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate")"#)
         .unwrap();
     assert!(
         !s.minimap_tooltip("Stormwind", false),
@@ -713,7 +771,7 @@ fn a_cursor_seated_plate_lands_on_the_cursor_under_the_ui_scale() {
         up:SetPoint("BOTTOMLEFT", 0, 0); up:SetPoint("TOPRIGHT", 0, 0)
         -- The cursor stays on the Minimap, whose probe drops the blip on a miss.
         CreateFrame("Minimap", "Minimap", up):SetAllPoints(up)
-        CreateFrame("GameTooltip", "GameTooltip", UIParent)
+        CreateFrame("GameTooltip", "GameTooltip", UIParent, "TestTooltipTemplate")
     "#,
     )
     .unwrap();
@@ -759,7 +817,7 @@ fn the_health_bar_shows_and_hides_through_its_own_transitions() {
         r#"
         log = {}
         BarHost = CreateFrame("Frame", "BarHost")
-        BarTip = CreateFrame("GameTooltip", "BarTip")
+        BarTip = CreateFrame("GameTooltip", "BarTip", nil, "TestTooltipTemplate")
         local bar = CreateFrame("StatusBar", "BarTipStatusBar", BarTip)
         bar:Hide()
         bar:SetScript("OnShow", function() table.insert(log, "bar show") end)
@@ -808,7 +866,7 @@ fn a_cursor_seated_world_plate_hides_at_once_on_hover_loss() {
     s.run(
         r#"
         local up = CreateFrame("Frame", "UIParent"); up:SetAllPoints()
-        CreateFrame("GameTooltip", "GameTooltip")
+        CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate")
         "#,
     )
     .unwrap();
@@ -832,7 +890,7 @@ fn a_minimap_blip_plate_hides_at_once_on_hover_loss() {
         r#"
         local up = CreateFrame("Frame", "UIParent"); up:SetAllPoints()
         CreateFrame("Minimap", "Minimap", up)
-        CreateFrame("GameTooltip", "GameTooltip")
+        CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate")
         "#,
     )
     .unwrap();
@@ -864,7 +922,7 @@ fn a_cursor_plate_replaced_by_another_hides_then_shows_and_clears_twice_per_seat
         r#"
         log = {}
         local up = CreateFrame("Frame", "UIParent"); up:SetAllPoints()
-        local tt = CreateFrame("GameTooltip", "GameTooltip"); tt:Hide()
+        local tt = CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate"); tt:Hide()
         tt:SetScript("OnTooltipCleared", function() table.insert(log, "cleared") end)
         tt:SetScript("OnShow", function() table.insert(log, "show") end)
         tt:SetScript("OnHide", function() table.insert(log, "hide") end)
@@ -899,7 +957,7 @@ fn a_mouseover_change_fades_the_tooltip_whoever_holds_it() {
     s.run(
         r#"
         UIParent = CreateFrame("Frame", "UIParent"); UIParent:SetAllPoints()
-        CreateFrame("GameTooltip", "GameTooltip"):Hide()
+        CreateFrame("GameTooltip", "GameTooltip", nil, "TestTooltipTemplate"):Hide()
         Bag = CreateFrame("Button", "Bag")
         function bag_tooltip()
             GameTooltip:SetOwner(Bag, "ANCHOR_RIGHT"); GameTooltip:SetText("Bag slot")
@@ -941,7 +999,7 @@ fn a_unit_with_guid_zero_is_no_unit() {
     s.run(
         r#"
         ZeroHost = CreateFrame("Frame", "ZeroHost")
-        ZeroTip = CreateFrame("GameTooltip", "ZeroTip")
+        ZeroTip = CreateFrame("GameTooltip", "ZeroTip", nil, "TestTooltipTemplate")
         ZeroTip:SetOwner(ZeroHost, "ANCHOR_RIGHT")
         assert(ZeroTip:SetUnit("target") == nil, "no object, no plate")
         assert(not ZeroTip:IsShown() and not ZeroTip:IsOwned(ZeroHost))

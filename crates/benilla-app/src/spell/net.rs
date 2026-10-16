@@ -648,6 +648,7 @@ fn cast_result(
                     // `SMSG_CAST_FAILED` is addressed to the caster, and this handler is ours.
                     caster: crate::ui_action::Caster::Player,
                     redisplay: false,
+                    input: benilla_ui::script::InputEvents::NONE,
                 });
             }
         }
@@ -1293,7 +1294,7 @@ fn channel_update(remaining_ms: u32, channel: &mut ActiveChannel, feed: &mut Cas
 
 /// `SMSG_UPDATE_AURA_DURATION`: one of our auras' remaining time, by raw slot, stamped with the
 /// receive time. It arrives before the descriptor delta that names the slot.
-fn aura_duration(slot: u8, remaining_ms: u32, durations: &mut AuraDurations, now_secs: f64) {
+fn aura_duration(slot: u8, remaining_ms: i32, durations: &mut AuraDurations, now_secs: f64) {
     durations.set(slot, remaining_ms, now_secs);
 }
 
@@ -1354,6 +1355,28 @@ fn spell_chain_targets(
 mod tests {
     use super::*;
     use benilla_protocol::messages::ACTION_KIND_SPELL;
+
+    /// `SMSG_COOLDOWN_EVENT` (`0x6e9670`): the event moves the held record's one start, which the
+    /// GCD leg reads (`0x6e15d8`), so the global cooldown runs again from the packet.
+    #[test]
+    fn a_cooldown_event_packet_restarts_the_held_records_gcd() {
+        let form = benilla_formats::SpellDisplay {
+            start_recovery_category: 133,
+            start_recovery_ms: 1_500,
+            attributes: 0x0200_0000,
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        let mut cooldowns = Cooldowns::default();
+        cooldowns.start_gcd(15473, &form, t0, &crate::spell::SpellModifiers::default());
+        std::thread::sleep(Duration::from_millis(40));
+        cooldown_event(15473, 10, &mut cooldowns);
+
+        // 20 ms past the original GCD's end: only a restart from the packet is still running.
+        let info = cooldowns.info(15473, 0, Some(&form), t0 + Duration::from_millis(1_520));
+        assert!(info.remaining_ms >= 10, "the GCD runs from the event");
+        assert!(info.start > t0, "and reads the event's start");
+    }
 
     /// A catalog holding one row, so the announce tests can name a real `Attributes` value.
     fn catalog_with(id: u32, display: benilla_formats::SpellDisplay) -> Spells {

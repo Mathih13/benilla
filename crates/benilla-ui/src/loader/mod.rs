@@ -307,8 +307,9 @@ impl Loader<'_> {
     /// name matters: unnamed, mlua's `#[track_caller]` `load` names it after this Rust line.
     fn run(&self, chunk: &[u8], path: &str) -> mlua::Result<()> {
         // The reference's file chunk name, `"@%s"` (`0x8716e0`, `0x704bc0`; a file name to
-        // `luaO_chunkid 0x6f5c40`), with `\` separators as in `crate::script::addon_chunk_name`.
-        self.run_named(chunk, &format!("@{}", path.replace('/', "\\")))
+        // `luaO_chunkid 0x6f5c40`), with `\` separators as in `crate::script::addon_chunk_name`,
+        // over the install path: an addon's files sit under `Interface\AddOns\`.
+        self.run_named(chunk, &format!("@{}", self.status_path(path)))
     }
 
     /// Run a chunk under a complete chunk name, for a producer whose name is not a path.
@@ -399,7 +400,7 @@ impl Loader<'_> {
                     // The reference names an inline body `"%s:<Scripts>"` (`0x871074`, formatted at
                     // `0x6ee0ff`) over the document's path with no `@`, so a raise reads
                     // `[string "Interface\FrameXML\Foo.xml:<Scripts>"]`, not a file path.
-                    let name = format!("{}:<Scripts>", self.path.replace('/', "\\"));
+                    let name = format!("{}:<Scripts>", self.status_path(&self.path));
                     if let Err(e) = self.run_named(&chunk, &name) {
                         self.report.raise(format!("inline <Script>: {e}"), &e);
                     }
@@ -513,6 +514,22 @@ impl Loader<'_> {
         drop(model);
         self.report.warnings.extend(warns);
         out
+    }
+
+    /// The `file=` loads of a texture region, in the order the reference runs them
+    /// (`0x76fe20`): each `inherits` level's own file with the wrap flag of that level's own
+    /// `<TexCoords>` (the flag is a local of the level's load, zeroed before its children,
+    /// `0x76fec6`), the template first. A level without a `file=` loads nothing.
+    pub(super) fn texture_file_loads(&self, raw: &Element) -> Vec<(String, bool)> {
+        let model = self.model();
+        let templates = model.framexml_templates.borrow();
+        framexml::inherit_chain(raw, &*templates)
+            .into_iter()
+            .filter_map(|level| {
+                let file = level.attr("file").filter(|f| !f.is_empty())?;
+                Some((file.to_string(), tex_coords_wrap(level)))
+            })
+            .collect()
     }
 
     /// [`Loader::expand`] for a region, only when `inherits=` names a registered element template:
@@ -739,6 +756,7 @@ impl Loader<'_> {
         // 7 · the post-load hook (`0x76a2f0`): close the window (`0x76a2ff`), then the nested
         //     <Frames>, whose OnLoads fire before ours (`0x76a060`).
         crate::script::visibility::set_load_window(self.lua(), wrapper, false);
+        crate::script::tooltip_post_load(self.lua(), wrapper);
         for frames_el in children_named(el, "Frames") {
             for child in &frames_el.children {
                 let expanded = self.expand(child);
@@ -885,6 +903,27 @@ pub(super) fn tex_coords_of(el: &Element) -> Option<(f32, f32, f32, f32)> {
     let tc = children_named(el, "TexCoords").next()?;
     let edge = |k: &str| tc.attr(k).and_then(|v| v.trim().parse::<f32>().ok());
     Some((edge("left")?, edge("right")?, edge("top")?, edge("bottom")?))
+}
+
+/// Whether an XML `<Texture>` loads its file with the wrap flag on: some `<TexCoords>` child has
+/// an edge below 0 or above 1 (`0x76fff0`-`0x77006b` set the flag at `0x770071`, which `0x77012d`
+/// passes to `0x770200`). An edge left out or empty keeps its default 0, 1, 0, 1 (`0x76fef5`),
+/// and a NaN fails both tests.
+pub(super) fn tex_coords_wrap(el: &Element) -> bool {
+    children_named(el, "TexCoords").any(|tc| {
+        [("left", 0.0), ("right", 1.0), ("top", 0.0), ("bottom", 1.0)]
+            .into_iter()
+            .any(|(k, default)| {
+                // Not `contains`: a NaN edge is in range here.
+                #[allow(clippy::manual_range_contains)]
+                let out_of_range = |edge: f32| edge < 0.0 || edge > 1.0;
+                let edge = tc
+                    .attr(k)
+                    .filter(|v| !v.is_empty())
+                    .map_or(default, crate::framexml::atof);
+                out_of_range(edge)
+            })
+    })
 }
 
 /// A `<FontHeight>`-style scalar: its `<AbsValue val=>` child, else its own `val=`.

@@ -13,5 +13,3 @@ roxmltree = "0.20"
 # The script host's Lua: benilla's own interpreter, through a crate that answers to the name
 # `mlua` (`src/lib.rs`).
 benilla-mlua = { path = "../benilla-mlua" }
-
-[features]

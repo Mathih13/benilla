@@ -149,9 +149,19 @@ fn on_command_result(
     }
 }
 
-fn on_member_stats(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>) {
+/// The record lands, then the unit events of what it changed go out (`0x5e54fa`), the old record
+/// the stored one or, for a member neither list holds, an empty one (`0x5e519b`).
+fn on_member_stats(
+    In(ev): In<SessionEvent>,
+    mut group: ResMut<GroupState>,
+    mut notices: MessageWriter<crate::field_watch::FieldNotice>,
+) {
     if let SessionEvent::PartyMemberStats { guid, full, info } = ev {
+        let old = group.stats.get(&guid).cloned().unwrap_or_default();
         group.apply_stats(guid, full, *info);
+        if let Some(new) = group.stats.get(&guid) {
+            notices.write_batch(super::records::record_notices(guid, &old, new));
+        }
     }
 }
 
@@ -229,7 +239,7 @@ fn leader_changed(
 ) {
     let own = self_guid
         .0
-        .and_then(|g| names.resolve(g, net_commands).map(str::to_string));
+        .and_then(|g| names.resolve_player(g, net_commands).map(str::to_string));
     push_group_lines(errors, group.apply_leader_changed(name, own.as_deref()));
 }
 
@@ -256,11 +266,11 @@ fn list(
 ) {
     let mut names_pending = false;
     for m in &members {
-        names_pending |= names.resolve(m.guid, net_commands).is_none();
+        names_pending |= names.resolve_player(m.guid, net_commands).is_none();
     }
     if group_type == GROUPTYPE_RAID && !members.is_empty() {
         if let Some(own) = self_guid.0 {
-            names_pending |= names.resolve(own, net_commands).is_none();
+            names_pending |= names.resolve_player(own, net_commands).is_none();
         }
     }
     // Taken before `apply_list` consumes the list; `seat_new_records` then treats a member with
@@ -872,5 +882,171 @@ mod tests {
 
         send(&mut group, member_status::ONLINE);
         assert!(group.stats[&far].is_online());
+    }
+
+    /// The group feed's mapping reaches the chat gate: `SMSG_GROUP_LIST` through its handler, the
+    /// roster feed into the VM, then `SendChatMessage` through the drain. We lead a raid, so RAID
+    /// goes out as RAID_LEADER (`0x49f3bf`); led by another member it goes out plain; ungrouped it
+    /// is refused (`0x49f379`).
+    #[test]
+    fn a_group_list_through_the_feed_decides_the_raid_leaders_chat_type() {
+        use super::super::pets::tests::{app_with, ME};
+        use crate::net::{ChatKind, Guid, SelfPlayer};
+        use benilla_ui::script::{UiScript, UnitState};
+        use bevy::ecs::system::RunSystemOnce;
+
+        let run =
+            |leader: u64, members: Vec<GroupMemberEntry>| -> (Vec<ChatKind>, Vec<&'static str>) {
+                let mut script = UiScript::new().unwrap();
+                script.set_unit(
+                    "player",
+                    Some(UnitState {
+                        exists: true,
+                        name: Some("Me".into()),
+                        ..Default::default()
+                    }),
+                );
+                let mut app = app_with(script);
+                let (tx, rx) = crossbeam_channel::unbounded();
+                app.insert_resource(NetCommands(tx));
+                app.init_resource::<UiErrorKeys>()
+                    .init_resource::<MessageSounds>()
+                    .init_resource::<QuestGiver>()
+                    .init_resource::<crate::ui_chat::AfkMirror>()
+                    .init_resource::<crate::cvars::Cvars>()
+                    .init_resource::<crate::ui_chat::ChannelState>()
+                    .insert_resource(SelfGuid(Some(ME)));
+                let me = app
+                    .world_mut()
+                    .spawn((SelfPlayer, Guid(ME), ObjectStore::default()))
+                    .id();
+                app.world_mut().resource_mut::<GuidIndex>().0.insert(ME, me);
+                let group_type = if members.is_empty() {
+                    0
+                } else {
+                    GROUPTYPE_RAID
+                };
+                app.world_mut()
+                    .run_system_once_with(
+                        on_list,
+                        SessionEvent::GroupList {
+                            group_type,
+                            own_flags: 0,
+                            members,
+                            leader,
+                            loot: None,
+                        },
+                    )
+                    .expect("the group-list handler");
+                app.update();
+                app.world_mut()
+                    .non_send_resource_mut::<UiScript>()
+                    .run(r#"SendChatMessage("go", "RAID")"#)
+                    .expect("lua");
+                app.world_mut()
+                    .run_system_once(crate::ui_chat::drain_addon_chat_sends)
+                    .expect("drain");
+                let sent = rx
+                    .try_iter()
+                    .filter_map(|c| match c {
+                        ClientCommand::Chat { kind, .. } => Some(kind),
+                        _ => None,
+                    })
+                    .collect();
+                let refused = app
+                    .world()
+                    .resource::<UiErrorKeys>()
+                    .0
+                    .iter()
+                    .map(|e| e.key)
+                    .collect();
+                (sent, refused)
+            };
+        let listed = |guid: u64, name: &str| GroupMemberEntry {
+            name: name.into(),
+            guid,
+            status: member_status::ONLINE,
+            flags: 0,
+        };
+
+        let (sent, refused) = run(ME, vec![listed(0x1001, "Aldwyn")]);
+        assert_eq!(sent, vec![ChatKind::RaidLeader], "{refused:?}");
+        let (sent, _) = run(0x1001, vec![listed(0x1001, "Aldwyn")]);
+        assert_eq!(sent, vec![ChatKind::Raid], "another member leads");
+        let (sent, refused) = run(0, vec![]);
+        assert!(sent.is_empty());
+        assert_eq!(refused, ["ERR_NOT_IN_RAID"]);
+    }
+
+    /// A stats packet lands its record, then writes the unit events of what it changed, against
+    /// the stored record; an unknown member's old record is the empty one.
+    #[test]
+    fn a_stats_packet_writes_the_events_of_the_record_it_changed() {
+        use crate::field_watch::FieldNotice;
+        use bevy::ecs::system::RunSystemOnce;
+        const MATE: u64 = 0x2001;
+        let mut app = App::new();
+        app.init_resource::<GroupState>()
+            .add_message::<FieldNotice>();
+        let mut packet = |full: bool, info: PartyMemberStatsInfo| -> Vec<FieldNotice> {
+            app.world_mut()
+                .run_system_once_with(
+                    on_member_stats,
+                    SessionEvent::PartyMemberStats {
+                        guid: MATE,
+                        full,
+                        info: Box::new(info),
+                    },
+                )
+                .unwrap();
+            app.world_mut()
+                .resource_mut::<Messages<FieldNotice>>()
+                .drain()
+                .collect()
+        };
+        let signal = |id: u16| FieldNotice::Signal { guid: MATE, id };
+        assert_eq!(
+            packet(
+                true,
+                PartyMemberStatsInfo {
+                    cur_hp: Some(100),
+                    level: Some(60),
+                    ..Default::default()
+                }
+            ),
+            [signal(28), signal(16)]
+        );
+        assert_eq!(
+            packet(
+                false,
+                PartyMemberStatsInfo {
+                    cur_hp: Some(90),
+                    ..Default::default()
+                }
+            ),
+            [signal(16)]
+        );
+        assert!(
+            packet(
+                false,
+                PartyMemberStatsInfo {
+                    cur_hp: Some(90),
+                    ..Default::default()
+                }
+            )
+            .is_empty(),
+            "an equal resend"
+        );
+        // A full packet starts from an empty record: what it leaves out reads as cleared.
+        assert_eq!(
+            packet(
+                true,
+                PartyMemberStatsInfo {
+                    cur_hp: Some(90),
+                    ..Default::default()
+                }
+            ),
+            [signal(28)]
+        );
     }
 }

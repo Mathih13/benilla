@@ -7,9 +7,7 @@ use benilla_protocol::messages::{buy_result, sell_result, VendorItem};
 use benilla_world::interact::WorldRightPress;
 use bevy::prelude::*;
 
-use benilla_ui::script::{
-    ItemStatsHead, MerchantItem, MerchantState, RepairCosts, ScriptValue, UiScript,
-};
+use benilla_ui::script::{ItemStatsHead, MerchantItem, MerchantState, RepairCosts, UiScript};
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
@@ -630,22 +628,21 @@ fn feed_merchant(
         player,
         vendor_npc_flags(&open, &units),
     );
-    // The vendor's name rides `MERCHANT_SHOW` and `MERCHANT_UPDATE` as arg1, and its landing alone
-    // re-fires `MERCHANT_UPDATE`; the reference fires both bare (`0x4fad92`, `0x4facaa`), and
-    // stock `MerchantFrame.lua:67` titles with `UnitName("NPC")`.
+    // `MERCHANT_SHOW` and `MERCHANT_UPDATE` carry no argument (`SignalEvent` `0x4fad92`,
+    // `0x4facaa`) and the stock window titles with `UnitName("NPC")` (`MerchantFrame.lua:67`), so
+    // the name's landing alone re-fires `MERCHANT_UPDATE`.
     let vendor_name = open
         .vendor
-        .and_then(|g| names.resolve(g, &commands).map(str::to_string));
+        .and_then(|g| names.resolve(&objects, g, &commands).map(str::to_string));
     let name_changed = *last_name != vendor_name;
     if fresh == *last && !name_changed {
         return;
     }
     script.set_merchant(fresh.clone());
-    let name_arg = || vec![ScriptValue::Str(vendor_name.clone().unwrap_or_default())];
     match (&*last, &fresh) {
-        (None, Some(_)) => script.fire_event("MERCHANT_SHOW", name_arg()),
+        (None, Some(_)) => script.fire_event("MERCHANT_SHOW", vec![]),
         // A change while open: an item or the name landed, or the stock moved.
-        (Some(_), Some(_)) => script.fire_event("MERCHANT_UPDATE", name_arg()),
+        (Some(_), Some(_)) => script.fire_event("MERCHANT_UPDATE", vec![]),
         // The core told the VM; a disconnect's clear tells it nothing.
         (Some(_), None) | (None, None) => {}
     }
@@ -949,6 +946,7 @@ pub(crate) mod purse_fixture {
     /// A VM with the sword at live id 16, backpack slot 1 and bank slot 1, and a tooltip `TT`.
     pub(crate) fn sword_vm() -> UiScript {
         let mut script = UiScript::new().unwrap();
+        crate::ui_script::test_ui::load_tooltip_template(&script);
         let mut inv: benilla_ui::script::InventorySlots = Default::default();
         inv[16] = Some(benilla_ui::script::InvSlotView {
             item_id: SWORD_ENTRY,
@@ -971,7 +969,7 @@ pub(crate) mod purse_fixture {
         script.set_container(crate::ui_items::BANK_CONTAINER, Some(bag));
         script
             .run(
-                r#"CreateFrame("GameTooltip", "TT"):SetOwner(CreateFrame("Frame"), "ANCHOR_NONE")"#,
+                r#"CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate"):SetOwner(CreateFrame("Frame"), "ANCHOR_NONE")"#,
             )
             .unwrap();
         script

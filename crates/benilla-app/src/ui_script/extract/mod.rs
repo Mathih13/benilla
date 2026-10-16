@@ -101,22 +101,43 @@ fn content_kind(c: &QuadContent) -> &'static str {
     }
 }
 
-/// Which axes run past the texture, the reference's tiling idiom (`SetTexCoord(0, n, 0, 1)`
-/// repeats the art n times), and so sample `Repeat`; a bounded axis on `Repeat` would filter its
-/// edge against the opposite one. Its tolerance must match [`uv_clamp_window`]'s.
-pub(crate) fn tiling_axes(uv: &UvRect) -> (bool, bool) {
-    let past = |axis: usize| {
-        uv.corners
-            .iter()
-            .any(|c| !(-0.001..=1.001).contains(&c[axis]))
-    };
-    (past(0), past(1))
+/// Where a UI sprite comes from: the store's clamped and repeating images of one file.
+trait SpriteSource {
+    fn clamped(&mut self, path: &str, images: &mut Assets<Image>) -> Option<Handle<Image>>;
+    fn wrapped(&mut self, path: &str, images: &mut Assets<Image>) -> Option<Handle<Image>>;
+}
+
+impl SpriteSource for WorldAssets {
+    fn clamped(&mut self, path: &str, images: &mut Assets<Image>) -> Option<Handle<Image>> {
+        self.sprite_texture(path, images)
+    }
+
+    fn wrapped(&mut self, path: &str, images: &mut Assets<Image>) -> Option<Handle<Image>> {
+        self.sprite_texture_wrapped(path, images)
+    }
+}
+
+/// The image a texture quad samples: the repeating one when its file loaded with the wrap flag,
+/// else the clamped one (`0x770200`'s second argument, bits 3 and 4 of the flags word), whatever
+/// its coordinates say.
+fn sprite_for_wrap(
+    source: &mut impl SpriteSource,
+    path: &str,
+    wrap: bool,
+    images: &mut Assets<Image>,
+) -> Option<Handle<Image>> {
+    if wrap {
+        source.wrapped(path, images)
+    } else {
+        source.clamped(path, images)
+    }
 }
 
 /// The [`UiQuad::uv_clamp`] window of an atlas crop, inset half a texel so a magnified cell does
 /// not filter in its neighbour (in `ChatBubble-Backdrop`, a white alpha-0 column: a pale line
-/// through the speech bubble). A tiling axis is left alone, or each period would land short and
-/// walk the art; a whole-texture axis needs no window.
+/// through the speech bubble). An axis past the texture is left alone (repeating, each period
+/// would land short and walk the art; clamping, the sampler's edge is the window); a
+/// whole-texture axis needs no window.
 fn uv_clamp_window(uv: &UvRect, size: (u32, u32)) -> Option<[f32; 4]> {
     let mut out = [1.0, 1.0, 0.0, 0.0]; // both axes off: `min > max`
     let mut any = false;
@@ -436,13 +457,15 @@ pub(super) fn tick_script(
 ) {
     pass.live = false;
     let Some(mut script) = script else {
-        // No VM, no UI sampling a booth pane: a stranded pane would keep the paper-doll camera
-        // rendering behind a dead UI.
+        // No VM, no UI sampling a booth pane: a stranded pane would keep its camera rendering
+        // behind a dead UI.
         booths.panes.0.clear();
+        booths.character.reset(0);
         return;
     };
     let Ok(window) = window.single() else {
         booths.panes.0.clear();
+        booths.character.reset(0);
         return;
     };
     let (w, h) = (window.width(), window.height());
@@ -979,9 +1002,10 @@ pub(super) fn paint_script(
     prev.text_ui = text_ui.clone();
     prev.portraits = booths.images.0.clone();
     prev.extracted = extracted.clone();
-    // Cleared only on the full-conversion path: a settled frame's map is still true, and
-    // clearing it would put the body panes' cameras to sleep.
+    // Cleared only on the full-conversion path: a settled frame's maps are still true, and
+    // clearing them would put the character panes' cameras to sleep.
     booths.panes.0.clear();
+    booths.character.reset(script.session());
     let mut spans: Vec<u32> = Vec::with_capacity(prev.extracted.len());
     for eq in extracted {
         convert_entry(
@@ -1145,11 +1169,12 @@ fn convert_entry(
         }
         // A `<Model>`/`<PlayerModel>` pane draws itself, as the stock files declare a bare pane
         // with no Texture: a glue `ModelFFX` is the glue booth's scene, a file pane is a model
-        // tile, a unit pane samples its window's body bake square
-        // ([`crate::portrait::model_pane_booth`]), and an unclaimed pane draws nothing.
+        // tile, a character pane draws its own booth's copy of its subject
+        // (`crate::portrait::panes`), and a bare `Model` draws nothing.
         QuadContent::ModelPane {
             handle,
             name,
+            character,
             model,
             facing,
             model_scale,
@@ -1193,6 +1218,27 @@ fn convert_entry(
                     ..default()
                 });
                 return;
+            }
+            // A character pane publishes an idempotent request; `portrait::panes` builds the
+            // pane's booth and draws its quad each frame the engine lists the pane with a copy.
+            // Published with a file too: a `SetUnit` pending over it builds the copy that
+            // replaces the file.
+            if character && rect.width() > 0.0 && rect.height() > 0.0 {
+                let dpi = booths.tiles.dpi.max(0.01);
+                booths.character.insert(
+                    handle,
+                    crate::portrait::PaneRequest {
+                        rect,
+                        z_key: eq.z,
+                        // The copy draws at the widget's own alpha (`0x76d120`).
+                        alpha: own_alpha,
+                        clip,
+                        size_px: UVec2::new(
+                            (rect.width() * dpi).round().max(1.0) as u32,
+                            (rect.height() * dpi).round().max(1.0) as u32,
+                        ),
+                    },
+                );
             }
             // A file pane publishes an idempotent tile request; `ui_models::compose_tiles` draws
             // its quad each frame, so a cell packed later needs no re-conversion.
@@ -1252,39 +1298,7 @@ fn convert_entry(
                         tiles.atlas_size
                     );
                 }
-                return;
             }
-            let Some(slot) = name.as_deref().and_then(crate::portrait::model_pane_booth) else {
-                return;
-            };
-            // The aspect is published before the readiness check: the bake waits on the publish.
-            if rect.height() > 0.0 {
-                booths
-                    .panes
-                    .0
-                    .insert(slot.to_string(), rect.width() / rect.height());
-            }
-            // The bake is premultiplied; the 2D stand-in while a model streams is straight alpha.
-            let (handle, premultiplied) = match booths.images.0.get(slot) {
-                Some(PortraitSource::Live(h)) => (Some(h.clone()), true),
-                Some(PortraitSource::File(p)) => (
-                    assets.as_mut().and_then(|a| a.sprite_texture(p, images)),
-                    false,
-                ),
-                None => (None, false),
-            };
-            let Some(handle) = handle else {
-                return;
-            };
-            out.push(UiQuad {
-                rect,
-                z_key: eq.z,
-                texture: Some(handle),
-                color: [1.0, 1.0, 1.0, eq.alpha],
-                premultiplied,
-                clip,
-                ..default()
-            });
         }
         QuadContent::Texture {
             path,
@@ -1292,6 +1306,7 @@ fn convert_entry(
             gradient,
             additive,
             tex_coords,
+            wrap,
             circular,
             portrait_unit,
             rotation,
@@ -1353,14 +1368,12 @@ fn convert_entry(
             // (a data-less run) the quad draws untextured.
             //
             // `SetTexCoord`'s edges map to raw UV corners, so a mirrored slice (`left > right`)
-            // keeps its flip; resolved before the handle because the wrap mode follows it.
+            // keeps its flip. The coordinates never decide the wrap: the file's load did.
             let uv = match tex_coords {
                 Some(TexCoords::Rect(edges)) => UvRect::from_tex_coords(edges),
                 Some(TexCoords::Corners(corners)) => UvRect::from_corners(corners),
                 None => UvRect::FULL,
             };
-            // A slice past the texture tiles (`BonusActionBarFrame.lua:173`), on that axis alone.
-            let wrap = tiling_axes(&uv);
             let handle = match (path.as_deref(), assets.as_mut()) {
                 (Some(p), Some(a)) => {
                     let resolved = if p == benilla_ui::script::nameplate::BORDER_TEXTURE {
@@ -1391,10 +1404,8 @@ fn convert_entry(
                     } else if circular {
                         // The circle-masked variant (`SetPortraitToTexture`).
                         a.portrait_texture(p, images)
-                    } else if wrap != (false, false) {
-                        a.sprite_texture_wrapped(p, wrap, images)
                     } else {
-                        a.sprite_texture(p, images)
+                        sprite_for_wrap(&mut **a, p, wrap, images)
                     };
                     if resolved.is_none() {
                         return;
@@ -1572,10 +1583,10 @@ fn cursor_icon_quad(pos: Vec2, texture: Handle<Image>) -> UiQuad {
     }
 }
 
-/// [`uv_clamp_window`] and [`tiling_axes`] on shapes the stock UI draws.
+/// [`uv_clamp_window`] on shapes the stock UI draws.
 #[cfg(test)]
 mod uv_clamp_tests {
-    use super::{tiling_axes, uv_clamp_window, UvRect};
+    use super::{uv_clamp_window, UvRect};
 
     /// `POIIcons` is 128², and a world-map POI samples its cell (7, 1).
     #[test]
@@ -1592,40 +1603,6 @@ mod uv_clamp_tests {
     #[test]
     fn the_whole_texture_asks_for_no_window() {
         assert!(uv_clamp_window(&UvRect::FULL, (128, 128)).is_none());
-    }
-
-    /// The stance bar's middle strip, `SetTexCoord(0, n-2, 0, 1)` (`BonusActionBarFrame.lua:173`).
-    #[test]
-    fn a_one_axis_strip_wraps_that_axis_only() {
-        assert_eq!(
-            tiling_axes(&UvRect::from_tex_coords([0.0, 2.0, 0.0, 1.0])),
-            (true, false)
-        );
-        assert_eq!(
-            tiling_axes(&UvRect::from_tex_coords([0.0, 1.0, 0.0, 3.0])),
-            (false, true)
-        );
-    }
-
-    #[test]
-    fn a_bounded_mapping_tiles_nothing() {
-        assert_eq!(
-            tiling_axes(&UvRect::from_tex_coords([0.0, 1.0, 0.0, 1.0])),
-            (false, false)
-        );
-        assert_eq!(tiling_axes(&UvRect::FULL), (false, false));
-        assert_eq!(
-            tiling_axes(&UvRect::from_tex_coords([0.453125, 0.875, 0.0, 1.0])),
-            (false, false)
-        );
-    }
-
-    #[test]
-    fn a_two_axis_tile_wraps_both() {
-        assert_eq!(
-            tiling_axes(&UvRect::from_tex_coords([0.0, 4.0, 0.0, 2.5])),
-            (true, true)
-        );
     }
 
     #[test]
@@ -1717,6 +1694,7 @@ mod clip_plumb_tests {
         app.init_resource::<Assets<Image>>();
         app.init_resource::<PortraitImages>();
         app.init_resource::<crate::portrait::BoothPanes>();
+        app.init_resource::<crate::portrait::PaneRequests>();
         app.init_resource::<crate::ui_models::UiModelTiles>();
         app.init_resource::<crate::minimap::MinimapWidget>();
         app.init_resource::<crate::ui_script::UiFrameCost>();
@@ -1802,6 +1780,7 @@ mod clip_plumb_tests {
         app.init_resource::<Assets<Image>>();
         app.init_resource::<PortraitImages>();
         app.init_resource::<crate::portrait::BoothPanes>();
+        app.init_resource::<crate::portrait::PaneRequests>();
         app.init_resource::<crate::ui_models::UiModelTiles>();
         app.init_resource::<crate::minimap::MinimapWidget>();
         app.init_resource::<crate::ui_script::UiFrameCost>();
@@ -2032,6 +2011,7 @@ mod extract_gate_tests {
         app.init_resource::<Assets<Image>>();
         app.init_resource::<PortraitImages>();
         app.init_resource::<crate::portrait::BoothPanes>();
+        app.init_resource::<crate::portrait::PaneRequests>();
         app.init_resource::<crate::ui_models::UiModelTiles>();
         app.init_resource::<crate::minimap::MinimapWidget>();
         app.init_resource::<crate::ui_script::UiFrameCost>();
@@ -2196,56 +2176,57 @@ mod extract_gate_tests {
         );
     }
 
-    /// `PaperDollFrame.xml:204` declares a bare `<PlayerModel name="CharacterModelFrame">`; a pane
-    /// no window claims ([`crate::portrait::model_pane_booth`]) must not borrow a bake.
+    /// `PaperDollFrame.xml:204` declares a bare `<PlayerModel name="CharacterModelFrame">`. Every
+    /// character pane, the stock window's or an addon's, publishes its own composite request at
+    /// its own rect, and draws no quad here: its booth's composite does (`crate::portrait`). A
+    /// plain `Model` with no file publishes nothing.
     #[test]
-    fn a_named_model_pane_samples_its_booth_and_an_unclaimed_one_draws_nothing() {
+    fn every_character_pane_publishes_its_own_request_and_a_bare_model_none() {
         let mut app = app_from_script(
             r#"
             local doll = CreateFrame("PlayerModel", "CharacterModelFrame")
             doll:SetPoint("TOPLEFT", 0, 0)
             doll:SetWidth(233); doll:SetHeight(224)
             doll:SetUnit("player")
-            local stray = CreateFrame("PlayerModel", "SomeAddonsModelPane")
+            local stray = CreateFrame("DressUpModel", "SomeAddonsModelPane")
             stray:SetPoint("TOPLEFT", 300, 0)
-            stray:SetWidth(233); stray:SetHeight(224)
-            stray:SetUnit("player")
+            stray:SetWidth(100); stray:SetHeight(200)
+            local bare = CreateFrame("Model", "Bare")
+            bare:SetPoint("TOPLEFT", 500, 0)
+            bare:SetWidth(50); bare:SetHeight(50)
         "#,
-        );
-        let bake = app
-            .world_mut()
-            .resource_mut::<Assets<Image>>()
-            .add(Image::default());
-        app.world_mut().resource_mut::<PortraitImages>().0.insert(
-            "paperdoll".to_string(),
-            crate::portrait::PortraitSource::Live(bake.clone()),
         );
         app.update();
 
-        let quads = &app.world().resource::<UiQuads>().quads;
-        let panes: Vec<_> = quads
-            .iter()
-            .filter(|q| q.texture.as_ref() == Some(&bake))
-            .collect();
+        let script = app.world().non_send_resource::<UiScript>();
+        let handle = |name: &str| script.frame_handle(name).expect(name);
+        let (doll, stray, bare) = (
+            handle("CharacterModelFrame"),
+            handle("SomeAddonsModelPane"),
+            handle("Bare"),
+        );
+        let requests = app.world().resource::<crate::portrait::PaneRequests>();
+        let doll = requests.of(doll).expect("the paper doll publishes");
         assert_eq!(
-            panes.len(),
-            1,
-            "exactly the claimed pane draws the paper doll's bake"
+            doll.size_px,
+            UVec2::new(233, 224),
+            "its own rect, in device px"
+        );
+        assert!((doll.alpha - 1.0).abs() < 1e-6);
+        let stray = requests.of(stray).expect("an addon's pane publishes too");
+        assert_eq!(stray.size_px, UVec2::new(100, 200));
+        assert!(stray.rect.min.x > doll.rect.max.x, "at its own place");
+        assert!(
+            requests.of(bare).is_none(),
+            "a bare Model is no character pane"
         );
         assert!(
-            panes[0].premultiplied,
-            "a render-target bake carries premultiplied colour"
-        );
-        let aspect = app
-            .world()
-            .resource::<crate::portrait::BoothPanes>()
-            .0
-            .get("paperdoll")
-            .copied()
-            .expect("the pane publishes its aspect");
-        assert!(
-            (aspect - 233.0 / 224.0).abs() < 0.01,
-            "the pane's own rect is the aspect, got {aspect}"
+            app.world()
+                .resource::<UiQuads>()
+                .quads
+                .iter()
+                .all(|q| q.texture.is_none()),
+            "no pane draws a quad of its own in the extract"
         );
     }
 
@@ -2507,5 +2488,35 @@ mod extract_gate_tests {
             0,
             "a moved raster environment forbids splicing"
         );
+    }
+}
+
+/// [`sprite_for_wrap`]: the load-time flag alone picks the sampler.
+#[cfg(test)]
+mod sprite_wrap_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Calls(Vec<&'static str>);
+
+    impl SpriteSource for Calls {
+        fn clamped(&mut self, _: &str, _: &mut Assets<Image>) -> Option<Handle<Image>> {
+            self.0.push("clamped");
+            None
+        }
+
+        fn wrapped(&mut self, _: &str, _: &mut Assets<Image>) -> Option<Handle<Image>> {
+            self.0.push("wrapped");
+            None
+        }
+    }
+
+    #[test]
+    fn a_wrapped_file_repeats_and_any_other_clamps() {
+        let mut images = Assets::<Image>::default();
+        let mut calls = Calls::default();
+        sprite_for_wrap(&mut calls, "Interface\\A", true, &mut images);
+        sprite_for_wrap(&mut calls, "Interface\\B", false, &mut images);
+        assert_eq!(calls.0, ["wrapped", "clamped"]);
     }
 }

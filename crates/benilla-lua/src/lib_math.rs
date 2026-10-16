@@ -169,15 +169,16 @@ fn max(vm: &mut Vm, nargs: usize) -> R<usize> {
 
 /// glibc's `rand()`: `random_r`'s additive feedback generator (`TYPE_3`, `r[i] = r[i-3] +
 /// r[i-31]`), as the script host's 5.1 build called it. Its state is the process's in C, shared by
-/// every VM; here it is the thread's, the one the UI's VMs run on.
-struct GlibcRand {
+/// every VM; here it is the VM's own, so a fork or a clone draws its own sequence.
+#[derive(Clone)]
+pub(crate) struct GlibcRand {
     r: [i32; 34],
     i: usize,
 }
 
 impl GlibcRand {
     /// `srandom_r`: the 31 words from `seed` by `16807 * w % (2^31 - 1)`, then 310 outputs dropped.
-    fn seeded(seed: u32) -> GlibcRand {
+    pub(crate) fn seeded(seed: u32) -> GlibcRand {
         let mut r = [0i32; 34];
         let mut word = if seed == 0 { 1 } else { seed as i32 };
         r[0] = word;
@@ -209,12 +210,8 @@ impl GlibcRand {
     }
 }
 
-thread_local! {
-    static RAND: std::cell::RefCell<GlibcRand> = std::cell::RefCell::new(GlibcRand::seeded(1));
-}
-
-fn rand(_vm: &mut Vm) -> u32 {
-    RAND.with(|g| g.borrow_mut().next())
+fn rand(vm: &mut Vm) -> u32 {
+    vm.rand.next()
 }
 
 /// glibc's `RAND_MAX`.
@@ -247,7 +244,7 @@ fn random(vm: &mut Vm, nargs: usize) -> R<usize> {
 
 fn randomseed(vm: &mut Vm, nargs: usize) -> R<usize> {
     let s = vm.check_int(nargs, 1)?;
-    RAND.with(|g| *g.borrow_mut() = GlibcRand::seeded(s as u32));
+    vm.rand = GlibcRand::seeded(s as u32);
     Ok(0)
 }
 

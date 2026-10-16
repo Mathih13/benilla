@@ -16,7 +16,7 @@
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
@@ -98,9 +98,15 @@ thread_local! {
     /// The family and VM of the callback running now, if any.
     static RUNNING: Cell<(u64, *mut Vm)> = const { Cell::new((0, std::ptr::null_mut())) };
     /// Each panic a callback raised as a Lua error, by its error value's tag: the payload until
-    /// it resumes in Rust, and its text for `tostring`.
-    static PANICS: RefCell<HashMap<u64, Panic>> = RefCell::new(HashMap::new());
+    /// it resumes in Rust, and its text for `tostring`. Tags rise, so the first entry is the
+    /// oldest; a Lua `pcall` that swallows a panic leaves its entry, and only the latest
+    /// [`PANICS_KEPT`] are kept.
+    static PANICS: RefCell<BTreeMap<u64, Panic>> = const { RefCell::new(BTreeMap::new()) };
 }
+
+// ponytail: a bound in place of a `__gc`, which the VM lacks; an older panic's error loses its
+// text and payload, and a callback panicking that often is already a bug report.
+const PANICS_KEPT: usize = 64;
 
 /// A panic raised as a Lua error: its payload until it resumes, and its text.
 type Panic = (Option<Box<dyn Any + Send>>, std::string::String);
@@ -149,7 +155,13 @@ fn raise_panic(vm: &mut Vm, payload: Box<dyn Any + Send>) -> LuaError {
         "<panic>".to_owned()
     };
     let tag = PANIC_TAG | NEXT_PANIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    PANICS.with(|p| p.borrow_mut().insert(tag, (Some(payload), text)));
+    PANICS.with(|p| {
+        let mut p = p.borrow_mut();
+        p.insert(tag, (Some(payload), text));
+        while p.len() > PANICS_KEPT {
+            p.pop_first();
+        }
+    });
     let meta = panic_meta(vm);
     let u = vm.new_user(tag, Some(meta));
     vm.throw(u)
@@ -662,7 +674,7 @@ impl Lua {
     // ── the collector ────────────────────────────────────────────────────────────────────────
 
     pub fn used_memory(&self) -> usize {
-        self.vm().heap.bytes
+        self.vm().heap.bytes()
     }
 
     pub fn gc_collect(&self) -> Result<()> {
@@ -678,7 +690,7 @@ impl Lua {
     /// The stack level `level` up, for a traceback: `f` reads it.
     pub fn inspect_stack<R>(&self, level: usize, f: impl FnOnce(&Debug) -> R) -> Option<R> {
         let info = self.vm().frame_info(level)?;
-        Some(f(&Debug { info }))
+        Some(f(&Debug { info, lua: self }))
     }
 
     /// Run `callback` about every `triggers.every_nth_instruction` instructions.
@@ -694,7 +706,7 @@ impl Lua {
                 in_callback(&lua, vm, || {
                     let info = lua.vm().frame_info(0).unwrap_or_default();
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        callback(&lua, &Debug { info })
+                        callback(&lua, &Debug { info, lua: &lua })
                     }));
                     let out = match r {
                         Ok(Ok(_)) => Ok(()),
@@ -979,7 +991,7 @@ impl Value {
             Value::Nil => "nil".into(),
             Value::Boolean(b) => b.to_string(),
             Value::Integer(i) => i.to_string(),
-            Value::Number(n) => benilla_lua::number::fmt_g14(*n),
+            Value::Number(n) => benilla_lua::fmt_g14(*n),
             Value::String(s) => s.to_string_lossy(),
             other => format!("{}: {:p}", other.type_name(), other.to_pointer()),
         })
@@ -1329,7 +1341,7 @@ impl ObjectLike for Table {
         let t = self.0.get();
         let s = lua
             .vm()
-            .protected(|vm| benilla_lua::lib_base::tostring_value(vm, t))
+            .protected(|vm| benilla_lua::tostring_value(vm, t))
             .map_err(|e| lua.error_from(e))?;
         Ok(lua.vm().display(s))
     }
@@ -1423,7 +1435,7 @@ impl String {
     fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         // SAFETY: as `RefH::get`; `f` holds nothing that reaches the VM.
         let vm = unsafe { &*self.0.vm() };
-        let s = vm.rooted(self.0.id).as_str().expect("a string handle");
+        let s = self.0.get().as_str().expect("a string handle");
         f(vm.heap.str(s))
     }
 
@@ -1939,8 +1951,9 @@ impl<T> DerefMut for AppDataRefMut<'_, T> {
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 /// One stack level.
-pub struct Debug {
+pub struct Debug<'a> {
     info: benilla_lua::vm::FrameInfo,
+    lua: &'a Lua,
 }
 
 pub struct DebugSource<'a> {
@@ -1956,7 +1969,12 @@ pub struct DebugNames<'a> {
     pub name_what: Option<&'static str>,
 }
 
-impl Debug {
+impl Debug<'_> {
+    /// The function running at this level; a tail call's level names none, as 5.1's does.
+    pub fn function(&self) -> Function {
+        Function(self.lua.make_ref(self.info.func))
+    }
+
     pub fn source(&self) -> DebugSource<'_> {
         let i = &self.info;
         let (source, short_src) = match (i.what, &i.source) {

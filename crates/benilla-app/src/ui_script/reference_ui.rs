@@ -95,15 +95,16 @@ fn named_addon(name: &str, files: Vec<String>) -> Addon {
     )
 }
 
-/// One file's bytes off the player's patch chain, by internal path. Bytes, not a string: Lua
-/// takes a chunk as stored, and a cp1252 file is not valid UTF-8.
+/// One file's bytes as an interface file opens (`SFile::Load`, flag 1): a loose file of the
+/// player's install, then the patch chain, by internal path. Bytes, not a string: Lua takes a
+/// chunk as stored, and a cp1252 file is not valid UTF-8.
 pub(super) fn read(req: &str) -> Option<Vec<u8>> {
     #[cfg(test)]
     if let Some(overlaid) = fixture::read(req) {
         return overlaid;
     }
-    if let Some(bytes) = read_loose(req) {
-        return Some(bytes);
+    if let Some(answer) = read_loose(&benilla_formats::install_index().get(), req) {
+        return answer;
     }
     let chain = chain()?;
     match chain.read(req) {
@@ -115,77 +116,102 @@ pub(super) fn read(req: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// A bare file name off the install's own folders, read-only: Storm's open tries the install
-/// directory (its base path `0xc52418`) and its `Data\` before the archives, which is where the
-/// login screen's agreements (`<SimpleHTML file="eula.html">`) are found, loose in `Data\`. The
-/// lookup ignores case, as the reference's file system does, so `credits.html` finds
-/// `Data/Credits.html` on a case-sensitive one. Only a bare name looks on disk; every chain path
-/// keeps reading the archives alone.
-fn read_loose(req: &str) -> Option<Vec<u8>> {
-    if req.is_empty() || req.contains(['\\', '/']) || req.contains("..") {
-        return None;
-    }
-    static INDEX: OnceLock<std::collections::HashMap<String, std::path::PathBuf>> = OnceLock::new();
-    let index = INDEX.get_or_init(|| {
-        benilla_formats::wow_data()
-            .map(|data| {
-                let install = data.parent().map(std::path::Path::to_path_buf);
-                let dirs: Vec<std::path::PathBuf> =
-                    install.into_iter().chain(std::iter::once(data)).collect();
-                loose_index(&dirs)
-            })
-            .unwrap_or_default()
-    });
-    std::fs::read(index.get(&req.to_ascii_lowercase())?).ok()
+/// The install's answer for `req`, read-only, or `None` to ask the chain: Storm's open asks its
+/// index of the install folder and its `Data\` (`0x647f89`) before the archives (`0x648116`), so
+/// a loose copy of an interface file shadows the archive's, and the login screen's agreements
+/// (`<SimpleHTML file="eula.html">`) are found loose in `Data\`. A file the index holds that
+/// will not read answers `Some(None)`, with no turn to the chain (`0x647865`). `/` is read as `\`,
+/// where the index misses a name written with `/`: a `.toc` line and an `<Include>` or
+/// `<Script file=>` reach here joined by `benilla_ui::loader::join_ref`, which writes every
+/// separator as `/`, so the name's own is gone.
+fn read_loose(index: &benilla_formats::LooseIndex, req: &str) -> Option<Option<Vec<u8>>> {
+    let file = index.resolve(&req.replace('/', "\\"), benilla_formats::LooseOpen::Index)?;
+    Some(file.read())
 }
 
-/// The files directly in `dirs` by lowercased name, read once; an earlier directory wins a name
-/// two share.
-fn loose_index(
-    dirs: &[std::path::PathBuf],
-) -> std::collections::HashMap<String, std::path::PathBuf> {
-    let mut index = std::collections::HashMap::new();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                index.entry(name.to_ascii_lowercase()).or_insert(path);
-            }
-        }
+/// What opening the chain has to say, kept until something can log it.
+enum Notice {
+    Warn(String),
+    Error(String),
+}
+
+/// The chain `data` names, and the one thing to say if there is none.
+fn open(data: Option<std::path::PathBuf>) -> (Option<Chain>, Option<Notice>) {
+    let Some(data) = data else {
+        return (
+            None,
+            Some(Notice::Warn(
+                "ui_script: no client data — the stock interface, `FrameXML.toc` and every \
+                 file it lists, is absent off the player's install, so its windows do not \
+                 exist and addons that call their globals will raise"
+                    .to_string(),
+            )),
+        );
+    };
+    match benilla_formats::open_chain(&data) {
+        Ok(chain) => (Some(chain), None),
+        Err(e) => (
+            None,
+            Some(Notice::Error(format!(
+                "ui_script: opening the patch chain to source the reference UI: {e:#}"
+            ))),
+        ),
     }
-    index
+}
+
+/// The notice of the open, until [`chain`] logs it.
+static NOTICE: std::sync::Mutex<Option<Notice>> = std::sync::Mutex::new(None);
+
+/// The patch chain, opened once per process, logging nothing: the window is born before the log
+/// plugin exists ([`boot_client_locale`]), where a message would be dropped.
+fn chain_quiet() -> Option<&'static Chain> {
+    static CHAIN: OnceLock<Option<Chain>> = OnceLock::new();
+    CHAIN
+        .get_or_init(|| {
+            let (chain, notice) = open(benilla_formats::wow_data());
+            *NOTICE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = notice;
+            chain
+        })
+        .as_ref()
 }
 
 /// The player's patch chain, opened once per process and shared by every VM. Process-local, not
 /// the one [`benilla_assets`] holds: tests, the addon harness and a bare `UiScript` load the
-/// interface with no Bevy world to ask.
+/// interface with no Bevy world to ask. The open's one message is logged here, the first time
+/// anything past start-up asks.
 fn chain() -> Option<&'static Chain> {
-    static CHAIN: OnceLock<Option<Chain>> = OnceLock::new();
-    CHAIN
-        .get_or_init(|| {
-            let Some(data) = benilla_formats::wow_data() else {
-                warn!(
-                    "ui_script: no client data — the stock interface, `FrameXML.toc` and every \
-                     file it lists, is absent off the player's install, so its windows do not \
-                     exist and addons that call their globals will raise"
-                );
-                return None;
-            };
-            match benilla_formats::open_chain(&data) {
-                Ok(chain) => Some(chain),
-                Err(e) => {
-                    error!("ui_script: opening the patch chain to source the reference UI: {e:#}");
-                    None
-                }
-            }
-        })
-        .as_ref()
+    let chain = chain_quiet();
+    let notice = NOTICE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    match notice {
+        Some(Notice::Warn(m)) => warn!("{m}"),
+        Some(Notice::Error(m)) => error!("{m}"),
+        None => {}
+    }
+    chain
+}
+
+/// [`client_locale`] for the one caller that runs before the log plugin: the primary window's
+/// birth. It opens the same chain, but whatever the open has to say waits for [`chain`].
+pub(crate) fn boot_client_locale() -> benilla_formats::Locale {
+    chain_quiet().map(Chain::locale).unwrap_or_default()
+}
+
+/// The client's locale, from the player's `Wow.ini` as start-up reads it once (`0x402350`): the
+/// default, enUS's column and tag 0, with no install. Every VM answers `GetLocale` and picks an
+/// addon's metadata by its index, the logon carries its tag, and the name cache keys on it.
+pub(crate) fn client_locale() -> benilla_formats::Locale {
+    chain().map(Chain::locale).unwrap_or_default()
+}
+
+/// `Wow.ini`'s `Region`, which start-up hands the character name check once (`0x402b7f`); 0 with
+/// no install, the file or the key. Signed, as the name check compares it (`0x6c9a78`).
+pub(crate) fn client_region() -> i32 {
+    chain().map_or(0, |c| benilla_formats::client_region(c) as i32)
 }
 
 /// Files a test lays over the chain, per test thread: an entry with bytes reads as a chain file,
@@ -237,22 +263,68 @@ fn is_word(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fire_scan;
     use benilla_ui::script::UiScript;
 
-    /// A bare name finds its loose file whatever the case on disk, the install root ahead of
-    /// `Data`.
+    /// The open's message is returned, not logged, so a caller before the log plugin loses
+    /// nothing: no install is a warning naming the missing interface, a folder with no archives
+    /// an error carrying the cause, and a good open says nothing.
     #[test]
-    fn the_loose_index_ignores_case_and_prefers_the_install_root() {
-        let tmp = std::env::temp_dir().join(format!("benilla-loose-{}", std::process::id()));
-        let data = tmp.join("Data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join("Credits.html"), b"data").unwrap();
-        std::fs::write(data.join("eula.html"), b"data").unwrap();
-        std::fs::write(tmp.join("EULA.html"), b"root").unwrap();
-        let index = super::loose_index(&[tmp.clone(), data.clone()]);
-        let read = |name: &str| std::fs::read(&index[name]).unwrap();
-        assert_eq!(read("credits.html"), b"data");
-        assert_eq!(read("eula.html"), b"root");
+    fn the_open_returns_its_message_for_the_first_logging_caller() {
+        let (chain, notice) = super::open(None);
+        assert!(chain.is_none());
+        assert!(
+            matches!(&notice, Some(super::Notice::Warn(m)) if m.contains("no client data")),
+            "no install"
+        );
+        let empty = std::env::temp_dir().join(format!("benilla-empty-data-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let (chain, notice) = super::open(Some(empty.clone()));
+        std::fs::remove_dir_all(&empty).ok();
+        assert!(chain.is_none());
+        assert!(
+            matches!(&notice, Some(super::Notice::Error(m)) if m.contains("opening the patch chain")),
+            "no archives"
+        );
+        if let Some(data) = benilla_formats::wow_data() {
+            let (chain, notice) = super::open(Some(data));
+            assert!(
+                chain.is_some() && notice.is_none(),
+                "an install opens silently"
+            );
+        }
+    }
+
+    /// An interface file loose in the install answers by its path below the install folder or
+    /// `Data\`, whatever its case and separators, ahead of the chain; a bare name finds a file at
+    /// either top; a copy of `Interface\FrameXML` below the install folder is never read.
+    #[test]
+    fn a_loose_interface_file_answers_ahead_of_the_chain() {
+        let tmp = std::env::temp_dir().join(format!(
+            "benilla-ui-loose-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let put = |rel: &str, body: &[u8]| {
+            let path = tmp.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        put("Data/Credits.html", b"data");
+        put("Data/eula.html", b"data");
+        put("EULA.html", b"root");
+        put("Data/Interface/Glues/Credits/Credits.xml", b"loose xml");
+        put("Interface/FrameXML/UIParent.lua", b"moved aside");
+        let index = benilla_formats::LooseIndex::build(Some(&tmp), &tmp.join("Data"));
+        let read = |name: &str| super::read_loose(&index, name).map(Option::unwrap);
+        assert_eq!(read("credits.html").as_deref(), Some(&b"data"[..]));
+        assert_eq!(read("eula.html").as_deref(), Some(&b"root"[..]));
+        assert_eq!(
+            read("Interface/Glues/Credits/credits.XML").as_deref(),
+            Some(&b"loose xml"[..])
+        );
+        assert_eq!(read("Interface\\FrameXML\\UIParent.lua"), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1042,7 +1114,7 @@ mod tests {
                 .collect()
         };
 
-        // Every function each chain entry and its same-name `.lua` define.
+        // Every function each chain entry and the files it loads define.
         let toc = &super::super::manifest::manifest_files();
         // Load order: each manifest entry at its line, ours included (`ours_wins` reads both
         // sides), then each reached addon's files after everything.
@@ -1064,21 +1136,13 @@ mod tests {
         let mut chain_frames: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for entry in &chain {
-            let leaf = entry.rsplit(['\\', '/']).next().unwrap_or(entry);
-            let mut cands = vec![entry.clone()];
-            if let Some(stem) = entry.strip_suffix(".xml") {
-                cands.push(format!("{stem}.lua"));
-            }
-            for cand in cands {
-                let Some(b) = super::read(&cand.replace('\\', "/")) else {
-                    continue;
-                };
-                let text = String::from_utf8_lossy(&b).into_owned();
+            // Each definition is credited to the file it is in, which for `ActionBarFrame.xml`
+            // is `ActionButton.lua`, not the entry.
+            for (path, text) in entry_files(entry) {
+                let file = path.rsplit('/').next().unwrap_or(&path).to_string();
                 for name in defined_in(&text) {
                     let at = pos[entry];
-                    chain_home.entry(name).or_insert_with(|| {
-                        (cand.rsplit('/').next().unwrap_or(leaf).to_string(), at)
-                    });
+                    chain_home.entry(name).or_insert_with(|| (file.clone(), at));
                 }
             }
         }
@@ -1112,18 +1176,16 @@ mod tests {
             if line.is_empty() || line.starts_with('#') || !line.ends_with(".xml") {
                 continue;
             }
-            for cand in [line.to_string(), format!("{}.lua", &line[..line.len() - 4])] {
-                let Some(b) = super::read(&format!("Interface/FrameXML/{cand}")) else {
-                    continue;
-                };
-                let text = String::from_utf8_lossy(&b).into_owned();
-                if cand.ends_with(".xml") {
+            // A window's frames belong to its toc line; a function belongs to the file it is in.
+            for (path, text) in entry_files(&format!("Interface\\FrameXML\\{line}")) {
+                let file = path.rsplit('/').next().unwrap_or(&path).to_string();
+                if path.ends_with(".xml") {
                     for name in declares(&text) {
                         chain_frames.entry(name).or_insert_with(|| line.to_string());
                     }
                 }
                 for (name, n) in params_in(&text) {
-                    ref_arity.entry(name).or_insert((n, cand.clone()));
+                    ref_arity.entry(name).or_insert((n, file.clone()));
                 }
             }
         }
@@ -1232,9 +1294,10 @@ mod tests {
 
     /// Every global a migrated window calls exists once the shipped interface is up. Loading never
     /// runs the body that calls it, so a missing one raises on the first click that reaches it.
-    /// Bare `name(` calls in each chain file and its `.lua`, minus its own functions and locals,
-    /// count when the reference's `_G` has them (`reference/lua_globals.tsv`). Blind to names
-    /// reached through `getglobal` and to widget methods; it checks existence, not the body.
+    /// Bare `name(` calls in each chain file and every file it loads (`entry_sources`: its
+    /// `<Script file=>` and `<Include file=>`), minus their own functions and locals, count when
+    /// the reference's `_G` has them (`reference/lua_globals.tsv`). Blind to names reached
+    /// through `getglobal` and to widget methods; it checks existence, not the body.
     #[test]
     fn every_global_a_migrated_window_calls_is_answered() {
         let _data = benilla_formats::wow_data_or_skip!();
@@ -1295,17 +1358,12 @@ mod tests {
                 continue;
             }
             let leaf = entry.rsplit(['\\', '/']).next().unwrap_or(entry);
-            let mut text = String::new();
-            let mut cands = vec![entry.replace('\\', "/")];
-            if let Some(stem) = entry.strip_suffix(".xml") {
-                cands.push(format!("{stem}.lua").replace('\\', "/"));
-            }
-            for cand in &cands {
-                if let Some(b) = super::read(cand) {
-                    text.push_str(&String::from_utf8_lossy(&b));
-                    text.push('\n');
-                }
-            }
+            // The entry's own text and every file it loads, as the loader does: each
+            // `<Script file=>` (`ActionBarFrame.xml` loads `ActionButton.lua`) and `<Include
+            // file=>` (`PartyFrame.xml` includes `PartyFrameTemplates.xml`), transitively.
+            let sources = entry_sources(entry);
+            assert!(!sources.is_empty(), "{entry}: the chain has no such file");
+            let text = sources.join("\n");
             let text = strip_strings(&strip_comments(&text));
             let defines: std::collections::HashSet<String> = text
                 .lines()
@@ -1329,18 +1387,15 @@ mod tests {
                     l.strip_prefix("for ")
                 };
                 if let Some(rest) = rest {
-                    for name in rest
-                        .split(['=', ' ', '\t'])
-                        .take_while(|w| *w != "in" && *w != "=" && !w.starts_with('('))
-                        .flat_map(|w| w.split(','))
-                        .map(|w| w.trim())
+                    // Only the names a statement binds: before its `=` (`local a, b = f()`
+                    // binds `a` and `b`, not `f`) and before a `for`'s `in`.
+                    let bound = rest.split('=').next().unwrap_or("");
+                    let bound = bound.split(" in ").next().unwrap_or("");
+                    for name in bound
+                        .split(['(', ')', ' ', '\t', ','])
                         .filter(|w| !w.is_empty())
                     {
-                        let name: String =
-                            name.chars().take_while(|c| super::is_word(*c)).collect();
-                        if !name.is_empty() {
-                            locals.insert(name);
-                        }
+                        locals.insert(name.to_string());
                     }
                 }
             }
@@ -1713,7 +1768,18 @@ mod tests {
         out
     }
 
+    /// The text of every file a toc entry loads, itself included.
     fn entry_sources(entry: &str) -> Vec<String> {
+        entry_files(entry)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    /// Every file a toc entry loads, itself first and the rest in the order the walk reaches them:
+    /// each `<Script file=>` and `<Include file=>`, transitively, as `(path, text)` with `/`
+    /// separators.
+    fn entry_files(entry: &str) -> Vec<(String, String)> {
         fn read_one(path: &str, chain: bool) -> Option<String> {
             if chain {
                 let bytes = super::read(&path.replace('\\', "/"))?;
@@ -1727,12 +1793,8 @@ mod tests {
             .ok()
         }
         let chain = super::is_chain_entry(entry);
-        let dir = {
-            let p = entry.replace('\\', "/");
-            p.rsplit_once('/').map(|(d, _)| d.to_string())
-        };
         let mut out = Vec::new();
-        let mut queue = vec![entry.to_string()];
+        let mut queue = vec![entry.replace('\\', "/")];
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(path) = queue.pop() {
             if !seen.insert(path.clone()) {
@@ -1741,11 +1803,13 @@ mod tests {
             let Some(text) = read_one(&path, chain) else {
                 continue;
             };
+            // A file resolves what it loads beside itself, as the loader does.
+            let dir = path.rsplit_once('/').map(|(d, _)| d.to_string());
             for chunk in text.split('<').skip(1) {
                 let Some(end) = chunk.find('>') else { continue };
                 let tag = &chunk[..end];
                 // `<Include>` brings a sibling document and `<Script file=>` the code, where
-                // nearly every `RegisterEvent` lives; both resolve in the entry's own folder.
+                // nearly every `RegisterEvent` lives; both resolve in the including file's own folder.
                 let kind = tag.trim_start();
                 if !kind.starts_with("Include") && !kind.starts_with("Script") {
                     continue;
@@ -1758,7 +1822,7 @@ mod tests {
                     queue.push(next);
                 }
             }
-            out.push(text);
+            out.push((path, text));
         }
         out
     }
@@ -1827,26 +1891,6 @@ mod tests {
             stale.join("\n  ")
         );
     }
-    /// `text` with every whitespace run before a `.` removed, so a chain rustfmt split across lines
-    /// reads as one call.
-    fn glue_chains(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut pending = String::new();
-        for c in text.chars() {
-            if c.is_whitespace() {
-                pending.push(c);
-            } else {
-                if c != '.' {
-                    out.push_str(&pending);
-                }
-                pending.clear();
-                out.push(c);
-            }
-        }
-        out.push_str(&pending);
-        out
-    }
-
     /// Every event a chain file registers is fired by something here or listed in `UNPRODUCED`. An
     /// event name is a plain string at both ends, so a listener nothing feeds is silent; a new one
     /// means a window migration brought it.
@@ -1854,47 +1898,21 @@ mod tests {
     fn every_event_a_chain_file_registers_has_a_producer() {
         let _data = benilla_formats::wow_data_or_skip!();
 
-        // Names built at runtime, which a literal scan cannot see; each entry is a promise that
-        // something fires it.
-        const CONSTRUCTED: &[&str] = &[
-            // `ui_unit.rs` builds `UNIT_{}` and `UNIT_MAX{}` over `power_token`'s five resources.
-            "UNIT_MANA",
-            "UNIT_RAGE",
-            "UNIT_FOCUS",
-            "UNIT_ENERGY",
-            "UNIT_HAPPINESS",
-            "UNIT_MAXMANA",
-            "UNIT_MAXRAGE",
-            "UNIT_MAXFOCUS",
-            "UNIT_MAXENERGY",
-            "UNIT_MAXHAPPINESS",
-        ];
-
         // Registered by a chain file we load and fired by nothing here; each says why.
         const UNPRODUCED: &[(&str, &str)] = &[
             // ── The stock `UIParent.lua`'s listeners first, then the other files' ──
             (
-                "ADDON_ACTION_FORBIDDEN",
-                "UIParent.lua — the protected-action refusal; benilla has no protected-call \
-                 taint model, so nothing can raise it",
+                "GUILD_INVITE_CANCEL",
+                "UIParent.lua — the invite popup's hide. The 5875 client registers it, and its \
+                 signal wrapper `0x48f470` has no caller and no stored address, so nothing \
+                 signals it THERE either: producing it would be a divergence, not a fix",
             ),
             (
-                "MACRO_ACTION_FORBIDDEN",
-                "UIParent.lua — the macro half of ADDON_ACTION_FORBIDDEN, same reason",
-            ),
-            (
-                "AUTOEQUIP_BIND_CONFIRM",
-                "UIParent.lua — the bind-on-equip confirm for an AUTOEQUIP (right-click) path; \
-                 benilla's equip path fires the EQUIP_BIND_CONFIRM sibling only",
-            ),
-            (
-                "EQUIP_BIND_CONFIRM",
-                "UIParent.lua — the bind-on-equip confirm; benilla's inventory feed does not \
-                 derive the server's confirm ask yet",
-            ),
-            (
-                "USE_BIND_CONFIRM",
-                "UIParent.lua — the bind-on-use confirm, the same gap from the use path",
+                "FRIENDLIST_SHOW",
+                "FriendsFrame.lua — registered, but the name is no row of the client's event table \
+                 (`reference/events.tsv`), so `RegisterEvent` drops it (`0x702140`) and nothing \
+                 signals it. The friend list ends in `FRIENDLIST_UPDATE` (`0x5ae867`), after \
+                 `ShowFriends` too",
             ),
             (
                 "BILLING_NAG_DIALOG",
@@ -1938,9 +1956,10 @@ mod tests {
             ),
             (
                 "CLOSE_WORLD_MAP",
-                "WorldMapFrame.lua — the engine-side close the reference fires when the map is \
-                 shut from outside its own frame; benilla closes the map through the frame's own \
-                 hide path only",
+                "WorldMapFrame.lua — registered, and signalled from NOWHERE reachable: its one \
+                 fire site (`0x4a7835`) ends `0x4a76e0`, which sends `CMSG_WORLD_TELEPORT` and \
+                 has no caller or stored address, so, like TRADE_REQUEST, producing it would be \
+                 a divergence, not a fix",
             ),
             ("DISPLAY_SIZE_CHANGED", "the four paperdoll files"),
             (
@@ -1952,8 +1971,6 @@ mod tests {
             ),
             ("ITEM_TEXT_TRANSLATION", "ItemTextFrame.lua"),
             ("PET_UI_CLOSE", "PetPaperDollFrame.lua"),
-            ("PET_UI_UPDATE", "PetPaperDollFrame.lua"),
-            ("PLAYER_DAMAGE_DONE_MODS", "PaperDollFrame.lua"),
             (
                 "SHOW_COMPARE_TOOLTIP",
                 "PaperDollFrame.lua — the second `TRADE_REQUEST`: event 377 is \
@@ -1966,7 +1983,6 @@ mod tests {
                  event would be a divergence, not a fix",
             ),
             ("SYSMSG", "UIErrorsFrame.lua"),
-            ("UNIT_DEFENSE", "PetPaperDollFrame.lua"),
             (
                 "UNIT_MODEL_CHANGED",
                 "four files — the paperdoll model refresh",
@@ -1974,123 +1990,45 @@ mod tests {
             ("UNIT_PORTRAIT_UPDATE", "three files — the portrait refresh"),
             (
                 "ZONE_UNDER_ATTACK",
-                "ChatFrame.lua — the reference's `SMSG_ZONE_UNDER_ATTACK` line (\"%s is under \
-                 attack!\"); the wire handler is not built",
+                "ChatFrame.lua — registered, but the name is no row of the client's event table \
+                 (`reference/events.tsv`), so `RegisterEvent` drops it (`0x702140`) and nothing \
+                 signals it. `SMSG_ZONE_UNDER_ATTACK` prints its LocalDefense line itself \
+                 (`0x49dcc0`, the global string `ZONE_UNDER_ATTACK`), which `ui_chat/broadcast.rs` \
+                 builds",
             ),
         ];
 
-        let mut fired: std::collections::HashSet<String> =
-            CONSTRUCTED.iter().map(|s| (*s).to_string()).collect();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root")
-            .join("crates");
-        let caps = |lit: &str| {
-            !lit.is_empty()
-                && lit
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
-        };
-        // The event-name table an indirect fire reads: `"EVENT", vec!`, a match arm
-        // `=> "EVENT",`, or a lone `"EVENT"` as a block arm's value.
-        let scan_arms = |text: &str, fired: &mut std::collections::HashSet<String>| {
-            const SHAPE: &str = "\", vec!";
-            for (i, _) in text.match_indices(SHAPE) {
-                let before = &text[..i];
-                let Some(q) = before.rfind('"') else { continue };
-                let lit = &before[q + 1..];
-                if caps(lit) {
-                    fired.insert(lit.to_string());
-                }
-            }
-            let lines: Vec<&str> = text.lines().map(str::trim).collect();
-            for (i, t) in lines.iter().enumerate() {
-                let (t, arm_value) = match t.find("=> \"") {
-                    Some(k) => (t[k + 3..].trim_end_matches(','), true),
-                    None => (*t, false),
-                };
-                let Some(lit) = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')) else {
-                    continue;
-                };
-                if arm_value && caps(lit) {
-                    fired.insert(lit.to_string());
-                    continue;
-                }
-                let arm = i > 0
-                    && lines[i - 1].ends_with('{')
-                    && lines.get(i + 1).is_some_and(|n| n.starts_with('}'));
-                if arm && caps(lit) {
-                    fired.insert(lit.to_string());
-                }
-            }
-        };
-        // An indirect fire names a const or a function, whose literal may live in another file
-        // (`ui_chat::event::event_name`, for the fire in `ui_chat::frames`).
+        let mut fired: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Every fire site of the scan names its event or does not. A name held in a binding or
+        // built by a call is an indirect fire, and any event-shaped literal of its file counts as
+        // fired, as does any of the file that defines the const or function it names (which may
+        // be another: `ui_chat::event::event_name`, for the fire in `ui_chat::frames`).
+        let scan = fire_scan::scan();
         let mut indirect: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut texts: Vec<String> = Vec::new();
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    let text = std::fs::read_to_string(&p).unwrap_or_default();
-                    // rustfmt splits a long chain at its dots, so the three shapes are matched
-                    // with the whitespace before each `.` removed.
-                    let text = glue_chains(&text);
-                    // A verb's `model.raise(name, args)` and the host queue,
-                    // `pending_events.push((name, args))`, fire too.
-                    const CALLS: [&str; 4] = [
-                        concat!("fire_event", "("),
-                        concat!("fire_event_into", "("),
-                        concat!("model.raise", "("),
-                        concat!("pending_events.push", "(("),
-                    ];
-                    let mut fires_indirectly = false;
-                    for call in CALLS {
-                        let mut from = 0;
-                        while let Some(i) = text[from..].find(call) {
-                            let at = from + i + call.len();
-                            from = at;
-                            let rest = text[at..].trim_start();
-                            let rest = rest.strip_prefix("lua,").map_or(rest, str::trim_start);
-                            if let Some(body) = rest.strip_prefix('"') {
-                                if let Some(end) = body.find('"') {
-                                    fired.insert(body[..end].to_string());
-                                }
-                            } else {
-                                fires_indirectly = true;
-                                let ident: String = rest
-                                    .chars()
-                                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                                    .collect();
-                                if !ident.is_empty() {
-                                    indirect.insert(ident);
-                                }
-                            }
-                        }
+        let mut indirect_files: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for site in &scan.sites {
+            match &site.name {
+                fire_scan::Name::Lit(names) => fired.extend(names.iter().cloned()),
+                fire_scan::Name::Other(expr) if !site.relay => {
+                    indirect_files.insert(&site.path);
+                    let ident: String = expr
+                        .trim_start_matches('&')
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !ident.is_empty() {
+                        indirect.insert(ident);
                     }
-                    if fires_indirectly {
-                        scan_arms(&text, &mut fired);
-                    }
-                    texts.push(text);
                 }
+                fire_scan::Name::Other(_) => {}
             }
         }
-        for text in &texts {
-            for ident in &indirect {
-                let decl = format!("const {ident}: &str = \"");
-                if let Some(k) = text.find(&decl) {
-                    let body = &text[k + decl.len()..];
-                    if let Some(end) = body.find('"') {
-                        fired.insert(body[..end].to_string());
-                    }
-                }
-                if text.contains(&format!("fn {ident}(")) {
-                    scan_arms(text, &mut fired);
-                }
+        for src in &scan.sources {
+            let names_one = indirect.iter().any(|i| {
+                src.code.contains(&format!("fn {i}(")) || src.code.contains(&format!("const {i}:"))
+            });
+            if names_one || indirect_files.contains(src.path.as_str()) {
+                fired.extend(src.event_literals());
             }
         }
 
@@ -2153,84 +2091,6 @@ mod tests {
                 level: 60,
                 ..Default::default()
             }),
-        );
-    }
-
-    /// Every event benilla fires exists in the 1.12 client: an event it can dispatch is a
-    /// NUL-terminated string in `WoW.exe`, and a name missing there no stock listener can ever
-    /// receive. Test files are skipped; they fire synthetic names (`E3`) on purpose.
-    #[test]
-    fn every_event_we_fire_is_an_event_the_reference_has() {
-        let data = benilla_formats::wow_data_or_skip!();
-        let exe = data.parent().expect("install root").join("WoW.exe");
-        let Ok(bytes) = std::fs::read(&exe) else {
-            eprintln!("skipping: no WoW.exe at {exe:?}");
-            return;
-        };
-
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root")
-            .join("crates");
-        let mut fired: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    stack.push(p);
-                    continue;
-                }
-                if p.extension().is_none_or(|x| x != "rs") {
-                    continue;
-                }
-                // A test's own synthetic events are not a surface we ship.
-                if p.to_string_lossy().contains("test") {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&p).unwrap_or_default();
-                // Split so this file cannot match its own walker.
-                const CALL: &str = concat!("fire_event", "(");
-                let mut from = 0;
-                while let Some(i) = text[from..].find(CALL) {
-                    let at = from + i + CALL.len();
-                    from = at;
-                    let rest = text[at..].trim_start();
-                    if let Some(body) = rest.strip_prefix('"') {
-                        if let Some(end) = body.find('"') {
-                            fired
-                                .entry(body[..end].to_string())
-                                .or_insert_with(|| p.display().to_string());
-                        }
-                    }
-                }
-            }
-        }
-        assert!(
-            fired.len() > 100,
-            "the walker found only {} fired events — it stopped matching, which would make this \
-             gate silently vacuous",
-            fired.len()
-        );
-
-        let ghosts: Vec<String> = fired
-            .iter()
-            // A `BENILLA_` prefix marks an event as ours, never mistaken for a 1.12 name.
-            .filter(|(ev, _)| !ev.starts_with("BENILLA_"))
-            .filter(|(ev, _)| {
-                let needle: Vec<u8> = ev.bytes().chain(std::iter::once(0)).collect();
-                !bytes.windows(needle.len()).any(|w| w == needle)
-            })
-            .map(|(ev, at)| format!("{ev}  (fired from {at})"))
-            .collect();
-        assert!(
-            ghosts.is_empty(),
-            "benilla fires {} event(s) the 1.12 client does not have — a Classic Era name, or one \
-             invented here. Nothing in the stock UI can ever listen for these:\n  {}",
-            ghosts.len(),
-            ghosts.join("\n  ")
         );
     }
 }

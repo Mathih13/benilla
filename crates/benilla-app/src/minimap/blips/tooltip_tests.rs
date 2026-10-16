@@ -14,9 +14,11 @@ fn minimap_app() -> App {
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx))
         .init_resource::<NameCache>()
+        .init_resource::<crate::net::GuidIndex>()
         .init_resource::<MinimapBlipHover>()
         .add_systems(Update, drive_blip_tooltip);
     let mut script = UiScript::new().unwrap();
+    crate::ui_script::test_ui::load_tooltip_template(&script);
     script.set_screen_size(800.0, 600.0);
     script
         .run(
@@ -25,7 +27,7 @@ fn minimap_app() -> App {
             local map = CreateFrame("Minimap", "Minimap", UIParent)
             map:SetPoint("BOTTOMLEFT", 600, 400); map:SetWidth(140); map:SetHeight(140)
             map:EnableMouse(true)
-            CreateFrame("GameTooltip", "GameTooltip", UIParent):Hide()
+            CreateFrame("GameTooltip", "GameTooltip", UIParent, "TestTooltipTemplate"):Hide()
             "#,
         )
         .unwrap();

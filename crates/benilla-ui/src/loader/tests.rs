@@ -674,15 +674,31 @@ mod loader_tests {
             "{on:?}"
         );
 
+        // `lua_isnumber` refuses everything but a number or a numeric string, so the rest only
+        // read: the flag stays 1 (`true` coerces to no number and used to store 0).
+        for arg in ["nil", "true", "false", "\"x\"", "{}", "FrameXML_Debug"] {
+            assert_eq!(
+                s.eval::<i32>(&format!("return FrameXML_Debug({arg})"))
+                    .unwrap(),
+                1,
+                "{arg} is a pure GET — the flag is untouched"
+            );
+        }
+        assert_eq!(s.eval::<i32>("return FrameXML_Debug()").unwrap(), 1);
         assert_eq!(
-            s.eval::<i32>("return FrameXML_Debug(nil)").unwrap(),
-            1,
-            "nil is a pure GET — the flag is untouched"
+            s.eval::<i32>("return FrameXML_Debug(\"3.7\")").unwrap(),
+            3,
+            "a numeric string converts, truncated toward zero"
+        );
+        assert_eq!(
+            s.eval::<i32>("return FrameXML_Debug(-2.9)").unwrap(),
+            -2,
+            "…and a negative truncates toward zero too"
         );
         assert_eq!(
             s.eval::<i32>("return FrameXML_Debug(0)").unwrap(),
             0,
-            "…but 0 is TRUTHY in Lua, so it really does disable it"
+            "…and 0 is a number, so it really does disable it"
         );
         assert!(load(&s, &doc(), &no_files).traces.is_empty());
         // The stored value truncates toward zero (`0x40a2b0`).
@@ -1360,6 +1376,88 @@ mod loader_tests {
         s.tick(0.0);
         assert!(s.eval::<bool>("return typed == true").unwrap());
         assert!(s.errors().is_empty(), "{:?}", s.errors());
+    }
+
+    /// The line limit (`+0x320`) is the count of declared `TextLeft<n>`/`TextRight<n>` pairs, read
+    /// until either is missing (`0x529650`): a line past it is not added (`0x530291`).
+    #[test]
+    fn a_tooltip_holds_as_many_lines_as_it_declares_pairs() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <GameTooltip name="Cap">
+                    <Layers><Layer level="ARTWORK">
+                        <FontString name="$parentTextLeft1"/><FontString name="$parentTextRight1"/>
+                        <FontString name="$parentTextLeft2"/><FontString name="$parentTextRight2"/>
+                        <FontString name="$parentTextLeft3"/>
+                    </Layer></Layers>
+                </GameTooltip>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        s.run(
+            r#"
+            for i = 1, 5 do Cap:AddLine("line " .. i) end
+            assert(Cap:NumLines() == 2, "two pairs; a lone TextLeft3 is no line: " .. Cap:NumLines())
+            Cap:ClearLines()
+            Cap:AddDoubleLine("a", "b") Cap:AddLine("c") Cap:AddLine("d")
+            assert(Cap:NumLines() == 2)
+        "#,
+        )
+        .unwrap();
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+    }
+
+    /// An EditBox's `<FontString bytes="N">` caps the box at N - 1 bytes (`0x77a225`-`0x77a260`):
+    /// `SStrToInt`, a value of 0 or less lifts the cap, and an empty or absent one leaves the
+    /// ctor's.
+    #[test]
+    fn an_editbox_fontstring_bytes_caps_the_box_at_n_minus_one() {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = parse(
+            r#"<Ui>
+                <EditBox name="Chat" letters="255"><FontString bytes="256"/></EditBox>
+                <EditBox name="Short"><FontString bytes="4x"/></EditBox>
+                <EditBox name="Off"><FontString bytes="0"/></EditBox>
+                <EditBox name="Neg"><FontString bytes="-3"/></EditBox>
+                <EditBox name="Empty"><FontString bytes=""/></EditBox>
+                <EditBox name="Plain"><FontString/></EditBox>
+                <EditBox name="Bare" bytes="9"/>
+            </Ui>"#,
+        );
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        for (name, want) in [
+            ("Chat", 256),
+            ("Short", 4),
+            ("Off", 0),
+            ("Neg", 0),
+            ("Empty", 0),
+            ("Plain", 0),
+            ("Bare", 0),
+        ] {
+            assert_eq!(
+                s.eval::<i64>(&format!("return {name}:GetMaxBytes()"))
+                    .unwrap(),
+                want,
+                "{name}"
+            );
+        }
+        // 300 two-byte letters stop at 255 bytes: 127 whole letters.
+        s.run(r#"Chat:SetFocus() Chat:Insert(string.rep("é", 300))"#)
+            .unwrap();
+        assert_eq!(
+            s.eval::<i64>("return string.len(Chat:GetText())").unwrap(),
+            254
+        );
+        s.run(r#"Chat:SetText(string.rep("a", 300))"#).unwrap();
+        assert_eq!(
+            s.eval::<i64>("return string.len(Chat:GetText())").unwrap(),
+            255
+        );
     }
 
     /// The EditBox ctor leaves autoFocus on (`flags = 1`), so the stock UI writes the attribute
@@ -3001,4 +3099,254 @@ fn join_ref_resolves_relative_framexml_paths() {
     assert_eq!(join_ref("", "../secret"), "../secret");
     // A leading `/` re-roots rather than meaning the filesystem root.
     assert_eq!(join_ref("a/b", "/c.xml"), "c.xml");
+}
+
+/// A texture's wrap is fixed when its file loads (`0x770200`'s second argument), never from the
+/// coordinates it draws with later: the XML loader passes 1 only when its `<TexCoords>` leave
+/// [0, 1] (`0x77012d`), the Lua `SetTexture` always 0 (`0x79bda5`).
+mod texture_wrap_tests {
+    use crate::framexml;
+    use crate::loader::*;
+    use crate::script::{QuadContent, UiScript};
+
+    fn no_files(_: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// A host holding one frame whose XML textures are `layers`, plus a Button with a
+    /// `<NormalTexture>` from `normal`.
+    fn host(layers: &str, normal: &str) -> UiScript {
+        host_with("", layers, normal)
+    }
+
+    /// [`host`] with `templates` (top-level `virtual` elements) ahead of the frame.
+    fn host_with(templates: &str, layers: &str, normal: &str) -> UiScript {
+        let mut s = UiScript::new().unwrap();
+        s.set_screen_size(800.0, 600.0);
+        let doc = framexml::parse(&format!(
+            r#"<Ui>
+                {templates}
+                <Frame name="WrapHost">
+                    <Size><AbsDimension x="100" y="100"/></Size>
+                    <Anchors><Anchor point="CENTER"/></Anchors>
+                    <Layers><Layer level="ARTWORK">{layers}</Layer></Layers>
+                </Frame>
+                <Button name="WrapBtn">
+                    <Size><AbsDimension x="40" y="20"/></Size>
+                    <Anchors><Anchor point="TOPLEFT"/></Anchors>
+                    {normal}
+                </Button>
+            </Ui>"#
+        ))
+        .expect("valid FrameXML");
+        let report = load(&s, &doc, &no_files);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        s
+    }
+
+    /// The load-time wrap of the drawn quad whose path holds `file`.
+    fn wrap_of(s: &mut UiScript, file: &str) -> bool {
+        s.resolve();
+        let wraps: Vec<bool> = s
+            .extract()
+            .into_iter()
+            .filter_map(|q| match q.content {
+                QuadContent::Texture {
+                    path: Some(p),
+                    wrap,
+                    ..
+                } if p.contains(file) => Some(wrap),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wraps.len(), 1, "one quad draws {file}: {wraps:?}");
+        wraps[0]
+    }
+
+    /// A Lua texture whose coordinates run far past [0, 1] clamps: the taxi map's route lines
+    /// (`TaxiFrame.lua:178`) stretch one texture over a long box and must not repeat.
+    #[test]
+    fn a_lua_texture_with_uvs_past_one_clamps() {
+        let mut s = host("", "");
+        s.run(
+            r#"local t = WrapHost:CreateTexture("LuaLine", "ARTWORK")
+            t:SetAllPoints(WrapHost)
+            t:SetTexture("Interface\\LuaLine")
+            t:SetTexCoord(-2.4, 3.4, 0, 1)"#,
+        )
+        .unwrap();
+        assert!(!wrap_of(&mut s, "LuaLine"));
+        s.run("LuaLine:SetTexCoord(0, 5, -1, 7)").unwrap();
+        assert!(!wrap_of(&mut s, "LuaLine"));
+    }
+
+    /// An XML `<Texture>` repeats exactly when one `<TexCoords>` edge is below 0 or above 1; an
+    /// edge left out keeps its default 0 or 1, and no `<TexCoords>` is no wrap.
+    #[test]
+    fn an_xml_texture_repeats_when_its_texcoords_leave_the_unit_square() {
+        let tex = |name: &str, tc: &str| {
+            format!(
+                r#"<Texture name="{name}" file="Interface\{name}"><Anchors><Anchor point="TOPLEFT"/></Anchors>{tc}</Texture>"#
+            )
+        };
+        let layers = [
+            tex(
+                "TcOut",
+                r#"<TexCoords left="0" right="2" top="0" bottom="1"/>"#,
+            ),
+            tex(
+                "TcNeg",
+                r#"<TexCoords left="0" right="1" top="-0.5" bottom="1"/>"#,
+            ),
+            tex(
+                "TcIn",
+                r#"<TexCoords left="0" right="0.453125" top="0" bottom="1"/>"#,
+            ),
+            tex(
+                "TcFlip",
+                r#"<TexCoords left="1" right="0" top="0" bottom="1"/>"#,
+            ),
+            tex("TcNone", ""),
+            tex("TcDefault", r#"<TexCoords right="1"/>"#),
+            tex("TcPartOut", r#"<TexCoords left="0.25" bottom="3"/>"#),
+        ]
+        .concat();
+        let mut s = host(&layers, "");
+        for (file, want) in [
+            ("TcOut", true),
+            ("TcNeg", true),
+            ("TcIn", false),
+            ("TcFlip", false),
+            ("TcNone", false),
+            ("TcDefault", false),
+            ("TcPartOut", true),
+        ] {
+            assert_eq!(wrap_of(&mut s, file), want, "{file}");
+        }
+    }
+
+    /// `SetTexCoord` leaves the flag where the load put it, in either direction.
+    #[test]
+    fn set_tex_coord_never_changes_the_wrap() {
+        let mut s = host(
+            r#"<Texture name="Tiled" file="Interface\Tiled"><Anchors><Anchor point="TOPLEFT"/></Anchors>
+                   <TexCoords left="0" right="4" top="0" bottom="1"/></Texture>
+               <Texture name="Strip" file="Interface\Strip"><Anchors><Anchor point="TOPLEFT"/></Anchors>
+                   <TexCoords left="0" right="1" top="0" bottom="1"/></Texture>"#,
+            "",
+        );
+        s.run("Tiled:SetTexCoord(0, 1, 0, 1) Strip:SetTexCoord(0, 4, 0, 1)")
+            .unwrap();
+        assert!(
+            wrap_of(&mut s, "Tiled"),
+            "a tiled texture shown whole stays repeating"
+        );
+        assert!(
+            !wrap_of(&mut s, "Strip"),
+            "a clamped one stretched past 1 stays clamped"
+        );
+    }
+
+    /// The binding loads with the flag off: a different file clamps, and the same file answers 1
+    /// before any load (`0x770225`), so the flag the XML load set survives, whatever the spelling.
+    #[test]
+    fn lua_set_texture_on_a_repeating_xml_texture() {
+        let mut s = host(
+            r#"<Texture name="Tiled" file="Interface\Tiled"><Anchors><Anchor point="TOPLEFT"/></Anchors>
+                   <TexCoords left="0" right="4" top="0" bottom="1"/></Texture>"#,
+            "",
+        );
+        assert!(wrap_of(&mut s, "Tiled"));
+        s.run(r#"Tiled:SetTexture("interface\\TILED.blp")"#)
+            .unwrap();
+        assert!(
+            wrap_of(&mut s, "Tiled"),
+            "the file it already shows is a no-op"
+        );
+        s.run(r#"Tiled:SetTexture("Interface\\Other")"#).unwrap();
+        assert!(
+            !wrap_of(&mut s, "Other"),
+            "another file loads with the flag off"
+        );
+        s.run(r#"Tiled:SetTexture("Interface\\Tiled")"#).unwrap();
+        assert!(
+            !wrap_of(&mut s, "Tiled"),
+            "…and so does coming back to the first"
+        );
+    }
+
+    /// Clearing or filling the texture drops the loaded image with its flag; the next file loads
+    /// with the binding's 0.
+    #[test]
+    fn clearing_or_filling_a_texture_drops_the_flag_with_the_image() {
+        let mut s = host(
+            r#"<Texture name="Tiled" file="Interface\Tiled"><Anchors><Anchor point="TOPLEFT"/></Anchors>
+                   <TexCoords left="0" right="4" top="0" bottom="1"/></Texture>"#,
+            "",
+        );
+        s.run("Tiled:SetTexture(nil)").unwrap();
+        s.run(r#"Tiled:SetTexture("Interface\\Tiled")"#).unwrap();
+        assert!(!wrap_of(&mut s, "Tiled"));
+        s.run(r#"Tiled:SetTexture(1, 0, 0, 1) Tiled:SetTexture("Interface\\Tiled")"#)
+            .unwrap();
+        assert!(!wrap_of(&mut s, "Tiled"));
+    }
+
+    /// A Button's state texture is an XML `<Texture>` too; `SetNormalTexture(path)` reloads it
+    /// through `0x770200` with the flag off (`0x778f3a`).
+    #[test]
+    fn a_button_state_texture_follows_the_same_rule() {
+        let mut s = host(
+            "",
+            r#"<NormalTexture file="Interface\BtnTiled">
+                   <TexCoords left="0" right="3" top="0" bottom="1"/></NormalTexture>"#,
+        );
+        assert!(wrap_of(&mut s, "BtnTiled"));
+        s.run(r#"WrapBtn:SetNormalTexture("Interface\\BtnTiled")"#)
+            .unwrap();
+        assert!(wrap_of(&mut s, "BtnTiled"), "the same file keeps its load");
+        s.run(r#"WrapBtn:SetNormalTexture("Interface\\BtnOther")"#)
+            .unwrap();
+        assert!(!wrap_of(&mut s, "BtnOther"));
+    }
+
+    /// A template loads through its own recursive load with its own flag, and the flag is zeroed
+    /// before the instance's children (`0x76fe5b`, `0x76fec6`): the instance's file takes the wrap
+    /// of the instance's own `<TexCoords>` alone, and a template's file keeps its own.
+    #[test]
+    fn a_template_level_loads_with_its_own_wrap_flag() {
+        let templates = r#"
+            <Texture name="TplBare" virtual="true">
+                <TexCoords left="0" right="3" top="0" bottom="1"/>
+            </Texture>
+            <Texture name="TplFile" virtual="true" file="Interface\TplFile">
+                <TexCoords left="0" right="3" top="0" bottom="1"/>
+            </Texture>
+            <Texture name="TplPlain" virtual="true" file="Interface\TplPlain"/>
+            <Texture name="TplShared" virtual="true" file="Interface\Shared">
+                <TexCoords left="0" right="3" top="0" bottom="1"/>
+            </Texture>"#;
+        let a = r#"<Anchors><Anchor point="TOPLEFT"/></Anchors>"#;
+        let layers = format!(
+            r#"<Texture name="OwnOnly" inherits="TplBare" file="Interface\OwnOnly">{a}</Texture>
+               <Texture name="OwnOut" inherits="TplPlain" file="Interface\OwnOut">{a}
+                   <TexCoords left="0" right="2" top="0" bottom="1"/></Texture>
+               <Texture name="FromTpl" inherits="TplFile">{a}</Texture>
+               <Texture name="Other" inherits="TplFile" file="Interface\Other">{a}</Texture>
+               <Texture name="Same" inherits="TplShared" file="interface\SHARED.blp">{a}</Texture>"#
+        );
+        let mut s = host_with(templates, &layers, "");
+        // The template has out-of-range edges, the instance only a file: the instance clamps.
+        assert!(!wrap_of(&mut s, "OwnOnly"));
+        // The instance's own out-of-range edges repeat its file, whatever the template says.
+        assert!(wrap_of(&mut s, "OwnOut"));
+        s.run("OwnOnly:SetTexCoord(0, 1, 0, 1)").unwrap();
+        // The template's file keeps the flag of the template's own edges.
+        assert!(wrap_of(&mut s, "TplFile"));
+        // An instance file of another name loads again, with the instance's flag.
+        assert!(!wrap_of(&mut s, "Other"));
+        // The same file under another spelling is the no-op of `0x770225`: the template's flag
+        // stays.
+        assert!(wrap_of(&mut s, "Shared"));
+    }
 }

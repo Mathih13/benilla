@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use benilla_protocol::messages::{select_greeting, GossipOption, NpcTextBlock};
 use bevy::prelude::*;
 
-use benilla_ui::script::{GossipMenu, GossipOptionView, GossipQuestRow, ScriptValue, UiScript};
+use benilla_ui::script::{GossipMenu, GossipOptionView, GossipQuestRow, UiScript};
 
 use crate::names::NameCache;
 use crate::net::{ClientCommand, Guid, NetCommands, ObjectStore, SelfPlayer};
@@ -260,6 +260,8 @@ fn feed_gossip(
     self_q: Query<(&ObjectStore, &Guid), With<SelfPlayer>>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
+    objects: crate::net::Objects,
+    unit_names: crate::ui_unit::NameTables,
     states: Res<crate::world_state::WorldStates>,
     mut last: crate::ui_script::WindowMemo<Option<GossipMenu>>,
     mut last_name: crate::ui_script::WindowMemo<Option<String>>,
@@ -274,12 +276,12 @@ fn feed_gossip(
         *last = None;
         *last_name = None;
     }
-    // The NPC's name rides `GOSSIP_SHOW` as arg1, and its landing alone re-fires the event; the
-    // reference fires `GOSSIP_SHOW` bare (`0x4e22b0`), and stock `GossipFrame.lua:33` titles with
-    // `UnitName("npc")`. Asked before the hold, so the name query goes out beside the text query.
+    // `GOSSIP_SHOW` carries no argument (`SignalEvent` `0x4e22b5`) and the stock window titles with
+    // `UnitName("npc")` (`GossipFrame.lua:33`), so the name's landing alone re-fires it. Asked
+    // before the hold, so the name query goes out beside the text query.
     let npc_name = state
         .npc
-        .and_then(|g| names.resolve(g, &commands).map(str::to_string));
+        .and_then(|g| names.resolve(&objects, g, &commands).map(str::to_string));
     // While the text query is out, fire nothing and keep the last snapshot: the reference returns
     // at `0x4e2068` with no write and no event, so its frame keeps what it last showed. Reading
     // the hold as a close would flash an open window.
@@ -289,7 +291,7 @@ fn feed_gossip(
     let mut fresh = snapshot(&state);
     // Expand the greeting's `$N`/`$B`/`$G`/`$<n>w` macros client-side, as the reference does.
     if let Some(greeting) = fresh.as_mut().map(|m| &mut m.greeting) {
-        let player = crate::npc_text::player_identity(&self_q, &names, &commands);
+        let player = crate::npc_text::player_identity(&self_q, &names, &commands, unit_names.get());
         *greeting = crate::npc_text::substitute(
             greeting,
             &crate::npc_text::MacroContext {
@@ -303,11 +305,10 @@ fn feed_gossip(
         return;
     }
     script.set_gossip(fresh.clone());
-    let name_arg = || vec![ScriptValue::Str(npc_name.clone().unwrap_or_default())];
     // Opened, or changed while open; a close is the core's, and a disconnect's clear tells the
     // VM nothing.
     if fresh.is_some() {
-        script.fire_event("GOSSIP_SHOW", name_arg());
+        script.fire_event("GOSSIP_SHOW", vec![]);
     }
     *last = fresh;
     *last_name = npc_name;
@@ -467,6 +468,7 @@ mod tests {
         app.insert_resource(NetCommands(tx))
             .init_resource::<GossipState>()
             .init_resource::<NameCache>()
+            .init_resource::<crate::net::GuidIndex>()
             .init_resource::<crate::world_state::WorldStates>()
             .add_systems(Update, (feed_gossip, drain_gossip).chain());
         let mut script = UiScript::new().unwrap();
