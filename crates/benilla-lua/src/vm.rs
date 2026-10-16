@@ -2304,8 +2304,8 @@ impl Vm {
             }
             loop {
                 debug_assert!(unsafe { (*fr!().proto).code.as_ptr_range().contains(&ip) });
-                // SAFETY: `Proto::verify` checked that every function ends in a return and every jump
-                // lands inside it.
+                // SAFETY: `Proto::verify` checked that every function ends in a return and
+                // every jump lands inside it.
                 let op = unsafe { *ip };
                 ip = unsafe { ip.add(1) };
                 match op {
