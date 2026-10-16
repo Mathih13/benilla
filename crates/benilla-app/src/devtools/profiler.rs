@@ -58,22 +58,23 @@ pub(super) fn toggle(
     let Some(script) = script else { return };
     prof.open = !prof.open;
     demand.profiler = prof.open;
-    // SAFETY: plain `Vm` calls only; no Lua runs and no other `Lua` API is reached while held.
-    let vm = unsafe { script.lua().raw_vm() };
-    vm.set_profiling(prof.open);
+    let open = prof.open;
+    let last_ns = script.lua().with_vm(|vm| {
+        vm.set_profiling(open);
+        vm.profile
+            .as_ref()
+            .map(|p| p.ns.clone())
+            .unwrap_or_default()
+    });
     info!(
         "devtools: addon profiler {}",
-        if prof.open { "on" } else { "off" }
+        if open { "on" } else { "off" }
     );
-    if prof.open {
+    if open {
         *prof = AddonProfiler {
             open: true,
             session: script.session(),
-            last_ns: vm
-                .profile
-                .as_ref()
-                .map(|p| p.ns.clone())
-                .unwrap_or_default(),
+            last_ns,
             ..default()
         };
     }
@@ -89,8 +90,7 @@ pub(super) fn sample(
     }
     let Some(script) = script else { return };
     if prof.session != script.session() {
-        // SAFETY: one plain `Vm` call.
-        unsafe { script.lua().raw_vm() }.set_profiling(true);
+        script.lua().with_vm(|vm| vm.set_profiling(true));
         *prof = AddonProfiler {
             open: true,
             session: script.session(),
@@ -104,14 +104,15 @@ pub(super) fn sample(
         return;
     }
     prof.next = now + SAMPLE_SECS;
-    // SAFETY: reads of the profile and the heap; no Lua runs and no other `Lua` API is reached.
-    let vm = unsafe { script.lua().raw_vm() };
-    let owners = owners_of(&vm.heap);
-    let ns = vm
-        .profile
-        .as_ref()
-        .map(|p| p.ns.clone())
-        .unwrap_or_default();
+    let census = now >= prof.next_census;
+    let (owners, ns, census) = script.lua().with_vm(|vm| {
+        let ns = vm
+            .profile
+            .as_ref()
+            .map(|p| p.ns.clone())
+            .unwrap_or_default();
+        (owners_of(&vm.heap), ns, census.then(|| vm.heap.census()))
+    });
 
     let frames = prof.frames.max(1) as f32;
     let mut per: HashMap<&str, f32> = HashMap::new();
@@ -135,12 +136,12 @@ pub(super) fn sample(
         push(&mut row.history, row.us);
     }
 
-    if now >= prof.next_census {
+    if let Some(census) = census {
         prof.next_census = now + CENSUS_SECS;
         for row in prof.rows.values_mut() {
             (row.kb, row.tables, row.functions) = (0.0, 0, 0);
         }
-        for (id, c) in vm.heap.census().into_iter().enumerate() {
+        for (id, c) in census.into_iter().enumerate() {
             if let Some(row) = owners.get(id).and_then(|o| prof.rows.get_mut(o)) {
                 row.kb += c.bytes as f32 / 1024.0;
                 row.tables += c.tables;

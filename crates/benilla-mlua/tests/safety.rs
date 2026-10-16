@@ -253,3 +253,29 @@ fn a_value_handed_over_by_value_survives_a_collecting_newindex() {
     let back: Table = t.raw_get("a fresh key").unwrap();
     assert_eq!(back.get::<i64>("inner").unwrap(), 5);
 }
+
+/// While the VM is lent, the state's own API panics instead of reaching it a second way; Lua run
+/// through the lent VM reaches its callbacks, which use the API as usual.
+#[test]
+fn a_lent_vm_is_the_only_way_in_until_it_is_back() {
+    let lua = benilla_mlua::Lua::new();
+    let t = lua.create_table().unwrap();
+    let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lua.with_vm(|_| t.set("x", 1).unwrap())
+    }));
+    assert!(hit.is_err(), "a handle used while the VM is lent panics");
+    let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lua.with_vm(|_| lua.globals())
+    }));
+    assert!(hit.is_err(), "the state's API used while the VM is lent panics");
+
+    let f = lua
+        .create_function(|lua, ()| {
+            lua.globals().set("seen", 7)?;
+            Ok(())
+        })
+        .unwrap();
+    lua.globals().set("cb", f).unwrap();
+    lua.with_vm(|vm| vm.exec(b"cb()", b"=t").map(|_| ()).unwrap());
+    assert_eq!(lua.globals().get::<i64>("seen").unwrap(), 7, "back after the lend");
+}

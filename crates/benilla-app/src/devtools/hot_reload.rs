@@ -48,25 +48,26 @@ pub(super) fn poll(time: Res<Time>, script: Option<NonSend<UiScript>>, mut hr: R
         hr.epoch = u64::MAX;
         hr.mtimes.clear();
     }
-    // SAFETY: reads of the heap's source table; no Lua runs and no other `Lua` API is reached.
-    let heap = &unsafe { script.lua().raw_vm() }.heap;
-    if hr.epoch != heap.sources_epoch() {
-        hr.epoch = heap.sources_epoch();
-        let resolved = &mut hr.resolved;
-        hr.files = heap
-            .sources
-            .iter()
-            .map(|name| {
-                let name = name.as_ref()?;
-                if let Some(p) = resolved.get(&name[..]) {
-                    return p.clone();
-                }
-                let p = file_of(&root, &String::from_utf8_lossy(name));
-                resolved.insert(Box::from(&name[..]), p.clone());
-                p
-            })
-            .collect();
-    }
+    script.lua().with_vm(|vm| {
+        let heap = &vm.heap;
+        if hr.epoch != heap.sources_epoch() {
+            hr.epoch = heap.sources_epoch();
+            let resolved = &mut hr.resolved;
+            hr.files = heap
+                .sources
+                .iter()
+                .map(|name| {
+                    let name = name.as_ref()?;
+                    if let Some(p) = resolved.get(&name[..]) {
+                        return p.clone();
+                    }
+                    let p = file_of(&root, &String::from_utf8_lossy(name));
+                    resolved.insert(Box::from(&name[..]), p.clone());
+                    p
+                })
+                .collect();
+        }
+    });
     let mut changed = Vec::new();
     for (id, path) in hr.files.iter().enumerate() {
         let Some(path) = path else { continue };
@@ -112,13 +113,14 @@ fn reload(script: &UiScript, root: &Path, id: usize, path: &Path) -> (String, bo
         return (format!("{shown}: unreadable"), false);
     };
     let src = benilla_ui::source::chunk(&bytes);
-    // SAFETY: a source lookup and a hot reload through this one reference; nothing else reaches
-    // the `Lua` API until it is let go.
-    let vm = unsafe { script.lua().raw_vm() };
-    let Some(name) = vm.heap.source_name(id as u32).cloned() else {
+    let r = script.lua().with_vm(|vm| {
+        let name = vm.heap.source_name(id as u32).cloned()?;
+        Some(vm.hot_reload(&name, src))
+    });
+    let Some(r) = r else {
         return (format!("{shown}: no longer loaded"), false);
     };
-    match vm.hot_reload(&name, src) {
+    match r {
         // A file of top-level code only: nothing to swap, and it does not rerun.
         Ok(r) if r.swapped.is_empty() && r.reshaped.is_empty() && r.added.is_empty() => (
             format!("{shown}: no function to swap; top-level code runs again only on /reload"),

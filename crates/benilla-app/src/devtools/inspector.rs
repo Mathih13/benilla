@@ -80,15 +80,19 @@ pub(crate) struct LuaInspector {
     owners_epoch: Option<u64>,
     /// [`FRAME_HELPER`]'s function, a VM root, and the session of its VM.
     helper: Option<(u32, u64)>,
-    /// Each listed table's frame name, or `None` for a table that is no frame: running the frame
-    /// helper for every row on every frame cost about a millisecond of Lua over `_G`. Cleared every
-    /// [`NAME_FRAMES`] draws, so a label may trail a change, or a recycled table id, that long.
-    names: std::collections::HashMap<u32, Option<String>>,
+    /// Each listed table's frame name, or `None` for a table that is no frame, and the draw it was
+    /// read on: running the frame helper for every row on every frame cost about a millisecond of
+    /// Lua over `_G`. A name older than [`NAME_FRAMES`] draws is read again, at most
+    /// [`NAME_REFRESHES`] a draw, so a label may trail a change, or a recycled table id, a little
+    /// longer, and no one draw reads them all.
+    names: std::collections::HashMap<u32, (Option<String>, u32)>,
     draws: u32,
 }
 
 /// Draws a cached frame name lasts.
 const NAME_FRAMES: u32 = 30;
+/// Stale frame names read again per draw.
+const NAME_REFRESHES: u32 = 16;
 
 pub(super) fn toggle(
     keys: Res<ButtonInput<KeyCode>>,
@@ -113,8 +117,7 @@ pub(super) fn toggle(
 fn release_root(ins: &mut LuaInspector, script: &UiScript) {
     if let Some((id, session)) = ins.root.take() {
         if session == script.session() {
-            // SAFETY: one plain `Vm` call.
-            unsafe { script.lua().raw_vm() }.unroot(id);
+            script.lua().with_vm(|vm| vm.unroot(id));
         }
     }
 }
@@ -122,9 +125,7 @@ fn release_root(ins: &mut LuaInspector, script: &UiScript) {
 /// [`run`] under the load budget, so a runaway line errors instead of hanging the client.
 fn run_bounded(script: &UiScript, text: &str) -> Result<Option<Value>, String> {
     script.set_instruction_budget(crate::ui_script::addons::LOAD_INSTRUCTION_BUDGET);
-    // SAFETY: the line runs through this one reference, which hands itself to the callbacks it
-    // reaches; nothing else touches the `Lua` API until it is let go.
-    let r = run(unsafe { script.lua().raw_vm() }, text);
+    let r = script.lua().with_vm(|vm| run(vm, text));
     script.clear_instruction_budget();
     r
 }
@@ -148,8 +149,7 @@ fn evaluate(ins: &mut LuaInspector, script: &UiScript) {
     match run_bounded(script, &ins.expr) {
         Ok(Some(v)) => {
             release_root(ins, script);
-            // SAFETY: one plain `Vm` call.
-            let id = unsafe { script.lua().raw_vm() }.root(v);
+            let id = script.lua().with_vm(|vm| vm.root(v));
             ins.root = Some((id, script.session()));
             ins.filter.clear();
             ins.status = None;
@@ -158,10 +158,8 @@ fn evaluate(ins: &mut LuaInspector, script: &UiScript) {
         Err(e) => ins.status = Some((e, false)),
     }
     if ins.root.is_none() {
-        // SAFETY: plain `Vm` calls.
-        let vm = unsafe { script.lua().raw_vm() };
-        let g = Value::Table(vm.globals);
-        ins.root = Some((vm.root(g), script.session()));
+        let id = script.lua().with_vm(|vm| vm.root(Value::Table(vm.globals)));
+        ins.root = Some((id, script.session()));
     }
 }
 
@@ -179,7 +177,10 @@ struct Cx<'a> {
     edit: &'a mut Option<(egui::Id, String, bool)>,
     asks: &'a mut Asks,
     helper: Value,
-    names: &'a mut std::collections::HashMap<u32, Option<String>>,
+    names: &'a mut std::collections::HashMap<u32, (Option<String>, u32)>,
+    draws: u32,
+    /// Stale names this draw may still read again.
+    refreshes: &'a mut u32,
 }
 
 /// A frame's name and its scripts, when `t` is a frame's table (its `[0]` is a userdata).
@@ -227,16 +228,52 @@ pub(super) fn panel_ui(
     };
     // Drawing runs Lua: the frame helper, whose `GetName` and `GetScript` an addon may override.
     script.set_instruction_budget(crate::ui_script::addons::LOAD_INSTRUCTION_BUDGET);
-    // SAFETY: from here to the end of the drawing, every VM access, the Lua the frame helper runs
-    // included, goes through this one reference; the budget is set before it is taken and
-    // cleared after its last use.
-    let vm = unsafe { script.lua().raw_vm() };
-    if ins.helper.is_none_or(|(_, s)| s != script.session()) {
+    let session = script.session();
+    let mut asks = Asks::default();
+    script
+        .lua()
+        .with_vm(|vm| draw(ctx, vm, &mut ins, root_id, session, &mut asks));
+    script.clear_instruction_budget();
+
+    if let Some((slot, text)) = asks.commit {
+        let lua = script.lua();
+        let held = lua.with_vm(|vm| slot.holds().map(|v| vm.root(v)));
+        let r = run_bounded(&script, &text);
+        ins.status = Some(lua.with_vm(|vm| {
+            let status = match r {
+                Ok(v) => match write(vm, slot, v.unwrap_or(Value::Nil)) {
+                    Ok(()) => (format!("wrote {text}"), true),
+                    Err(e) => (e, false),
+                },
+                Err(e) => (e, false),
+            };
+            for id in held {
+                vm.unroot(id);
+            }
+            status
+        }));
+    }
+    if asks.evaluate {
+        evaluate(&mut ins, &script);
+    }
+    Ok(())
+}
+
+/// The window, drawn with the VM lent for it: the frame helper's Lua runs through `vm`.
+fn draw(
+    ctx: &egui::Context,
+    vm: &mut Vm,
+    ins: &mut LuaInspector,
+    root_id: u32,
+    session: u64,
+    asks: &mut Asks,
+) {
+    if ins.helper.is_none_or(|(_, s)| s != session) {
         let f = vm
             .exec(FRAME_HELPER, b"=[inspector]")
             .map_err(|e| vm.display(e));
         let f = f.expect("the frame helper compiles")[0];
-        ins.helper = Some((vm.root(f), script.session()));
+        ins.helper = Some((vm.root(f), session));
     }
     let helper = vm.rooted(ins.helper.unwrap().0);
     if ins.owners_epoch != Some(vm.heap.sources_epoch()) {
@@ -244,13 +281,8 @@ pub(super) fn panel_ui(
         ins.owners_epoch = Some(vm.heap.sources_epoch());
     }
     let root = vm.rooted(root_id);
-    let ins = &mut *ins;
     ins.draws = ins.draws.wrapping_add(1);
-    if ins.draws.is_multiple_of(NAME_FRAMES) {
-        ins.names.clear();
-    }
-    let mut asks = Asks::default();
-
+    let mut refreshes = NAME_REFRESHES;
     egui::Window::new("Lua inspector")
         .default_pos(egui::pos2(560.0, 200.0))
         .default_size(egui::vec2(520.0, 560.0))
@@ -304,9 +336,11 @@ pub(super) fn panel_ui(
                 vm: &mut *vm,
                 owners: &ins.owners,
                 edit: &mut ins.edit,
-                asks: &mut asks,
+                asks,
                 helper,
                 names: &mut ins.names,
+                draws: ins.draws,
+                refreshes: &mut refreshes,
             };
             let head = describe(&mut cx, root);
             ui.label(egui::RichText::new(head).strong().color(colour(root)));
@@ -318,31 +352,6 @@ pub(super) fn panel_ui(
                     _ => row(ui, &mut cx, egui::Id::new("lua_root"), "value", root, None),
                 });
         });
-    script.clear_instruction_budget();
-
-    if let Some((slot, text)) = asks.commit {
-        // SAFETY: plain `Vm` calls, each reference let go before the next `Lua` API call.
-        let held = slot
-            .holds()
-            .map(|v| unsafe { script.lua().raw_vm() }.root(v));
-        let r = run_bounded(&script, &text);
-        // SAFETY: plain `Vm` calls.
-        let vm = unsafe { script.lua().raw_vm() };
-        ins.status = Some(match r {
-            Ok(v) => match write(vm, slot, v.unwrap_or(Value::Nil)) {
-                Ok(()) => (format!("wrote {text}"), true),
-                Err(e) => (e, false),
-            },
-            Err(e) => (e, false),
-        });
-        for id in held {
-            vm.unroot(id);
-        }
-    }
-    if asks.evaluate {
-        evaluate(ins, &script);
-    }
-    Ok(())
 }
 
 /// A raw write: no `__newindex`, no frame script runs.
@@ -424,11 +433,18 @@ fn brief(vm: &mut Vm, v: Value) -> String {
 fn describe(cx: &mut Cx, v: Value) -> String {
     match v.unpack() {
         V::Table(t) => {
-            let name = match cx.names.get(&t.0) {
-                Some(n) => n.clone(),
+            let cached = cx
+                .names
+                .get(&t.0)
+                .filter(|(_, at)| cx.draws.wrapping_sub(*at) < NAME_FRAMES || *cx.refreshes == 0);
+            let name = match cached {
+                Some((n, _)) => n.clone(),
                 None => {
+                    if cx.names.contains_key(&t.0) {
+                        *cx.refreshes -= 1;
+                    }
                     let n = frame_info(cx, t).map(|(name, _)| name);
-                    cx.names.insert(t.0, n.clone());
+                    cx.names.insert(t.0, (n.clone(), cx.draws));
                     n
                 }
             };
