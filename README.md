@@ -118,5 +118,5 @@ runtime. The few files under `crates/benilla-app/assets/ui/` are our own, not co
 adapters over stock files, and the settings windows and script error log benilla draws itself.
 
 World of Warcraft is a trademark of Blizzard Entertainment, Inc. Our own code is licensed under
-[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. The vendored component
-under `third_party/`, the kira audio engine, keeps its own upstream license, alongside it.
+[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. The kira audio engine under
+`third_party/` is vendored under the same two licenses, with its author's copyright notices beside it.
