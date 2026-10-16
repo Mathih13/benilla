@@ -291,7 +291,7 @@ fn load_default_languages(
 pub(crate) fn seed_default_language(world: &mut World, script: &mut UiScript) {
     let (Some(langs), Some(roster)) = (
         world.get_resource::<DefaultLanguagesRes>(),
-        world.get_resource::<crate::char_select::Roster>(),
+        world.get_resource::<crate::glue_session::roster::Roster>(),
     ) else {
         return;
     };
@@ -2353,7 +2353,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin))
-            .insert_state(crate::char_select::ClientState::InWorld)
+            .insert_state(crate::client_state::ClientState::InWorld)
             .init_resource::<Selection>()
             .init_resource::<crate::ui_pet::PetBar>()
             .init_resource::<crate::net::GuidIndex>()

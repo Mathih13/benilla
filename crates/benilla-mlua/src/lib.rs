@@ -98,7 +98,11 @@ impl Drop for Inner {
     fn drop(&mut self) {
         // SAFETY: `owned` came from `Box::into_raw` in `Lua::over` and is freed only here; no
         // reference to the VM outlives the last `Lua`, which is going.
-        drop(unsafe { Box::from_raw(self.owned) });
+        let vm = unsafe { Box::from_raw(self.owned) };
+        let id = vm.vm_id();
+        drop(vm);
+        // Its panics' error values went with it. `try_with`: the thread may be ending.
+        let _ = PANICS.try_with(|p| p.borrow_mut().retain(|_, e| e.2 != id));
     }
 }
 
@@ -106,18 +110,19 @@ thread_local! {
     /// The family and VM of the callback running now, if any.
     static RUNNING: Cell<(u64, *mut Vm)> = const { Cell::new((0, std::ptr::null_mut())) };
     /// Each panic a callback raised as a Lua error, by its error value's tag: the payload until
-    /// it resumes in Rust, and its text for `tostring`. Tags rise, so the first entry is the
-    /// oldest; a Lua `pcall` that swallows a panic leaves its entry, and only the latest
-    /// [`PANICS_KEPT`] are kept.
+    /// it resumes in Rust, and its text for `tostring`. An entry a Lua `pcall` swallowed goes
+    /// once the collector frees its error value, or with its VM.
     static PANICS: RefCell<BTreeMap<u64, Panic>> = const { RefCell::new(BTreeMap::new()) };
 }
 
-// ponytail: a bound in place of a `__gc`, which the VM lacks; an older panic's error loses its
-// text and payload, and a callback panicking that often is already a bug report.
-const PANICS_KEPT: usize = 64;
-
-/// A panic raised as a Lua error: its payload until it resumes, and its text.
-type Panic = (Option<Box<dyn Any + Send>>, std::string::String);
+/// A panic raised as a Lua error: its payload until it resumes, its text, and the VM and
+/// userdata that carry it, by which an entry whose error value is gone is pruned.
+type Panic = (
+    Option<Box<dyn Any + Send>>,
+    std::string::String,
+    u64,
+    benilla_lua::value::UserRef,
+);
 
 static NEXT_FAMILY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -165,15 +170,18 @@ fn raise_panic(vm: &mut Vm, payload: Box<dyn Any + Send>) -> LuaError {
         "<panic>".to_owned()
     };
     let tag = PANIC_TAG | NEXT_PANIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    PANICS.with(|p| {
-        let mut p = p.borrow_mut();
-        p.insert(tag, (Some(payload), text));
-        while p.len() > PANICS_KEPT {
-            p.pop_first();
-        }
-    });
     let meta = panic_meta(vm);
     let u = vm.new_user(tag, Some(meta));
+    let V::User(r) = u.unpack() else {
+        unreachable!("a userdata")
+    };
+    let id = vm.vm_id();
+    PANICS.with(|p| {
+        let mut p = p.borrow_mut();
+        // The entries of this VM whose error value the collector freed go first.
+        p.retain(|&t, e| e.2 != id || vm.heap.user_tag(e.3) == Some(t));
+        p.insert(tag, (Some(payload), text, id, r));
+    });
     vm.throw(u)
 }
 
@@ -205,6 +213,12 @@ fn panic_meta(vm: &mut Vm) -> benilla_lua::value::TableRef {
         .set(key, benilla_lua::Value::Table(meta))
         .expect("a string key");
     meta
+}
+
+/// Panics raised as Lua errors this thread still keeps, for a test that they are let go.
+#[doc(hidden)]
+pub fn kept_panics() -> usize {
+    PANICS.with(|p| p.borrow().len())
 }
 
 /// The panic a Lua error value carries, if it is one whose payload has not resumed yet.
@@ -282,7 +296,16 @@ impl Lua {
     /// An independent copy of this state: the whole VM, every value and closure, with no host
     /// data; the caller copies the host data it needs (`set_app_data`). A snapshot to restore
     /// from, or a template to start many runs from.
+    ///
+    /// # Panics
+    ///
+    /// Inside a callback of this state: the copy would hold the running calls' frames, which
+    /// nothing would ever return from.
     pub fn fork(&self) -> Lua {
+        assert!(
+            self.vm().frames_empty(),
+            "a state is forked from outside its callbacks"
+        );
         let vm: Vm = self.vm().clone();
         Lua::over(Box::new(vm), self.0.family)
     }
@@ -362,14 +385,16 @@ impl Lua {
     }
 
     /// A VM value as an API value: collectables become rooted handles, and an integral number
-    /// becomes `Integer`, as mlua reads a 5.1 number.
+    /// in `i64`'s range becomes `Integer`, as mlua reads a 5.1 number (`num_traits::cast`, then
+    /// the bits compared: `-0` and `2^63` stay `Number`).
     pub(crate) fn wrap(&self, v: benilla_lua::Value) -> Value {
         match v.unpack() {
             V::Nil => Value::Nil,
             V::Bool(b) => Value::Boolean(b),
             V::Num(n) => {
+                const TWO63: f64 = 9_223_372_036_854_775_808.0;
                 let i = n as i64;
-                if (i as f64).to_bits() == n.to_bits() {
+                if (-TWO63..TWO63).contains(&n) && (i as f64).to_bits() == n.to_bits() {
                     Value::Integer(i)
                 } else {
                     Value::Number(n)
@@ -414,23 +439,27 @@ impl Lua {
         Ok(Table(self.make_ref(benilla_lua::Value::Table(t))))
     }
 
+    /// A table with room for the iterator's lower bound of keys, set raw in order, as mlua's.
     pub fn create_table_from<K: IntoLua, V2: IntoLua>(
         &self,
         iter: impl IntoIterator<Item = (K, V2)>,
     ) -> Result<Table> {
-        let t = self.create_table()?;
+        let iter = iter.into_iter();
+        let t = self.create_table_with_capacity(0, iter.size_hint().0)?;
         for (k, v) in iter {
             t.raw_set(k, v)?;
         }
         Ok(t)
     }
 
+    /// A table with an array part of the iterator's lower bound, `1..` set raw, as mlua's.
     pub fn create_sequence_from<T: IntoLua>(
         &self,
         iter: impl IntoIterator<Item = T>,
     ) -> Result<Table> {
-        let t = self.create_table()?;
-        for (i, v) in iter.into_iter().enumerate() {
+        let iter = iter.into_iter();
+        let t = self.create_table_with_capacity(iter.size_hint().0, 0)?;
+        for (i, v) in iter.enumerate() {
             t.raw_set(i + 1, v)?;
         }
         Ok(t)
@@ -658,11 +687,15 @@ impl Lua {
         })
     }
 
+    /// mlua's `coerce_integer` on 5.1: an `Integer` as it is, else `lua_tointegerx`'s compat
+    /// rule, the number truncated if it is within `EPSILON` of that.
     pub fn coerce_integer(&self, v: Value) -> Result<Option<Integer>> {
-        Ok(self.coerce_number(v)?.and_then(|n| {
-            let i = n as i64;
-            ((i as f64) == n).then_some(i)
-        }))
+        if let Value::Integer(i) = v {
+            return Ok(Some(i));
+        }
+        Ok(self
+            .coerce_number(v)?
+            .and_then(|n| ((n - (n as i64) as f64).abs() < f64::EPSILON).then_some(n as i64)))
     }
 
     /// `lua_tostring`: a string, or a number written as one.
@@ -712,7 +745,9 @@ impl Lua {
         Some(f(&Debug { info, lua: self }))
     }
 
-    /// Run `callback` about every `triggers.every_nth_instruction` instructions.
+    /// Run `callback` once for every `triggers.every_nth_instruction` instructions, counted as
+    /// 5.1 counts them, at the next loop back edge, call or return rather than the exact
+    /// instruction (`benilla_lua::vm::Hook`).
     pub fn set_hook<F>(&self, triggers: HookTriggers, callback: F) -> Result<()>
     where
         F: Fn(&Lua, &Debug) -> Result<VmState> + 'static,
@@ -1122,8 +1157,24 @@ impl Table {
         V2::from_raw(v, lua)
     }
 
+    /// mlua's `raw_remove`: an integer key in `1..=#t` shifts the rest down, as `table.remove`
+    /// does; any other key is set to nil.
     pub fn raw_remove(&self, key: impl IntoLua) -> Result<()> {
-        self.raw_set(key, Value::Nil)
+        let lua = &self.lua();
+        match key.into_lua(lua)? {
+            Value::Integer(idx) => {
+                let size = self.raw_len() as Integer;
+                if idx < 1 || idx > size {
+                    return Err(Error::runtime("index out of bounds"));
+                }
+                for i in idx..size {
+                    let v: Value = self.raw_get(i + 1)?;
+                    self.raw_set(i, v)?;
+                }
+                self.raw_set(size, Value::Nil)
+            }
+            key => self.raw_set(key, Value::Nil),
+        }
     }
 
     /// `lua_objlen`: 5.1's `luaH_getn`.
@@ -1131,8 +1182,27 @@ impl Table {
         self.lua().vm().heap.table(self.tref()).length()
     }
 
+    /// mlua's `len` on 5.1: `#t`, or with a metatable its compat `luaL_len`, which calls a
+    /// `__len` and takes its answer as `lua_tointegerx` does.
     pub fn len(&self) -> Result<Integer> {
-        Ok(self.raw_len() as Integer)
+        let lua = &self.lua();
+        let vm = lua.vm();
+        let Some(meta) = vm.heap.table(self.tref()).meta else {
+            return Ok(self.raw_len() as Integer);
+        };
+        let key = vm.str(b"__len");
+        let len = vm.heap.table(meta).get(key);
+        if len.is_nil() {
+            return Ok(self.raw_len() as Integer);
+        }
+        let t = self.0.get();
+        let r = lua
+            .vm()
+            .protected(|vm| vm.call_value(len, &[t], 1))
+            .map_err(|e| lua.error_from(e))?;
+        let n = lua.wrap(r[0]);
+        lua.coerce_integer(n)?
+            .ok_or_else(|| Error::runtime("object length is not an integer"))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1146,8 +1216,12 @@ impl Table {
         )
     }
 
+    /// mlua's `push`: with a metatable, at `len() + 1` through `__newindex`; else raw.
     pub fn push(&self, value: impl IntoLua) -> Result<()> {
-        let n = self.raw_len();
+        if !self.has_metatable() {
+            return self.raw_push(value);
+        }
+        let n = self.len()?;
         self.set(n + 1, value)
     }
 
@@ -1156,33 +1230,37 @@ impl Table {
         self.raw_set(n + 1, value)
     }
 
+    /// mlua's `pop`: with a metatable, `t[len()]` through `__index`, then set to nil through
+    /// `__newindex`, `0` included; else raw.
     pub fn pop<V2: FromLua>(&self) -> Result<V2> {
-        let n = self.raw_len();
-        if n == 0 {
-            return V2::from_lua(Value::Nil, &self.lua());
+        if !self.has_metatable() {
+            return self.raw_pop();
         }
+        let n = self.len()?;
         let v: Value = self.get(n)?;
         self.set(n, Value::Nil)?;
         V2::from_lua(v, &self.lua())
     }
 
+    /// mlua's `raw_pop`: `t[#t]`, then `t[#t] = nil` raw, which on an empty table sets key 0.
     pub fn raw_pop<V2: FromLua>(&self) -> Result<V2> {
         let n = self.raw_len();
-        if n == 0 {
-            return V2::from_lua(Value::Nil, &self.lua());
-        }
         let v: Value = self.raw_get(n)?;
         self.raw_set(n, Value::Nil)?;
         V2::from_lua(v, &self.lua())
     }
 
+    /// mlua's `raw_insert`: `idx` in `1..=#t + 1`, the value converted first, the rest shifted
+    /// up raw.
     pub fn raw_insert(&self, idx: Integer, value: impl IntoLua) -> Result<()> {
-        let n = self.raw_len() as Integer;
-        let mut i = n;
-        while i >= idx {
+        let size = self.raw_len() as Integer;
+        if idx < 1 || idx > size + 1 {
+            return Err(Error::runtime("index out of bounds"));
+        }
+        let value = value.into_lua(&self.lua())?;
+        for i in (idx..=size).rev() {
             let v: Value = self.raw_get(i)?;
             self.raw_set(i + 1, v)?;
-            i -= 1;
         }
         self.raw_set(idx, value)
     }

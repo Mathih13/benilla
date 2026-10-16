@@ -1,6 +1,8 @@
 //! The profiler charges time to the chunk that ran it, and the census charges tables to the
 //! chunk that made them.
 
+const SLEEP_MS: u64 = 2;
+
 fn source_id(vm: &benilla_lua::Vm, name: &[u8]) -> usize {
     vm.heap
         .sources
@@ -9,9 +11,15 @@ fn source_id(vm: &benilla_lua::Vm, name: &[u8]) -> usize {
         .expect("a compiled chunk")
 }
 
+/// Time in a host function lands on the chunk that called it, and a loop's on the chunk that runs
+/// it. Neither is checked against a wall clock's upper bound: a sleep takes at least its time.
 #[test]
 fn time_and_tables_land_on_the_chunk_that_spent_and_made_them() {
     let mut vm = benilla_lua::new_state();
+    vm.register("Sleep", |_, _| {
+        std::thread::sleep(std::time::Duration::from_millis(SLEEP_MS));
+        Ok(0)
+    });
     vm.exec(
         b"function Heavy() local s = 0 for i = 1, 200000 do s = s + i end return s end \
           function Maker() Kept = {} for i = 1, 500 do Kept[i] = {i} end end",
@@ -19,7 +27,7 @@ fn time_and_tables_land_on_the_chunk_that_spent_and_made_them() {
     )
     .unwrap();
     vm.exec(
-        b"function Light() return 1 end function Both() Light() return Heavy() end",
+        b"function Light() Sleep() end function Both() Light() return Heavy() end",
         b"@Interface\\AddOns\\Light\\Light.lua",
     )
     .unwrap();
@@ -31,10 +39,8 @@ fn time_and_tables_land_on_the_chunk_that_spent_and_made_them() {
     let light = source_id(&vm, b"@Interface\\AddOns\\Light\\Light.lua");
     let ns = |i: usize| p.ns.get(i).copied().unwrap_or(0);
     println!("heavy {} ns, light {} ns", ns(heavy), ns(light));
-    assert!(
-        ns(heavy) > 20 * ns(light),
-        "the loop's chunk carries the time"
-    );
+    assert!(ns(light) >= 50 * SLEEP_MS * 1_000_000, "the sleeps' caller");
+    assert!(ns(heavy) > 0);
     let census = vm.heap.census();
     assert!(
         census[heavy].tables >= 501,

@@ -12,7 +12,8 @@ use crate::sound::GlueSound;
 
 use super::dialog::DeleteDialog;
 use super::screen::SelectAction;
-use super::{class_name, send_pick, ClientState, Roster};
+use super::{class_name, ClientState};
+use crate::glue_session::roster::{send_pick, Roster};
 
 use crate::glue::{drag_yaw, ROTATE_RATE};
 
@@ -34,7 +35,7 @@ pub(super) fn select_input(
     choice: Res<crate::net::RealmChoice>,
     mut next: ResMut<NextState<ClientState>>,
     mut sounds: MessageWriter<GlueSound>,
-    mut intent: ResMut<crate::login::LoginIntent>,
+    mut intent: ResMut<crate::glue_session::login::LoginIntent>,
     glue_dialog: Res<crate::glue::dialog::GlueDialog>,
     time: Res<Time>,
     unit_names: crate::ui_unit::NameTables,
@@ -199,12 +200,12 @@ mod tests {
                 .init_resource::<Realms>()
                 .init_resource::<DeleteDialog>()
                 .init_resource::<super::super::addons::AddonsPanel>()
-                .init_resource::<crate::login::LoginIntent>()
+                .init_resource::<crate::glue_session::login::LoginIntent>()
                 .init_resource::<crate::glue::dialog::GlueDialog>()
                 .insert_resource(CharPick(pick_tx.into()))
                 .insert_resource(RealmChoice(realm_tx.into()))
                 .add_message::<GlueSound>()
-                .add_message::<crate::login::GlueLogin>()
+                .add_message::<crate::glue_session::login::GlueLogin>()
                 .add_message::<bevy::input::mouse::MouseWheel>()
                 .add_systems(PreUpdate, take_input);
             if list_first {
@@ -245,7 +246,7 @@ mod tests {
             );
             assert!(
                 app.world()
-                    .resource::<bevy::ecs::message::Messages<crate::login::GlueLogin>>()
+                    .resource::<bevy::ecs::message::Messages<crate::glue_session::login::GlueLogin>>()
                     .is_empty(),
                 "{order}: nor ends the login"
             );

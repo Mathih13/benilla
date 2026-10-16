@@ -177,16 +177,24 @@ fn setfenv(vm: &mut Vm, nargs: usize) -> R<usize> {
     Ok(vm.ret1(f))
 }
 
+/// `luaB_next`: `lua_next` replaces the key argument with the next key and pushes its value,
+/// so the results sit where the key was, as a generic `for`'s registers then show.
 fn next(vm: &mut Vm, nargs: usize) -> R<usize> {
     let t = vm.check_table(nargs, 1)?;
     let k = vm.arg(nargs, 1);
-    match vm.heap.table(t).next(k) {
+    let step = vm.heap.table(t).next(k);
+    let base = vm.native_base();
+    match step {
         Ok(Some((k, v))) => {
+            vm.top = base + 1;
             vm.push(k);
             vm.push(v);
             Ok(2)
         }
-        Ok(None) => Ok(vm.ret1(Value::Nil)),
+        Ok(None) => {
+            vm.top = base + 1;
+            Ok(vm.ret1(Value::Nil))
+        }
         Err(crate::table::InvalidKey) => Err(vm.rt_error("invalid key to `next'")),
     }
 }

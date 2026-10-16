@@ -1,7 +1,8 @@
 //! The script host against the C Lua 5.1 build it replaced: every case runs through `UiScript`,
-//! and its answer must equal the one that build gave, recorded in `vm_parity.golden` with mlua's
-//! `runtime error: ` and `stack traceback:` wrapper taken out. A new case's answer comes from
-//! the reference, written in by hand.
+//! and its answer must equal the one that build gave, recorded in `vm_parity.golden` per platform
+//! where the C library decides it (`PLATFORM_CASES`), with mlua's `runtime error: ` and
+//! `stack traceback:` wrapper taken out. A new case's answer comes from the reference, written in
+//! by hand.
 //!
 //! The cases that list every global answer with each binding the script host has, not with the
 //! VM, so they live in `vm_parity_surface.golden`, which `BENILLA_BLESS=1` rewrites when a
@@ -9,7 +10,7 @@
 
 use benilla_ui::script::UiScript;
 
-/// Serializers every case runs with: `S(...)` writes values, `E(f, ...)` writes a protected call. A number
+/// Serializers both VMs run: `S(...)` writes values, `E(f, ...)` writes a protected call. A number
 /// prints exactly, so a one-ulp difference shows.
 const PRELUDE: &str = r#"
 local function S1(v)
@@ -551,6 +552,105 @@ b]])"#),
         return S(R("for k in function() end, nil, nil, 42 do end return 7"),
           R("local n = 0 for k in function(s, c) if c ~= 3 then return (c or 0) + 1 end end, nil, nil, 9, 8 do do local y = k n = n + y end end return n"),
           R("local n = 0 for k, v in function(s, c) if c ~= 2 then return (c or 0) + 1, 10 end end, 1, nil, 4 do n = n + k + v end return n"))"#),
+    ("fix-front_forlist_return", r#"local function R(src) return E(loadstring(src, "=t")) end
+        local f = "local function f(s, c) if not c then return 1 end end "
+        return S(R(f .. "for k in f, nil, nil, 42 do return k, 5 end"),
+          R(f .. "for k in f, nil, nil, 42 do return k, 5, 6 end"),
+          R(f .. "for k in f, nil, nil, 42 do return tostring(k) end"),
+          R(f .. "local function g(x) return 'g' .. tostring(x) end for k in f, nil, nil, 42 do return g(k) end"),
+          R(f .. "for k in f, nil, nil, 42, 43 do return k, 5 end"))"#),
+    // A generic `for` over `next` with a fourth value: the body's first local reads the register
+    // above the loop's variables, which the call to `next` leaves as `OP_TFORLOOP` and
+    // `lua_next` wrote it.
+    ("fix-vm tforloop_next_registers", r#"local function R(src) return E(loadstring(src, "=t")) end
+        local t = "local t, o = {10, 20}, {} "
+        return S(R(t .. "for k in next, t, nil, 42 do local y = k table.insert(o, type(y)) end return table.concat(o, ' ')"),
+          R(t .. "for k in next, t, nil, 42, 43 do local y, z = k table.insert(o, tostring(z)) end return table.concat(o, ' ')"),
+          R(t .. "for k, v in next, t, nil, 42 do local y = k table.insert(o, tostring(y)) end return table.concat(o, ' ')"),
+          R(t .. "for k, v, w in next, t, nil, 42 do local y = k table.insert(o, tostring(y) .. tostring(w)) end return table.concat(o, ' ')"),
+          R(t .. "for k, v, w, x in next, t, nil, 42 do local y = k table.insert(o, tostring(y) .. tostring(x)) end return table.concat(o, ' ')"),
+          R(t .. "for k in pairs(t) do end for k in next, t, nil, 42 do local y = k table.insert(o, type(y)) end return table.concat(o, ' ')"),
+          R(t .. "local function f() local a, b, c, d, e, g, h, i, j, l = 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' end "
+            .. "local function h() for k, v, w, x in next, t, nil, 42 do local y = k table.insert(o, tostring(y)) end end f() h() return table.concat(o, ' ')"))"#),
+    // `luaD_precall` starts every Lua frame with its registers nil, and `OP_TAILCALL` makes the
+    // callee's frame where its function sits before moving it down: a generic `for` over more
+    // than three values lets its body read what the calls under it left.
+    ("fix-vm frame_clears", r#"local function R(src) return E(loadstring(src, "=t")) end
+        local P = 'local o, n = {}, 0 local function T(v) return type(v) == "function" and "f" or tostring(v) end '
+        local B = ' for k in it, "s", "c", 1, 2, 3, 4, 5, 6 do local x1, x2, x3, x4, x5, x6, x7, x8, x9 '
+          .. 'table.insert(o, T(x1)..T(x2)..T(x3)..T(x4)..T(x5)..T(x6)..T(x7)..T(x8)..T(x9)) end return table.concat(o, " ")'
+        local I = 'local function it(s, c) n = n + 1 if n > 3 then return nil end if n == 1 then '
+        -- First, as no other runs before it: the chunk calling the leaky function is in the VM's
+        -- fast loop until then, and `g`'s frame, entered from the leaky function, clears `w`'s.
+        return S(R(P .. 'local function it(s, c) n = n + 1 if n > 2 then return nil end return n end '
+            .. 'local function w() local a, b, c, d, e, f, g, h, i, j, k, l = "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" end '
+            .. 'local function g(x) if x then local a, b, c, d, e, f, h, i, j, k, l = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 end end '
+            .. 'local function leaky() w() g(false)' .. B .. ' end local r = leaky() return r'),
+          R(P .. I .. 'local a, b, c2, d = "A", "B", "C", "D" end return n end' .. B),
+          R(P .. 'local function deep(m) if m > 0 then return deep(m - 1) end local a, b, c, d, e = "P", "Q", "R", "S", "T" end '
+            .. I .. 'local function g() local a, b, c2, d, e, f = "A", "B", "C", "D", "E", "F" end g() deep(2) end return n end' .. B),
+          R(P .. 'local function two(a, b) local x, y = "X", "Y" end ' .. I .. 'two(1, 2, 3, 4, 5, 6, 7) end return n end' .. B),
+          R(P .. 'local function w() local a, b, c, d, e, f, g, h = "a", "b", "c", "d", "e", "f", "g", "h" end '
+            .. 'local function t2(a) end local function t1() return t2(1) end ' .. I .. 'w() t1() end return n end' .. B))"#),
+    // `__index` and `__newindex` chains: 5.1.5's `luaV_gettable` and `luaV_settable` take 100 steps.
+    ("fix-vm tag_loop", r#"local function chain(n, field)
+          local last = {x = "found"}
+          for i = 1, n do last = setmetatable({}, {[field] = last}) end
+          return last
+        end
+        local o = {}
+        for _, n in {98, 99, 100, 101} do
+          table.insert(o, E(function() return chain(n, "__index").x end))
+          table.insert(o, E(function() local t = chain(n, "__newindex") t.y = 1 return "set" end))
+        end
+        return table.concat(o, "|")"#),
+    // A collection marks a deleted key dead (5.1.5's `removeentry`): a key set again takes a new
+    // node by `newkey`'s rules, not its old one, so `pairs` order shows it. A key equal to an
+    // existing one keeps that key, `-0` or `0`.
+    ("fix-vm dead_keys", r#"local function order(t) local o = {} for k in pairs(t) do table.insert(o, k) end return table.concat(o, " ") end
+        local o = {}
+        for _, c in {{5, 4}, {6, 5}, {7, 6}, {8, 4}, {13, 10}, {14, 14}} do
+          local n, d = c[1], c[2]
+          local keys = {} for i = 1, n do keys[i] = "k" .. i end
+          local a = {} for i = 1, n do a[keys[i]] = i end
+          local b = {} for i = 1, n do b[keys[i]] = i end
+          a[keys[d]] = nil collectgarbage() a[keys[d]] = 0
+          b[keys[d]] = nil b[keys[d]] = 0
+          table.insert(o, order(a) .. " / " .. order(b))
+        end
+        local z = 0 local nz = -z
+        local function keys(t) local r = {} for k, v in pairs(t) do table.insert(r, tostring(k) .. "=" .. v .. ":" .. tostring(1 / k)) end return table.concat(r, " ") end
+        local t = {} t[nz] = 1 t[0] = 2 table.insert(o, keys(t))
+        local u = {} u[0] = 1 u[nz] = 2 table.insert(o, keys(u))
+        local w = {} w[nz] = 1 w[nz] = nil collectgarbage() w[0] = 2 table.insert(o, keys(w))
+        return table.concat(o, " | ")"#),
+    // ── fix-libs: library errors the cases above leave out ──
+    // The message's first line: the C build's carries a Rust-side traceback after it.
+    ("fix-libs sort_invalid_order", r#"local function M(f, ...) local ok, e = pcall(f, unpack(arg)) if ok then return "ok" end
+          local _, _, m = string.find(tostring(e), "^([^\n]*)") return m end
+        local t = {} for i = 1, 50 do t[i] = math.mod(i * 7, 13) end
+        return S(M(table.sort, t, function(a, b) return true end), M(function() table.sort({3, 2, 1, 5, 4, 6}, function(a, b) return a <= b end) end),
+          M(function() local u = {5, 3, 1, 4, 2} table.sort(u, function(a, b) return true end) return table.concat(u, " ") end))"#),
+    ("fix-libs pattern_errors", r#"local caps = string.rep("(a)", 33)
+        -- 32 captures are 34 results: counted in a Lua function, which has room for them, where
+        -- `pcall` pushing its status past them trips the C build's API check.
+        return S(E(string.find, string.rep("a", 40), caps), E(function() return table.getn({string.find(string.rep("a", 40), string.rep("(a)", 32))}) end),
+          E(string.find, "abc", "%b"), E(string.find, "abc", "%ba"), E(string.gsub, "abc", "%b(", "x"),
+          E(string.find, "abc", "%fa"), E(string.find, "abc", "%f"), E(string.gfind("abc", "%f%a")),
+          E(string.find, "abc", "a)"), E(string.find, "abc", "(a%1)"), E(string.find, "abc", "%0"), E(string.gsub, "abc", "(a)", "%9"))"#),
+    ("fix-libs format_repeated_flags", r#"return S(E(string.format, "%-----5d", 1), E(string.format, "%------5d", 1), E(string.format, "%-+ #05d", 1), E(string.format, "%-+ #0-5d", 1),
+          E(string.format, "%1234d", 1), E(string.format, "%.1234f", 1), E(string.format, "%12.123f", 1))"#),
+    ("fix-libs random_args", r#"return S(E(math.random, 2, 1), E(math.random, 0), E(math.random, -1), E(math.random, 1, 2, 3), E(math.random, 1, 0),
+          E(math.random, "x"), E(math.random, 1, "y"), E(random, 0), E(math.random, 3, 3))"#),
+    ("fix-libs gsub_replacement_value", r#"return S(E(function() return string.gsub("abc", "%w", {a = {}}) end),
+          E(function() return string.gsub("abc", "%w", function(c) return true end) end),
+          E(function() return gsub("abc", "%w", function(c) return {} end) end), E(string.gsub, "abc", "%w", {b = false}))"#),
+    ("fix-libs debugstack_tail", r#"local function inner() return debugstack() end
+        local function viatail() return inner() end
+        local function caller() local s = viatail() return s end
+        local function deep(n) if n == 0 then return debugstack(1, 2, 1) end return deep(n - 1) end
+        local function deeper() local s = deep(3) return s end
+        return S(caller(), deeper(), debugstack(1, 0, 0))"#),
     // ── r2-vm: error handlers as 5.1's `luaG_errormsg` runs them ──
     ("r2-vm handler_reenters", r#"local n = 0
         local ok, e = xpcall(function() error("a", 0) end, function(m) n = n + 1 error("b", 0) end)
@@ -717,10 +817,176 @@ fn run(src: &str) -> String {
     }
 }
 
-/// `name\tanswer`, one case a line, the answer through `escape_default` onto one line.
 const GOLDEN: &str = "tests/vm_parity.golden";
+
+/// The cases that list every global: their answers move with each binding the script host
+/// gains, not with the VM, so they live in a file of their own that a binding change re-blesses.
 const SURFACE_GOLDEN: &str = "tests/vm_parity_surface.golden";
 const SURFACE_CASES: &[&str] = &["pairs_globals", "global_surface"];
+
+/// `escape_default` undone: the golden file's one-line answers back to text.
+fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = it.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+            }
+            Some(c) => out.push(c),
+            None => {}
+        }
+    }
+    out
+}
+
+/// The C Lua build hands Lua an error from a Rust callback through mlua's wrapper:
+/// `runtime error: ` before the message, and a Rust-side `stack traceback:` block after it.
+/// Neither Lua nor the 1.12 client writes either, and benilla's own VM raises the message alone,
+/// so the wrapper is taken out of a golden answer before it is compared; the message must match.
+fn without_mlua_wrapper(s: &str) -> String {
+    let s = s.replace("runtime error: ", "");
+    let mut out = String::new();
+    let mut rest = s.as_str();
+    while let Some(i) = rest.find("\nstack traceback:") {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + "\nstack traceback:".len()..];
+        // The block's lines each open with a tab; one newline after it goes with it.
+        while let Some(r) = rest.strip_prefix("\n\t") {
+            rest = r.find('\n').map_or("", |j| &r[j..]);
+        }
+        rest = rest.strip_prefix('\n').unwrap_or(rest);
+        rest = rest.strip_prefix("stack traceback:").map_or(rest, |r| {
+            // A second block straight after the first, as a rethrown error carries.
+            let mut r = r;
+            while let Some(x) = r.strip_prefix("\n\t") {
+                r = x.find('\n').map_or("", |j| &x[j..]);
+            }
+            r.strip_prefix('\n').unwrap_or(r)
+        });
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Cases whose answer on the C build depends on the platform's C library or compiler, so the
+/// golden file holds one answer per platform, `name@<os>-<arch>`, each blessed there:
+/// - the transcendental functions are the host libm's, rounded differently by glibc and Apple's;
+/// - a NaN prints its sign under glibc (`-nan`), never under Apple's libc, and which NaN a
+///   function answers is the host libm's;
+/// - `luaL_checknumber` on two arguments in one C call (`fmod`, `pow`, `ldexp`, `atan2`) checks
+///   them in the compiler's order: gcc on x86-64 the second first, clang on arm64 the first;
+/// - a `double` past the integer range cast to `ptrdiff_t` or `unsigned long` is undefined: x86-64
+///   answers `INT64_MIN`, arm64 saturates;
+/// - `math.random` is the host `rand`.
+///
+/// benilla-lua pins the reference platform's answers for the compiler and `rand` cases, and runs
+/// the host libm, so it answers a whole case as the C build only on the reference platform.
+/// Elsewhere, and on a platform no answer was blessed on, a case's answer is split into items at
+/// its separator, and each item every recorded platform answers alike is checked: only the items
+/// the platforms differ on go unchecked.
+const PLATFORM_CASES: &[&str] = &[
+    "fix-libs deg_rad",
+    "fix-libs random_ranges",
+    "fix-libs format_ulong",
+    "sweep string.char",
+    "sweep string.sub",
+    "sweep strsub",
+    "sweep getfenv",
+    "sweep math.mod",
+    "sweep mod",
+    "sweep math.sqrt",
+    "sweep sqrt",
+    "sweep math.log",
+    "sweep math.pow",
+    "sweep math.ldexp",
+    "sweep ldexp",
+    "sweep math.sin",
+    "sweep math.tan",
+    "sweep tan",
+    "sweep math.asin",
+    "sweep math.atan",
+    "sweep math.atan2",
+];
+
+/// Where a platform case's answer splits into items: a sweep's calls, the random numbers, else
+/// the answer's `|`-separated parts.
+fn item_separator(name: &str) -> &'static str {
+    if name.starts_with("sweep ") {
+        " | "
+    } else if name == "fix-libs random_ranges" {
+        " "
+    } else {
+        "|"
+    }
+}
+
+/// A platform case checked item by item against `recorded`, each blessed platform's answer: the
+/// failures, how many items went unchecked because the platforms answer them differently, and
+/// how many there are. `None` when nothing was recorded, or the platforms' answers do not split
+/// alike.
+fn check_items(name: &str, got: &str, recorded: &[String]) -> Option<(Vec<String>, usize, usize)> {
+    let sep = item_separator(name);
+    let sets: Vec<Vec<&str>> = recorded.iter().map(|a| a.split(sep).collect()).collect();
+    let n = sets.first()?.len();
+    if sets.iter().any(|s| s.len() != n) {
+        return None;
+    }
+    let got: Vec<&str> = got.split(sep).collect();
+    if got.len() != n {
+        return Some((
+            vec![format!("{name}: {} items, the C build {n}", got.len())],
+            0,
+            n,
+        ));
+    }
+    let mut failures = Vec::new();
+    let mut unchecked = 0;
+    // A NaN prints the same `nan` under Apple's libc whatever its sign, so a NaN item agreeing
+    // says nothing of the sign another platform's libm gives it.
+    let nan = |a: &str| {
+        a.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == "nan")
+    };
+    for (i, g) in got.iter().enumerate() {
+        let w = sets[0][i];
+        if sets.iter().any(|s| s[i] != w || nan(s[i])) {
+            unchecked += 1;
+        } else if *g != w {
+            failures.push(format!(
+                "{name} item {i}\n    got:  {}\n    want: {}",
+                g.escape_default(),
+                w.escape_default()
+            ));
+        }
+    }
+    Some((failures, unchecked, n))
+}
+
+/// The platform benilla-lua's pinned answers are the C build's on: Linux, x86-64, glibc.
+const REFERENCE_PLATFORM: &str = "linux-x86_64";
+
+fn platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The golden key a case's answer is under on `platform`: its name, or for a platform case its
+/// name and the platform.
+fn golden_key(name: &str, platform: &str) -> String {
+    if PLATFORM_CASES.contains(&name) {
+        format!("{name}@{platform}")
+    } else {
+        name.to_string()
+    }
+}
 
 /// Each answer against its golden line; a difference goes into `failures`.
 fn compare(golden: &str, answers: &[(&str, String)], failures: &mut Vec<String>) {
@@ -730,14 +996,24 @@ fn compare(golden: &str, answers: &[(&str, String)], failures: &mut Vec<String>)
         let got = got.escape_default().to_string();
         match want.get(name) {
             Some(w) if *w == got => {}
-            Some(w) => failures.push(format!("{name}\n    got:  {got}\n    want: {w}")),
+            Some(w)
+                if without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string()
+                    == got => {}
+            Some(w) => {
+                let w = without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string();
+                failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
+            }
             None => failures.push(format!("{name}: no golden answer")),
         }
     }
 }
 
 #[test]
-fn every_case_answers_as_the_c_lua_build_did() {
+fn every_case_answers_as_the_c_lua_build_recorded() {
     let sweep: Vec<(String, String)> = SWEEP_FNS
         .iter()
         .map(|f| (format!("sweep {f}"), format!("return SWEEP({f:?})")))
@@ -759,25 +1035,101 @@ fn every_case_answers_as_the_c_lua_build_did() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), cases.len(), "case names are unique");
-    let (surface, vm): (Vec<_>, Vec<_>) = answers
+    for p in PLATFORM_CASES {
+        assert!(names.contains(p), "platform case {p:?} is a case");
+    }
+    // The cases that list every global have a file of their own, one answer each.
+    let (surface, answers): (Vec<_>, Vec<_>) = answers
         .into_iter()
         .partition(|(name, _)| SURFACE_CASES.contains(name));
+    let platform = platform();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let golden = std::fs::read_to_string(dir.join(GOLDEN)).expect("the golden file");
+    let want: std::collections::BTreeMap<String, String> = golden
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(k, a)| (k.to_string(), a.to_string()))
+        .collect();
+    for k in want.keys() {
+        let (name, on) = k
+            .split_once('@')
+            .map_or((k.as_str(), false), |(n, _)| (n, true));
+        assert_eq!(
+            on,
+            PLATFORM_CASES.contains(&name),
+            "{k}: a platform case's answers are per platform, any other case's one for all"
+        );
+    }
+    // The VM's answers are the C build's record, and no C build is left to bless them.
     if std::env::var_os("BENILLA_BLESS").is_some() {
-        let lines: String = surface
+        let surface_lines: String = surface
             .iter()
             .map(|(n, a)| format!("{n}\t{}\n", a.escape_default()))
             .collect();
-        std::fs::write(dir.join(SURFACE_GOLDEN), lines).expect("write the golden file");
+        std::fs::write(dir.join(SURFACE_GOLDEN), surface_lines).expect("write the golden file");
     }
     let mut failures = Vec::new();
-    for (file, answers) in [(GOLDEN, &vm), (SURFACE_GOLDEN, &surface)] {
-        let golden = std::fs::read_to_string(dir.join(file)).expect("the golden file");
-        compare(&golden, answers, &mut failures);
+    let mut skipped = Vec::new();
+    let (mut unchecked_items, mut items) = (0, 0);
+    for (name, got) in &answers {
+        let platform_case = PLATFORM_CASES.contains(name);
+        // benilla-lua answers a whole platform case as the C build only where its pins were
+        // taken; elsewhere, and where no answer was blessed, the items every platform agrees on.
+        let own = want.get(&golden_key(name, &platform));
+        if platform_case && (own.is_none() || platform != REFERENCE_PLATFORM) {
+            let prefix = format!("{name}@");
+            let recorded: Vec<String> = want
+                .iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(_, a)| without_mlua_wrapper(&unescape(a)))
+                .collect();
+            match check_items(name, &without_mlua_wrapper(got), &recorded) {
+                Some((f, unchecked, n)) => {
+                    failures.extend(f);
+                    unchecked_items += unchecked;
+                    items += n;
+                }
+                None => skipped.push(*name),
+            }
+            continue;
+        }
+        let got = got.escape_default().to_string();
+        match own {
+            Some(w) if *w == got => {}
+            Some(w)
+                if without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string()
+                    == got => {}
+            Some(w) => {
+                let w = without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string();
+                failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
+            }
+            None => failures.push(format!("{name}: no golden answer")),
+        }
+    }
+    let surface_golden =
+        std::fs::read_to_string(dir.join(SURFACE_GOLDEN)).expect("the surface golden file");
+    compare(&surface_golden, &surface, &mut failures);
+    if items > 0 {
+        eprintln!(
+            "platform cases on {platform}: {} of {items} items checked, {unchecked_items} the \
+             platforms answer differently not",
+            items - unchecked_items
+        );
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "{} platform cases not checked on {platform}: {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
     }
     assert!(
         failures.is_empty(),
-        "{} of {} cases differ:\n{}",
+        "{} answers of {} cases differ:\n{}",
         failures.len(),
         cases.len(),
         failures.join("\n")

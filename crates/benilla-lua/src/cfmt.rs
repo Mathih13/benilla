@@ -102,7 +102,8 @@ pub fn fmt_uint(v: u64, conv: u8, spec: &Spec) -> String {
     pad(digits, prefix, &s, true)
 }
 
-/// A mantissa and exponent from Rust's `{:e}`, the exponent as MSVC writes it.
+/// A mantissa and exponent from Rust's `{:e}`, the exponent as glibc writes it: a sign and two
+/// digits at least.
 fn exp_form(m: f64, prec: usize, upper: bool) -> String {
     let s = format!("{m:.prec$e}");
     let (mant, exp) = s.split_once('e').unwrap();

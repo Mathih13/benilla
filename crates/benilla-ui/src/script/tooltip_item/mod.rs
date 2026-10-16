@@ -148,6 +148,7 @@ fn slot_instance(s: &crate::script::ContainerSlot, openable_source: bool) -> ren
         name: s.link.as_deref().and_then(link_name).map(str::to_string),
         durability: s.durability,
         creator: s.creator.clone(),
+        gift_creator: s.gift_creator.clone(),
         has_text: s.readable,
         flags: s.flags,
         already_bound: s.already_bound,
@@ -157,6 +158,8 @@ fn slot_instance(s: &crate::script::ContainerSlot, openable_source: bool) -> ren
         duration_ms: s.duration_ms,
         object: true,
         block_lock_id: 0,
+        block_wrapped: false,
+        cooldown_ms: 0,
     }
 }
 
@@ -181,6 +184,7 @@ pub(super) fn owned_instance(model: &Model, item_id: u32) -> Option<render::Item
             name: s.name.clone(),
             durability: s.durability,
             creator: s.creator.clone(),
+            gift_creator: s.gift_creator.clone(),
             flags: s.flags,
             already_bound: s.already_bound,
             enchants: s.enchants.clone(),
@@ -450,6 +454,7 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                                     name: s.name.clone(),
                                     durability: s.durability,
                                     creator: s.creator.clone(),
+                                    gift_creator: s.gift_creator.clone(),
                                     has_text: false,
                                     flags: s.flags,
                                     already_bound: s.already_bound,
@@ -464,6 +469,19 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                                     // inspected unit's item is a block (`0x532ee0`).
                                     object: unit.eq_ignore_ascii_case("player"),
                                     block_lock_id: 0,
+                                    block_wrapped: false,
+                                    // The player's own item answers the cooldown query
+                                    // (`0x5331ec`), unless it is charged and spent
+                                    // (`0x53318a`-`0x53319b`, the feed's `None`); an inspected
+                                    // record has none.
+                                    cooldown_ms: if unit.eq_ignore_ascii_case("player") {
+                                        super::tooltip_spell::live_remaining_ms(
+                                            model.inv_slot_cooldown(slot),
+                                            model.now,
+                                        )
+                                    } else {
+                                        0
+                                    },
                                 },
                             )
                         });
@@ -516,7 +534,7 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                     Value::Integer(1),
                     // hasCooldown is the builder's `[ebp-0x38]`, set by four lines: LOCKED, the
                     // temporary-enchant countdown, the item's duration (`0x52ce0d`) and
-                    // ITEM_COOLDOWN_TIME (not built). A template still in flight draws only the
+                    // ITEM_COOLDOWN_TIME (`0x52e140`). A template still in flight draws only the
                     // name, but the slot's own expiry still counts.
                     flag(live || inst.duration_ms.is_some()),
                     Value::Integer(i64::from(repair_cost)),
@@ -533,7 +551,7 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
         "SetBagItem",
         lua.create_function(|lua, (this, bag, slot): (Table, i64, u32)| {
             let h = frame_handle_of(lua, &this)?;
-            let (item_id, count, has_cd, link, quality, inst, repair_cost) = {
+            let (item_id, count, link, quality, inst, repair_cost) = {
                 let model = lua.app_data_mut::<Model>().expect("model app_data");
                 let cost = model.repair_costs.bags.get(&(bag, slot)).copied();
                 match model
@@ -543,21 +561,28 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                     .filter(|s| s.item_id != 0)
                 {
                     // `0x534620` takes the p6=1 leg iff the cooldown query `0x6e2ed0` reports
-                    // enable, start and duration all non-zero; that one boolean is both the
-                    // `hasCooldown` return and the inverse of the openable gate.
+                    // enable, start and duration all non-zero; that boolean is the inverse of the
+                    // openable gate. `hasCooldown` is the builder's own return. A charged
+                    // template whose copy has no charge left skips the query for the p6=0 leg
+                    // (`0x5347e3`-`0x5347f4`); the feed leaves such a slot's cooldown `None`.
                     Some(s) => {
                         let has_cd = s
                             .cooldown
                             .is_some_and(|(start, dur, en)| en && start > 0 && dur > 0);
+                        // `start + duration - now` (`0x534882`..`0x53488c`), into `+0x408`.
+                        let mut inst = slot_instance(s, !has_cd);
+                        inst.cooldown_ms = super::tooltip_spell::live_remaining_ms(
+                            model.container_cooldowns.get(&(bag, slot)).copied(),
+                            model.now,
+                        );
                         (
                             s.item_id,
                             s.count.max(1),
-                            has_cd,
                             s.link.clone(),
                             s.quality.unwrap_or(1),
-                            // p6 = 0 iff no cooldown runs; mid-cooldown the reference shows
-                            // ITEM_COOLDOWN_TIME instead, which is not built.
-                            slot_instance(s, !has_cd),
+                            // p6 = 0 iff no cooldown runs; mid-cooldown ITEM_COOLDOWN_TIME takes
+                            // the openable line's place.
+                            inst,
                             cost.unwrap_or(0),
                         )
                     }
@@ -606,8 +631,8 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
             show_or_hide_empty(lua, h);
             Ok(MultiValue::from_vec(vec![
                 // The builder's `[ebp-0x38]`: LOCKED, a countdown, the item's duration line, or a
-                // running cooldown (ITEM_COOLDOWN_TIME, not drawn here).
-                flag(has_cd || live || inst.duration_ms.is_some()),
+                // running cooldown (ITEM_COOLDOWN_TIME, `0x52e140`).
+                flag(live || inst.duration_ms.is_some()),
                 Value::Integer(i64::from(repair_cost)),
             ]))
         })?,
@@ -637,10 +662,13 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                 clear(lua, h);
                 let inst = render::ItemInstance {
                     name: item.name.clone(),
-                    // The target side's block carries the partner's lock id (`0x534563`); the
-                    // player's is zero (`0x534341`), but its slot is a live item object, whose
-                    // flags the LOCKED gate reads (`0x5342ed`, `0x5343da`).
+                    // The target side's block carries the partner's lock id (`0x534563`), wrapped
+                    // word (`0x534559`) and gift creator (`0x534574`); the player's lock id is
+                    // zero (`0x534341`), but its slot is a live item object, whose flags the
+                    // LOCKED and wrapped gates read (`0x5342ed`, `0x5343da`, `0x52b789`).
                     block_lock_id: if player_side { 0 } else { item.lock_id },
+                    block_wrapped: !player_side && item.wrapped,
+                    gift_creator: item.gift_creator.clone(),
                     object: item.object_flags.is_some(),
                     flags: item.object_flags.unwrap_or(0),
                     ..Default::default()
