@@ -599,6 +599,33 @@ b]])"#),
         local u = {} u[0] = 1 u[nz] = 2 table.insert(o, keys(u))
         local w = {} w[nz] = 1 w[nz] = nil collectgarbage() w[0] = 2 table.insert(o, keys(w))
         return table.concat(o, " | ")"#),
+    // ── fix-libs: library errors the cases above leave out ──
+    // The message's first line: the C build's carries a Rust-side traceback after it.
+    ("fix-libs sort_invalid_order", r#"local function M(f, ...) local ok, e = pcall(f, unpack(arg)) if ok then return "ok" end
+          local _, _, m = string.find(tostring(e), "^([^\n]*)") return m end
+        local t = {} for i = 1, 50 do t[i] = math.mod(i * 7, 13) end
+        return S(M(table.sort, t, function(a, b) return true end), M(function() table.sort({3, 2, 1, 5, 4, 6}, function(a, b) return a <= b end) end),
+          M(function() local u = {5, 3, 1, 4, 2} table.sort(u, function(a, b) return true end) return table.concat(u, " ") end))"#),
+    ("fix-libs pattern_errors", r#"local caps = string.rep("(a)", 33)
+        -- 32 captures are 34 results: counted in a Lua function, which has room for them, where
+        -- `pcall` pushing its status past them trips the C build's API check.
+        return S(E(string.find, string.rep("a", 40), caps), E(function() return table.getn({string.find(string.rep("a", 40), string.rep("(a)", 32))}) end),
+          E(string.find, "abc", "%b"), E(string.find, "abc", "%ba"), E(string.gsub, "abc", "%b(", "x"),
+          E(string.find, "abc", "%fa"), E(string.find, "abc", "%f"), E(string.gfind("abc", "%f%a")),
+          E(string.find, "abc", "a)"), E(string.find, "abc", "(a%1)"), E(string.find, "abc", "%0"), E(string.gsub, "abc", "(a)", "%9"))"#),
+    ("fix-libs format_repeated_flags", r#"return S(E(string.format, "%-----5d", 1), E(string.format, "%------5d", 1), E(string.format, "%-+ #05d", 1), E(string.format, "%-+ #0-5d", 1),
+          E(string.format, "%1234d", 1), E(string.format, "%.1234f", 1), E(string.format, "%12.123f", 1))"#),
+    ("fix-libs random_args", r#"return S(E(math.random, 2, 1), E(math.random, 0), E(math.random, -1), E(math.random, 1, 2, 3), E(math.random, 1, 0),
+          E(math.random, "x"), E(math.random, 1, "y"), E(random, 0), E(math.random, 3, 3))"#),
+    ("fix-libs gsub_replacement_value", r#"return S(E(function() return string.gsub("abc", "%w", {a = {}}) end),
+          E(function() return string.gsub("abc", "%w", function(c) return true end) end),
+          E(function() return gsub("abc", "%w", function(c) return {} end) end), E(string.gsub, "abc", "%w", {b = false}))"#),
+    ("fix-libs debugstack_tail", r#"local function inner() return debugstack() end
+        local function viatail() return inner() end
+        local function caller() local s = viatail() return s end
+        local function deep(n) if n == 0 then return debugstack(1, 2, 1) end return deep(n - 1) end
+        local function deeper() local s = deep(3) return s end
+        return S(caller(), deeper(), debugstack(1, 0, 0))"#),
     // ── r2-vm: error handlers as 5.1's `luaG_errormsg` runs them ──
     ("r2-vm handler_reenters", r#"local n = 0
         local ok, e = xpcall(function() error("a", 0) end, function(m) n = n + 1 error("b", 0) end)
