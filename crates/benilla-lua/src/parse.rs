@@ -32,6 +32,15 @@ pub(crate) struct Parser<'a> {
     name_hint: Option<Vec<u8>>,
 }
 
+/// `sep` then `name` onto a function's name for its key, cut where a key cuts a name
+/// ([`KEY_NAME_MAX`]): a name built along a long chain or deep constructors costs no more.
+fn join_name(out: &mut Vec<u8>, sep: &[u8], name: &[u8]) {
+    for part in [sep, name] {
+        let room = KEY_NAME_MAX.saturating_sub(out.len());
+        out.extend_from_slice(&part[..part.len().min(room)]);
+    }
+}
+
 /// 5.1's `ConsControl`.
 struct ConsControl {
     /// The last list item read.
@@ -56,7 +65,7 @@ pub(crate) fn parse(src: &[u8], chunkname: &[u8], heap: &mut Heap, ccalls: u32) 
         ccalls,
         name_hint: None,
     };
-    p.fs.push(FuncState::new(Rc::from(chunkname), 0, Rc::from(&b""[..])));
+    p.fs.push(FuncState::new(Rc::from(chunkname), 0, Key::default()));
     p.chunk()?;
     p.check(Tok::Eof)?;
     let fs = p.close_func()?;
@@ -633,6 +642,10 @@ impl<'a> Parser<'a> {
         self.checknext(Tok::In)?;
         let line = self.lx.line;
         let (nexps, mut e) = self.explist1()?;
+        // Values past the third keep their registers: the body can read one unwritten.
+        if nexps > 3 {
+            self.fs().clears = true;
+        }
         self.adjust_assign(3, nexps, &mut e)?;
         self.checkstack(3)?;
         self.forbody(base, line, nvars - 3, None)
@@ -715,7 +728,7 @@ impl<'a> Parser<'a> {
                 let fs = self.fsr();
                 let name = &fs.locvars[fs.actvar[fs.nactvar as usize] as usize].name;
                 let mut hint = b"local ".to_vec();
-                hint.extend_from_slice(name);
+                join_name(&mut hint, b"", name);
                 self.name_hint = Some(hint);
             }
             self.explist1()?
@@ -731,7 +744,8 @@ impl<'a> Parser<'a> {
     /// `self`, and the function's name for its key, as written: `a.b.c`, `Frame:OnEvent`.
     fn funcname(&mut self) -> R<(Exp, bool, Vec<u8>)> {
         let (mut v, root) = self.singlevar()?;
-        let mut name = root.to_vec();
+        let mut name = Vec::new();
+        join_name(&mut name, b"", root);
         let mut needself = false;
         loop {
             let sep = match self.tok() {
@@ -743,8 +757,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             let field = self.field(&mut v)?;
-            name.push(sep);
-            name.extend_from_slice(field);
+            join_name(&mut name, &[sep], field);
             if needself {
                 break;
             }
@@ -860,12 +873,13 @@ impl<'a> Parser<'a> {
             if e.has_multret() {
                 self.setmultret(&e);
                 if let (Kind::Call(pc), 1) = (e.k, n) {
-                    // A tail call.
+                    // A tail call. 5.1 asserts its function sits at `nactvar`, which its
+                    // release build does not check and which does not hold in the body of a
+                    // generic `for` over more than three values (see `enterblock`).
                     let fs = self.fs();
                     let Op::Call(a, b, _) = fs.code[pc] else {
                         unreachable!()
                     };
-                    debug_assert_eq!(a, fs.nactvar);
                     fs.code[pc] = Op::TailCall(a, b);
                 }
                 first = self.fsr().nactvar;
@@ -874,10 +888,12 @@ impl<'a> Parser<'a> {
                 first = self.exp2anyreg(&mut e)?;
                 nret = 1;
             } else {
+                // 5.1 asserts the values went to `nactvar` on, unchecked in its release build
+                // and untrue in a generic `for` over more than three values: the return then
+                // reads the registers from `nactvar`, as the C build's does.
                 self.exp2nextreg(&mut e)?;
                 first = self.fsr().nactvar;
                 nret = n as i32;
-                debug_assert_eq!(nret, (self.fsr().freereg - first) as i32);
             }
         }
         self.ret(first, nret)
@@ -914,8 +930,7 @@ impl<'a> Parser<'a> {
             let name = self.str_checkname()?;
             if let Some(p) = &cc.prefix {
                 let mut n = p.clone();
-                n.push(b'.');
-                n.extend_from_slice(name);
+                join_name(&mut n, b".", name);
                 hint = Some(n);
             }
             Exp::new(Kind::K(self.string_k(name)?))
@@ -1090,14 +1105,15 @@ impl<'a> Parser<'a> {
         let mut tag: Option<Vec<u8>> = None;
         loop {
             if let (Some(c), Tok::Function) = (callee, self.tok()) {
-                let mut h = c.to_vec();
+                let mut h = Vec::new();
+                join_name(&mut h, b"", c);
                 if let Some(t) = &tag {
-                    h.push(b':');
                     // `/` and `#` structure keys.
-                    h.extend(
-                        t.iter()
-                            .map(|&b| if b == b'/' || b == b'#' { b'_' } else { b }),
-                    );
+                    let t: Vec<u8> = t
+                        .iter()
+                        .map(|&b| if b == b'/' || b == b'#' { b'_' } else { b })
+                        .collect();
+                    join_name(&mut h, b":", &t);
                 }
                 self.name_hint = Some(h);
             }
@@ -1138,7 +1154,15 @@ impl<'a> Parser<'a> {
         // literals.
         let (mut v, mut name, mut last) = if self.tok() == Tok::Name {
             let (v, n) = self.singlevar()?;
-            (v, want.then(|| n.to_vec()), Some(n))
+            (
+                v,
+                want.then(|| {
+                    let mut name = Vec::new();
+                    join_name(&mut name, b"", n);
+                    name
+                }),
+                Some(n),
+            )
         } else {
             (self.prefixexp()?, None, None)
         };
@@ -1147,8 +1171,7 @@ impl<'a> Parser<'a> {
                 Tok::Char(b'.') => {
                     let field = self.field(&mut v)?;
                     if let Some(n) = &mut name {
-                        n.push(b'.');
-                        n.extend_from_slice(field);
+                        join_name(n, b".", field);
                     }
                     last = Some(field);
                     continue;

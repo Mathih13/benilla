@@ -35,8 +35,10 @@ fn a_clone_is_a_snapshot_and_restoring_it_undoes_everything_after() {
     assert_eq!(run(&mut again, "return Counter"), "0");
 }
 
+/// A snapshot of a large state is the whole of it. The time it takes is printed, not asserted:
+/// a wall clock on a shared machine makes no test.
 #[test]
-fn snapshots_of_a_large_state_are_cheap() {
+fn a_snapshot_of_a_large_state_is_whole() {
     let mut vm = benilla_lua::new_state();
     run(
         &mut vm,
@@ -50,9 +52,13 @@ fn snapshots_of_a_large_state_are_cheap() {
         "snapshot of {} strings, {} tables, {} functions: {clone_ms:.1} ms",
         counts[0], counts[1], counts[2]
     );
-    drop(snap);
-    // A generous bound: the point is "milliseconds", not seconds.
-    assert!(clone_ms < 500.0, "{clone_ms} ms");
+    let mut snap = snap;
+    assert_eq!(snap.heap.counts(), counts);
+    run(&mut vm, "Data = nil collectgarbage()");
+    assert_eq!(
+        run(&mut snap, "return Data[100000].name .. Data[77777].f()"),
+        "item10000077777"
+    );
 }
 
 /// `math.random` draws from the VM's own generator: a clone continues the sequence on its own,

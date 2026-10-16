@@ -160,3 +160,58 @@ fn running_out_of_string_ids_is_not_enough_memory() {
         Ok(vec!["300000".into(), "40000".into()])
     );
 }
+
+/// A memory error is thrown as it is: `xpcall`'s handler runs only for a runtime error
+/// (`luaG_errormsg`), so the protected call answers `not enough memory` itself.
+#[test]
+fn a_memory_error_runs_no_error_handler() {
+    let src = r#"local t = {}
+        local ok, e = xpcall(function() for i = 1, 100000 do t[i] = "s" .. i end end,
+          function(m) Handled = true return "H:" .. m end)
+        return ok, e, Handled == nil"#;
+    let got = run_with(src, |vm| vm.heap.limit_string_ids(50_000));
+    assert_eq!(
+        got,
+        Ok(vec![
+            "false".into(),
+            "not enough memory".into(),
+            "true".into()
+        ])
+    );
+}
+
+/// A hot reload whose constants cannot be made changes nothing and says so, as `loadstring`
+/// answers `not enough memory`.
+#[test]
+fn a_hot_reload_out_of_string_ids_is_not_enough_memory() {
+    let got = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            let mut vm = benilla_lua::new_script_host_state();
+            vm.heap.limit_string_ids(50_000);
+            vm.exec(b"function F() return 'old' end", b"@f.lua")
+                .unwrap();
+            vm.exec(
+                b"Keep = {} for i = 1, 100000 do Keep[i] = 'k' .. i end",
+                b"=t",
+            )
+            .unwrap_err();
+            let r = vm.hot_reload(
+                b"@f.lua",
+                b"function F() return 'a constant no one made' end",
+            );
+            let f = vm.get_global("F");
+            let old = vm.call_value(f, &[], 1).map(|v| vm.display(v[0]));
+            (r.map(|_| ()).map_err(|e| e.to_string()), old.ok())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(
+        got,
+        (
+            Err("not enough memory".to_string()),
+            Some("old".to_string())
+        )
+    );
+}

@@ -174,8 +174,9 @@ pub fn strtoul(s: &[u8], base: u32) -> (u64, usize) {
     (n, i)
 }
 
-/// `%.14g` as glibc's `printf` writes it: a three-digit exponent (`1e+020`), and `1.#INF`,
-/// `-1.#INF` and `-1.#IND` for the non-finite values.
+/// `%.14g` as glibc's `printf` writes it: a two-digit exponent at least (`1e+20`), and `inf`,
+/// `-inf`, `nan` and `-nan` for the non-finite values. The client's MSVC text (`1e+020`,
+/// `1.#INF`) is later work (#1376).
 pub fn fmt_g14(n: f64) -> String {
     fmt_g(n, 14)
 }
@@ -218,7 +219,9 @@ pub fn fmt_g(n: f64, prec: usize) -> String {
         return (n as i64).to_string();
     }
     if n.is_nan() {
-        // The sign bit prints: x86's default NaN, from `0/0`, has it set.
+        // The sign bit prints, as glibc prints it: x86's default NaN, from `0/0`, has it set.
+        // Which NaN an operation answers is the host's; the client's MSVC text (`-1.#IND`) is
+        // later work (#1376).
         return if n.is_sign_negative() {
             "-nan".into()
         } else {

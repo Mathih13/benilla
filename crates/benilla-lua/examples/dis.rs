@@ -3,9 +3,7 @@ fn dump(p: &benilla_lua::proto::Proto, depth: usize) {
     let pad = "  ".repeat(depth);
     println!(
         "{pad}function {} (params {}, maxstack {})",
-        String::from_utf8_lossy(&p.key),
-        p.nparams,
-        p.maxstack
+        p.key, p.nparams, p.maxstack
     );
     for (i, op) in p.code.iter().enumerate() {
         println!("{pad}  {i:3} {op:?}");

@@ -1039,8 +1039,9 @@ fn add_value(
         vm.reserve(out, vm.heap.str(sv).len())?;
         out.extend_from_slice(vm.heap.str(sv));
     } else {
+        // `luaL_error`: the position of `gsub`'s caller.
         let t = v.type_name();
-        return Err(vm.rt_error(&format!("invalid replacement value (a {t})")));
+        return Err(vm.error_at(1, &format!("invalid replacement value (a {t})")));
     }
     Ok(())
 }

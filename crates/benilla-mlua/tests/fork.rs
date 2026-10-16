@@ -97,3 +97,25 @@ fn a_string_made_after_the_fork_is_foreign_to_it() {
         "false Lua instance passed Value created from a different main Lua state"
     );
 }
+
+/// A fork is made between calls: inside a callback the copy would hold frames no one returns
+/// from, so it panics, and the panic resumes in Rust as a callback's panic does.
+#[test]
+fn a_fork_inside_a_callback_panics() {
+    let lua = Lua::new();
+    let f = lua
+        .create_function(|lua, ()| {
+            let _ = lua.fork();
+            Ok(())
+        })
+        .unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.call::<()>(())));
+    let p = r.unwrap_err();
+    assert_eq!(
+        p.downcast_ref::<&str>().copied(),
+        Some("a state is forked from outside its callbacks")
+    );
+    // Between calls it forks.
+    let copy = lua.fork();
+    assert_eq!(copy.load("return 1 + 1").eval::<i64>().unwrap(), 2);
+}

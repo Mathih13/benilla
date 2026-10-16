@@ -13,8 +13,6 @@ use crate::value::{FuncRef, StrRef, TableRef, Value, V};
 #[derive(Clone, Copy, Debug)]
 pub struct LuaError {
     pub value: Value,
-    /// The innermost protected call's handler already ran on it.
-    handled: bool,
 }
 
 /// 5.1.5's `LUAI_MAXCCALLS`: nested host-level calls (a host call, a metamethod, a library
@@ -30,7 +28,11 @@ const BASIC_CI_SIZE: usize = 8;
 /// at `LUAI_MAXCCALLS`, with the same eighth of margin for a handler. 200 levels of the deepest
 /// library callback use under half of it in an optimized build, so there it never decides.
 const MAX_RUST_STACK: usize = 1 << 20;
-/// 5.0's `MAXTAGLOOP`.
+/// A stack slot in the collector's count: 5.1's `TValue`, which C's allocator counts as the
+/// stack grows.
+const STACK_SLOT_BYTES: usize = 16;
+/// 5.1.5's `MAXTAGLOOP`: the steps `luaV_gettable` and `luaV_settable` take along a chain of
+/// `__index` or `__newindex` tables before `loop in gettable`.
 const MAXTAGLOOP: u32 = 100;
 
 #[derive(Clone, Copy)]
@@ -112,7 +114,6 @@ pub struct Names {
     pub tostring: StrRef,
     pub n: StrRef,
     pub next: StrRef,
-    pub gpow: StrRef,
 }
 
 #[derive(Clone)]
@@ -143,6 +144,12 @@ pub struct Vm {
     /// `ci_size - 1`: a call is made while `frames.len()` is below it, one compare on the call
     /// path.
     ci_limit: usize,
+    /// The stack below it may hold the frame of a running function whose code can read a
+    /// register it has not written (`Proto::clears`). A Lua frame entered below it starts with
+    /// every register past its arguments nil, as `luaD_precall` starts every frame, so such code
+    /// reads what C's would; above it no code can tell, and the clearing is skipped. Raised as
+    /// such a function is entered, reset at the host's outermost call.
+    clear_below: usize,
     /// Error handlers running (`throw`): only they may use the margin past `MAX_RUST_STACK`.
     in_handler: u32,
     /// The Rust stack address where the outermost host-level call entered (`MAX_RUST_STACK`).
@@ -285,9 +292,12 @@ impl Clone for Roots {
 /// The host's hook body; an error it answers is raised where the hook ran.
 pub type HookFn = Rc<dyn Fn(&mut Vm) -> Result<(), LuaError>>;
 
-/// A host hook run about every `step` instructions. It is checked where a loop jumps back and
-/// where a call starts, the places a non-terminating script must pass, counting a loop's body
-/// length per iteration; so the dispatch loop pays nothing for it until one is set.
+/// A host hook run once for every `step` instructions Lua runs, counted as 5.1's
+/// `LUA_MASKCOUNT` counts them: each instruction 5.1 dispatches, in every Lua frame (Lua a
+/// library function or a metamethod calls included). It does not run at the instruction that
+/// completes a step, as 5.1's does, but at the next loop back edge, call or return, once for each
+/// step completed since. A non-terminating script passes those, so a budget still stops it, and
+/// the dispatch loop pays nothing for the count until a hook is set.
 #[derive(Clone)]
 pub struct Hook {
     pub step: u64,
@@ -384,7 +394,6 @@ impl Vm {
             tostring: s(b"__tostring"),
             n: s(b"n"),
             next: s(b"next"),
-            gpow: s(b"__pow"),
         };
         // `lua_newstate`: both made by `luaH_new(L, 0, 2)`.
         let globals = heap.new_table(0, 2);
@@ -404,6 +413,7 @@ impl Vm {
             c_depth: 0,
             ci_size: BASIC_CI_SIZE,
             ci_limit: BASIC_CI_SIZE - 1,
+            clear_below: 0,
             stack_base: 0,
             in_handler: 0,
             handlers: Vec::new(),
@@ -420,6 +430,7 @@ impl Vm {
             rand: crate::lib_math::GlibcRand::seeded(1),
             identity: Default::default(),
         };
+        vm.heap.charge(STACK_SLOT_BYTES * vm.stack.len());
         vm.heap.threshold = 2 * vm.heap.bytes().max(32 * 1024);
         vm
     }
@@ -536,6 +547,7 @@ impl Vm {
     /// Compile a chunk into a function over the globals.
     pub fn load(&mut self, src: &[u8], chunkname: &[u8]) -> Result<Value, crate::SyntaxError> {
         let proto = crate::compile::compile(src, chunkname, &mut self.heap, self.c_depth)?;
+        self.heap.charge(proto.tree_bytes());
         // A constant the compiler could not make: 5.1's `LUA_ERRMEM`.
         if self.heap.oom {
             self.heap.oom = false;
@@ -574,11 +586,8 @@ impl Vm {
         // A protected call of its own, as mlua's `lua_pcall` with no handler: an error inside
         // runs no enclosing `xpcall`'s handler.
         self.handlers.push(None);
-        let r = if frames == 0 {
-            self.unwind_guard(f)
-        } else {
-            f(self)
-        };
+        // A panic that passes leaves the state as at this call (`pcall_at`).
+        let r = self.unwind_guard(f);
         self.handlers.truncate(handlers);
         match r {
             Ok(v) => Ok(v),
@@ -689,10 +698,7 @@ impl Vm {
     /// 5.0's `luaD_throw` runs `errfunc` at the raise.
     pub fn throw(&mut self, v: Value) -> LuaError {
         let Some(Some(h)) = self.handlers.last().copied() else {
-            return LuaError {
-                value: v,
-                handled: false,
-            };
+            return LuaError { value: v };
         };
         // 5.1's `luaG_errormsg`: a handler that is not a function is LUA_ERRERR, uncalled.
         if !matches!(h.unpack(), V::Func(_)) {
@@ -707,7 +713,6 @@ impl Vm {
         match r {
             Ok(vals) => LuaError {
                 value: vals.first().copied().unwrap_or(Value::Nil),
-                handled: true,
             },
             Err(e) => e,
         }
@@ -775,7 +780,13 @@ impl Vm {
         None
     }
 
-    pub(crate) fn frames_empty(&self) -> bool {
+    /// A number naming this VM among every one made, a clone included.
+    pub fn vm_id(&self) -> u64 {
+        self.identity.0
+    }
+
+    /// No Lua or native runs on this VM: no call is in progress.
+    pub fn frames_empty(&self) -> bool {
         self.frames.is_empty()
     }
 
@@ -829,8 +840,8 @@ impl Vm {
     #[inline(never)]
     fn type_error(&mut self, v: Value, reg: Option<usize>, op: &str) -> LuaError {
         let t = v.type_name();
-        let fi = self.frames.len() - 1;
-        let named = reg.and_then(|r| self.objname(fi, r));
+        // A register names a value only in a running Lua frame; the host indexes with none.
+        let named = reg.and_then(|r| self.objname(self.frames.len().checked_sub(1)?, r));
         let msg = match named {
             Some((kind, name)) => format!(
                 "attempt to {op} {kind} `{}' (a {t} value)",
@@ -866,7 +877,10 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn grow(&mut self, n: usize) {
+        let old = self.stack.len();
         self.stack.resize(n.next_power_of_two(), Value::Nil);
+        self.heap
+            .charge(STACK_SLOT_BYTES * (self.stack.len() - old));
     }
 
     #[inline]
@@ -972,7 +986,7 @@ impl Vm {
     pub fn index(&mut self, t: Value, key: Value, reg: Option<usize>) -> Result<Value, LuaError> {
         let mut t = t;
         let mut reg = reg;
-        for _ in 0..=MAXTAGLOOP {
+        for _ in 0..MAXTAGLOOP {
             let tm = match t.unpack() {
                 V::Table(tr) => {
                     let tab = self.heap.table(tr);
@@ -1018,7 +1032,7 @@ impl Vm {
     ) -> Result<(), LuaError> {
         let mut t = t;
         let mut reg = reg;
-        for _ in 0..=MAXTAGLOOP {
+        for _ in 0..MAXTAGLOOP {
             let tm = match t.unpack() {
                 V::Table(tr) => {
                     let slot = match self.heap.table_mut(tr).slot_for(key) {
@@ -1059,8 +1073,8 @@ impl Vm {
         Err(self.rt_error("loop in settable"))
     }
 
-    /// 5.0's `Arith`. Numbers (and numeric strings) compute, `^` through the global `__pow`;
-    /// anything else tries the operands' metamethods.
+    /// 5.1's `Arith`. Numbers (and numeric strings) compute, `^` with C's `pow`; anything else
+    /// tries the operands' metamethods, `__pow` for `^`.
     #[cold]
     #[inline(never)]
     fn arith(
@@ -1303,6 +1317,7 @@ impl Vm {
         if !self.frames.is_empty() {
             return self.call_at_inner(func_idx, nargs, nres);
         }
+        self.clear_below = 0;
         let r = self.unwind_guard(|vm| vm.call_at_inner(func_idx, nargs, nres));
         if let Some(p) = self.profile.as_mut() {
             p.close();
@@ -1417,16 +1432,18 @@ impl Vm {
     ) -> Result<(), LuaError> {
         let frames = self.frames.len();
         let c_depth = self.c_depth;
+        let handlers = self.handlers.len();
         self.handlers.push(handler);
-        let r = self.call_at(func_idx, nargs, nres);
-        self.handlers.pop();
-        if let Err(mut e) = r {
+        // A panic that passes leaves this call's handler, frames and depth as they were, so a
+        // native that catches it finds the state as at this call.
+        let r = self.unwind_guard(|vm| vm.call_at(func_idx, nargs, nres));
+        self.handlers.truncate(handlers);
+        if let Err(e) = r {
             self.close_upvals(func_idx);
             self.frames.truncate(frames);
             self.c_depth = c_depth;
             self.top = func_idx;
             self.restore_stack_limit();
-            e.handled = false;
             return Err(e);
         }
         Ok(())
@@ -1436,6 +1453,19 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn precall(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<Called, LuaError> {
+        self.precall_clearing(func_idx, nargs, nres, false)
+    }
+
+    /// [`Vm::precall`]; `clear` clears a Lua frame's registers wherever it starts.
+    #[cold]
+    #[inline(never)]
+    fn precall_clearing(
+        &mut self,
+        func_idx: usize,
+        nargs: usize,
+        nres: i32,
+        clear: bool,
+    ) -> Result<Called, LuaError> {
         let mut nargs = nargs;
         let fref = match self.stack[func_idx].unpack() {
             V::Func(f) => f,
@@ -1484,12 +1514,18 @@ impl Vm {
                 } else if nargs > np {
                     fill_from = base + np;
                 }
-                // Missing parameters are nil. The registers above are not cleared, as C Lua
-                // clears them: the compiler writes each before reading it, and the collector
-                // skips a stale handle (`Heap::collect`).
-                let params_end = base + np;
-                if fill_from < params_end {
-                    for v in &mut self.stack[fill_from..params_end] {
+                // Missing parameters are nil; below `clear_below`, every register past the
+                // parameters too, extra arguments included, as `luaD_precall` clears them.
+                if proto.clears {
+                    self.clear_below = self.clear_below.max(frame_top);
+                }
+                let end = if clear || base < self.clear_below {
+                    base + proto.c_maxstack as usize
+                } else {
+                    base + np
+                };
+                if fill_from < end {
+                    for v in &mut self.stack[fill_from..end] {
                         *v = Value::Nil;
                     }
                 }
@@ -1641,7 +1677,6 @@ impl Vm {
     fn errerr(&mut self) -> LuaError {
         LuaError {
             value: self.str(b"error in error handling"),
-            handled: true,
         }
     }
 
@@ -1764,6 +1799,8 @@ impl Vm {
 
     // ── the hook ─────────────────────────────────────────────────────────────────────────────
 
+    /// Run `f` once for every `step` instructions, at the next back edge, call or return
+    /// ([`Hook`]).
     pub fn set_hook(&mut self, step: u64, f: HookFn) {
         self.hook = Some(Hook {
             step: step.max(1),
@@ -1798,7 +1835,17 @@ impl Vm {
         }
     }
 
-    /// `n` more instructions ran; past the step, the hook runs.
+    /// `n` more instructions ran, counted toward the hook's next run without running it.
+    #[cold]
+    #[inline(never)]
+    fn hook_add(&mut self, n: u64) {
+        if let Some(h) = self.hook.as_mut().filter(|_| !self.in_hook) {
+            h.counted += n;
+        }
+    }
+
+    /// `n` more instructions ran, as 5.1's `LUA_MASKCOUNT` counts them: the hook runs once for
+    /// each `step` they complete.
     #[cold]
     #[inline(never)]
     fn hook_count(&mut self, n: u64) -> Result<(), LuaError> {
@@ -1809,17 +1856,17 @@ impl Vm {
             return Ok(());
         };
         h.counted += n;
-        if h.counted < h.step {
-            return Ok(());
+        while let Some(h) = self.hook.as_mut().filter(|h| h.counted >= h.step) {
+            h.counted -= h.step;
+            let f = h.f.clone();
+            self.in_hook = true;
+            let id = self.identity();
+            let r = f(self);
+            self.check_identity(id);
+            self.in_hook = false;
+            r?;
         }
-        h.counted -= h.step;
-        let f = h.f.clone();
-        self.in_hook = true;
-        let id = self.identity();
-        let r = f(self);
-        self.check_identity(id);
-        self.in_hook = false;
-        r
+        Ok(())
     }
 
     /// This VM's and its heap's identity ([`crate::heap::Identity`]).
@@ -2022,7 +2069,6 @@ impl Vm {
             n.tostring,
             n.n,
             n.next,
-            n.gpow,
         ] {
             roots.push(Value::Str(s));
         }
@@ -2033,7 +2079,9 @@ impl Vm {
         }
         let live = self
             .heap
-            .collect(&roots, &open, &self.retired, self.names.mode);
+            .collect(&roots, &open, &self.retired, self.names.mode)
+            + STACK_SLOT_BYTES * self.stack.len();
+        self.heap.charge(STACK_SLOT_BYTES * self.stack.len());
         self.heap.threshold = 2 * live;
         // 5.1.5's `checkstacksizes`, which a cycle runs as it traverses the running thread, in
         // propagation and again in the atomic step: a call-info array a quarter used halves,
@@ -2050,7 +2098,10 @@ impl Vm {
         // captures' destructors may use the state.
         if !self.heap.freed_hosts.is_empty() {
             let freed = std::mem::take(&mut self.heap.freed_hosts);
+            // The host's `reentry` hands them this `&mut Vm`, while Lua may be running on it.
+            let id = self.identity();
             self.as_host(move || drop(freed));
+            self.check_identity(id);
         }
     }
 
@@ -2071,30 +2122,73 @@ impl Vm {
 
     // ── the interpreter ──────────────────────────────────────────────────────────────────────
 
-    /// Run the top Lua frame until the frame that entered with `boundary` returns.
+    /// Run the top Lua frame until the frame that entered with `boundary` returns. The dispatch
+    /// loop has two instantiations: the fast one while no hook or profile is on and no running
+    /// function can read a register it has not written (`clear_below`), the slow one, which counts
+    /// for the hook and clears frames as `luaD_precall`, otherwise. A hook set while the fast
+    /// one runs moves it to the slow one at the next call or loop back edge, a function that
+    /// needs its frames cleared as it is entered.
+    fn execute(&mut self) -> Result<(), LuaError> {
+        loop {
+            let done = if self.hooked || self.clear_below != 0 {
+                self.run::<true>()?
+            } else {
+                self.run::<false>()?
+            };
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
+    /// [`Vm::execute`]'s dispatch loop: `true` when the frame that entered with `boundary` has
+    /// returned, `false` to go on in the other instantiation from the top frame's saved place.
     ///
     /// The register file is addressed through `regs`, a raw pointer to `stack[base]`, as C Lua
     /// keeps `base` in a register. Anything that can grow the stack (a call, a metamethod, an
     /// upvalue that touches the stack) is followed by `refresh!`, which recomputes it.
     // `fr!` carries its own `unsafe`, nested in others at some uses.
     #[allow(unused_unsafe)]
-    fn execute(&mut self) -> Result<(), LuaError> {
+    #[inline(never)]
+    fn run<const SLOW: bool>(&mut self) -> Result<bool, LuaError> {
         // The running frame's state, kept in locals as C Lua's `luaV_execute` keeps it. A Lua
         // call sets it straight from the callee; a return reloads it from the caller's frame.
         // Only the three values every instruction touches live in locals; the rest of the
         // running frame is read from it (`fr!`), so they keep their registers.
-        let mut ip: *const Op;
+        let mut ip: *const Op = std::ptr::null();
         let mut k: *const Value;
         let mut regs: *mut Value;
+        // While a hook is set, where the current straight run of instructions began, in
+        // `seg_code`'s code: the run is charged at a back edge, a forward jump, a call and a
+        // return (here, as the caller's frame is entered again), so each charge is the
+        // instructions executed.
+        let mut seg: *const Op = std::ptr::null();
+        let mut seg_code: *const Proto = std::ptr::null();
         'frame: loop {
             {
+                if SLOW && self.hooked && !seg.is_null() && seg != ip {
+                    // The last run of the frame returned from; a call's run is charged already.
+                    // SAFETY: the returned function's code is alive: its closure is unreachable
+                    // at most since the return, and nothing has collected since.
+                    let n = ran_since(seg, ip, unsafe { &*seg_code });
+                    if n > 0 {
+                        self.hook_count(n)?;
+                    }
+                }
                 let frame = self.frames.last().expect("a Lua frame");
                 let base = frame.base();
                 ip = frame.ip;
                 k = frame.consts;
                 self.heap.cur_source = frame.source;
-                if self.hooked {
-                    self.prof_switch();
+                if SLOW {
+                    if self.hooked {
+                        seg = ip;
+                        seg_code = frame.proto;
+                        self.prof_switch();
+                    } else {
+                        // No run to keep: a hook set later starts from its first charge.
+                        seg = std::ptr::null();
+                    }
                 }
                 // SAFETY: `precall` grew the stack to cover `base + maxstack`, and the stack never
                 // shrinks.
@@ -2211,6 +2305,16 @@ impl Vm {
                     fr_mut!().ip = ip
                 };
             }
+            /// `check_gc` at a safe point: a collection drops the host closures it freed, whose
+            /// destructors may run Lua and move the stack, so the registers are refreshed after.
+            macro_rules! gc {
+                () => {
+                    if self.heap.bytes() >= self.heap.threshold || self.gc_stress {
+                        self.full_gc();
+                        refresh!();
+                    }
+                };
+            }
             /// A call that may run Lua: the pc saved first, the registers refreshed after.
             macro_rules! slow {
                 ($e:expr) => {{
@@ -2244,14 +2348,64 @@ impl Vm {
                     }
                 }};
             }
+            /// The instructions run since `seg`, the one just fetched included, for the hook; one
+            /// when the hook was set during this frame's run.
+            macro_rules! ran {
+                () => {
+                    if seg.is_null() {
+                        1
+                    } else {
+                        // SAFETY: `seg_code` is the code of the frame that set `seg`: this one,
+                        // or one that returned since with nothing collected in between; a frame
+                        // entered with no hook set clears `seg`.
+                        ran_since(seg, ip, unsafe { &*seg_code })
+                    }
+                };
+            }
+            /// A run starts here, in the running frame's code.
+            macro_rules! mark {
+                () => {{
+                    seg = ip;
+                    seg_code = fr!().proto;
+                }};
+            }
+            /// A jump forward: the run so far is counted when a hook is set, so a run holds only
+            /// what ran ([`Proto::uncounted`] is found in it), and the hook waits for the next
+            /// back edge, call or return.
+            macro_rules! skip {
+                ($off:expr) => {{
+                    let off = $off as isize;
+                    if SLOW && self.hooked {
+                        let n = ran!();
+                        // SAFETY: the compiler's jumps land inside the function.
+                        ip = unsafe { ip.offset(off) };
+                        mark!();
+                        self.hook_add(n);
+                    } else {
+                        // SAFETY: as above.
+                        ip = unsafe { ip.offset(off) };
+                    }
+                }};
+            }
             macro_rules! jump {
                 ($off:expr) => {{
                     let off = $off as isize;
-                    // SAFETY: `Proto::verify` checked that every jump lands inside the code.
-                    ip = unsafe { ip.offset(off) };
-                    // A loop's back edge: the place the budget hook is counted.
                     if off < 0 && self.hooked {
-                        slow!(self.hook_count((-off) as u64))?;
+                        if !SLOW {
+                            // A hook was set: the slow loop goes on from the loop's head.
+                            // SAFETY: as `skip!`.
+                            ip = unsafe { ip.offset(off) };
+                            save!();
+                            return Ok(false);
+                        }
+                        // A loop's back edge: the place a loop is charged.
+                        let n = ran!();
+                        // SAFETY: `Proto::verify` checked that every jump lands inside the code.
+                        ip = unsafe { ip.offset(off) };
+                        mark!();
+                        slow!(self.hook_count(n))?;
+                    } else {
+                        skip!(off);
                     }
                 }};
             }
@@ -2291,7 +2445,12 @@ impl Vm {
                         if nresults == 1 && n >= 1 {
                             self.top = func_idx + 1;
                         }
-                        return Ok(());
+                        // The frame's last run; a return into Lua charges it as it re-enters.
+                        if SLOW && self.hooked {
+                            let n = ran!();
+                            self.hook_count(n)?;
+                        }
+                        return Ok(true);
                     }
                     // Back in the calling Lua frame: a fixed result count restores its top.
                     let caller = self.frames.last().unwrap();
@@ -2514,7 +2673,7 @@ impl Vm {
                         r!(a) = Value::Table(t);
                         save!();
                         self.top = base!() + maxstack!();
-                        self.check_gc();
+                        gc!();
                     }
                     Op::SelfOp(a, b, c) => {
                         let obj = r!(b);
@@ -2550,7 +2709,7 @@ impl Vm {
                     Op::JmpCmpK(cj, b, kx, off) => cmpk!(cj.cmp(), cj.cond(), r!(b), kv!(kx), off),
                     Op::JmpCmpKR(cj, kx, c, off) => cmpk!(cj.cmp(), cj.cond(), kv!(kx), r!(c), off),
                     Op::Pow(a, b, c) => {
-                        // 5.0's `^` always goes through the global `__pow`.
+                        // 5.1's `OP_POW`: always `Arith`, numbers through `pow`.
                         let (x, y) = (rk!(b), rk!(c));
                         let v = slow!(self.arith(Arith::Pow, x, y, (rkreg!(b), rkreg!(c))))?;
                         r!(a) = v;
@@ -2582,7 +2741,7 @@ impl Vm {
                         let b0 = base!();
                         slow!(self.concat(b0 + b as usize, b0 + c as usize))?;
                         r!(a) = r!(b);
-                        self.check_gc();
+                        gc!();
                     }
                     Op::Jmp(off) => jump!(off),
                     Op::JmpCmp(cj, b, c, off) => {
@@ -2613,8 +2772,8 @@ impl Vm {
                         let v = r!(b);
                         if v.truthy() == cond {
                             r!(a) = v;
-                            // SAFETY: as `jump!`; a value's test jumps forward, never a back edge.
-                            ip = unsafe { ip.offset(off as isize) };
+                            // A value's test jumps forward, never a back edge.
+                            skip!(off);
                         }
                     }
                     Op::Call(a, b, c) => {
@@ -2626,7 +2785,14 @@ impl Vm {
                         };
                         save!();
                         if self.hooked {
-                            slow!(self.hook_count(1))?;
+                            if !SLOW {
+                                // A hook was set: the slow loop makes this call.
+                                fr_mut!().ip = unsafe { ip.sub(1) };
+                                return Ok(false);
+                            }
+                            let n = ran!();
+                            mark!();
+                            slow!(self.hook_count(n))?;
                         }
                         // A Lua function without `...`: the frame is pushed here, as C Lua's
                         // `luaD_precall` does for it, without the general path.
@@ -2640,7 +2806,7 @@ impl Vm {
                             {
                                 // `fi + 1` frames are live: the depth without reading the
                                 // frame list.
-                                if !shape.vararg && self.frames.len() < self.ci_limit {
+                                if !shape.precall && self.frames.len() < self.ci_limit {
                                     let np = shape.nparams as usize;
                                     let consts = shape.consts;
                                     let nbase = func_idx + 1;
@@ -2661,7 +2827,16 @@ impl Vm {
                                         boundary: false,
                                     };
                                     self.ensure(ftop + 1);
-                                    if nargs < np {
+                                    if SLOW && nbase < self.clear_below {
+                                        // As `precall`: every register past the arguments.
+                                        // SAFETY: the closure being called holds its code.
+                                        let cmax = unsafe { &*frame.proto }.c_maxstack as usize;
+                                        for v in
+                                            &mut self.stack[nbase + nargs.min(np)..nbase + cmax]
+                                        {
+                                            *v = Value::Nil;
+                                        }
+                                    } else if nargs < np {
                                         for v in &mut self.stack[nbase + nargs..nbase + np] {
                                             *v = Value::Nil;
                                         }
@@ -2673,8 +2848,14 @@ impl Vm {
                                     ip = frame.ip;
                                     k = consts;
                                     self.heap.cur_source = frame.source;
-                                    if self.hooked {
-                                        self.prof_switch();
+                                    if SLOW {
+                                        if self.hooked {
+                                            seg = ip;
+                                            seg_code = frame.proto;
+                                            self.prof_switch();
+                                        } else {
+                                            seg = std::ptr::null();
+                                        }
                                     }
                                     refresh!();
                                     continue;
@@ -2686,18 +2867,20 @@ impl Vm {
                                 if c != 0 {
                                     self.top = base!() + maxstack!();
                                 }
-                                self.check_gc();
+                                gc!();
                                 continue;
                             }
                         }
                         match self.precall(func_idx, nargs, c as i32 - 1)? {
+                            // A function that needs its frames cleared runs in the slow loop.
+                            Called::Lua if !SLOW && self.clear_below != 0 => return Ok(false),
                             Called::Lua => continue 'frame,
                             Called::Done => {
                                 refresh!();
                                 if c != 0 {
                                     self.top = base!() + maxstack!();
                                 }
-                                self.check_gc();
+                                gc!();
                             }
                         }
                     }
@@ -2712,7 +2895,14 @@ impl Vm {
                         // A call like any other for the budget: a tail-recursive loop passes
                         // no back edge and no `Call`.
                         if self.hooked {
-                            slow!(self.hook_count(1))?;
+                            if !SLOW {
+                                // A hook was set: the slow loop makes this call.
+                                fr_mut!().ip = unsafe { ip.sub(1) };
+                                return Ok(false);
+                            }
+                            let n = ran!();
+                            mark!();
+                            slow!(self.hook_count(n))?;
                         }
                         // 5.1's `OP_TAILCALL` resolves `__call` first, so a callable table's
                         // Lua `__call` replaces this frame too.
@@ -2726,6 +2916,7 @@ impl Vm {
                         );
                         if !is_lua {
                             match self.precall(func_idx, nargs, -1)? {
+                                Called::Lua if !SLOW && self.clear_below != 0 => return Ok(false),
                                 Called::Lua => continue 'frame,
                                 Called::Done => {
                                     refresh!();
@@ -2741,8 +2932,31 @@ impl Vm {
                         }
                         let b0 = base!();
                         self.close_upvals(b0);
+                        let dest = fr!().func_idx();
+                        if SLOW && dest < self.clear_below {
+                            // `OP_TAILCALL`'s order, where code may read what it leaves: the
+                            // callee's frame is made where its function sits, registers cleared,
+                            // then moved down whole over this one, and the place it was made
+                            // keeps its copy.
+                            let nres = fr!().nresults;
+                            self.precall_clearing(func_idx, nargs, nres, true)?;
+                            let mut new = self.frames.pop().unwrap();
+                            let me = self.frames.pop().unwrap();
+                            // C's frame, to `ci->top`; benilla's spare slots above stay as they
+                            // were.
+                            // SAFETY: the closure just called holds its code (`Frame::proto`).
+                            let cmax = unsafe { &*new.proto }.c_maxstack as usize;
+                            self.stack.copy_within(func_idx..func_idx + 1 + cmax, dest);
+                            self.top -= func_idx - dest;
+                            new.base = dest as u32 + 1;
+                            // 5.1's `ci->tailcalls++` is a C int; saturated here so 2^32 tail
+                            // calls cannot overflow, a count no traceback reaches.
+                            new.tailcalls = me.tailcalls.saturating_add(1);
+                            new.boundary = me.boundary;
+                            self.frames.push(new);
+                            continue 'frame;
+                        }
                         let me = self.frames.pop().unwrap();
-                        let dest = me.func_idx();
                         self.stack.copy_within(func_idx..func_idx + nargs + 1, dest);
                         self.top = dest + nargs + 1;
                         match self.precall(dest, nargs, me.nresults) {
@@ -2752,6 +2966,9 @@ impl Vm {
                                 // tail calls cannot overflow, a count no traceback reaches.
                                 f.tailcalls = me.tailcalls.saturating_add(1);
                                 f.boundary = me.boundary;
+                                if !SLOW && self.clear_below != 0 {
+                                    return Ok(false);
+                                }
                                 continue 'frame;
                             }
                             Ok(Called::Done) => unreachable!("a Lua callee"),
@@ -2797,11 +3014,13 @@ impl Vm {
                         );
                         let idx = idx + step;
                         if idx <= limit {
-                            jump!(off);
-                            // Canonical numbers in, a canonical number out.
+                            // Canonical numbers in, a canonical number out; written before
+                            // the jump, as `OP_FORLOOP` writes them, so a jump that leaves this
+                            // loop (to the slow one) finds them.
                             let v = Value::num_raw(idx);
                             r!(a) = v;
                             r!(a + 3) = v;
+                            jump!(off);
                         }
                     }
                     Op::ForLoop(a, off) => {
@@ -2816,17 +3035,20 @@ impl Vm {
                         } else {
                             limit <= idx
                         } {
-                            jump!(off);
-                            // Canonical numbers in, a canonical number out.
+                            // Canonical numbers in, a canonical number out; written before
+                            // the jump, as `OP_FORLOOP` writes them, so a jump that leaves this
+                            // loop (to the slow one) finds them.
                             let v = Value::num_raw(idx);
                             r!(a) = v;
                             r!(a + 3) = v;
+                            jump!(off);
                         }
                     }
-                    // 5.0's `TFORPREP`: a table becomes `next` over it once, at loop entry. The
-                    // C build's patch swaps at every `TFORLOOP` instead, so a callable-table
-                    // global `next` raises `invalid key to 'next'` after one pass there; benilla
-                    // keeps 5.0's single swap, which the 1.12 client runs.
+                    // The client's `TFORPREP` (`0x6f94a2`): a table generator becomes the raw
+                    // global `next` over it once, at loop entry. The C build's patch swaps at
+                    // every `TFORLOOP` instead, so where the global `next` is a callable table
+                    // it raises `invalid key to 'next'` after one pass; the single swap here
+                    // moves benilla-lua toward the reference.
                     Op::TForPrep(a, off) => {
                         if let V::Table(_) = (r!(a)).unpack() {
                             r!(a + 1) = r!(a);
@@ -2842,18 +3064,37 @@ impl Vm {
                         // call would do, minus the frame. An invalid key takes the call, which
                         // raises from inside `next` as before.
                         if r!(a) == self.builtin_next && !self.builtin_next.is_nil() {
-                            if let V::Table(t) = (r!(a + 1)).unpack() {
+                            let state = r!(a + 1);
+                            if let V::Table(t) = state.unpack() {
                                 if let Ok(step) = self.heap.table(t).next(r!(a + 2)) {
-                                    let (k, v) = step.unwrap_or((Value::Nil, Value::Nil));
-                                    r!(cb) = k;
-                                    if nv >= 2 {
-                                        r!(cb + 1) = v;
-                                        for i in 2..nv {
-                                            r!(cb + i) = Value::Nil;
+                                    // The registers from `cb` up as the call leaves them: the
+                                    // state and control copied to `cb + 1` and `cb + 2`, then
+                                    // `lua_next` writes the key over the control and the value
+                                    // above it (or `next` one nil there), and `nv` results move
+                                    // down to `cb`, nil past those given. A body can read one
+                                    // past its variables (`Proto::clears`).
+                                    let (k, v, n) = match step {
+                                        Some((k, v)) => (k, v, 2),
+                                        None => (Value::Nil, Value::Nil, 1),
+                                    };
+                                    let left = [k, state, k, v];
+                                    let res = [k, v];
+                                    for i in 0..nv.max(if n == 2 { 4 } else { 3 }) {
+                                        let x = if i < nv {
+                                            if i < n {
+                                                res[i]
+                                            } else {
+                                                Value::Nil
+                                            }
+                                        } else {
+                                            left[i]
+                                        };
+                                        if cb + i < maxstack!() {
+                                            r!(cb + i) = x;
                                         }
                                     }
                                     if k.is_nil() {
-                                        ip = unsafe { ip.add(1) };
+                                        skip!(1);
                                     } else {
                                         r!(a + 2) = k;
                                         // SAFETY: a `TForLoop` is always followed by its `Jmp`.
@@ -2875,7 +3116,7 @@ impl Vm {
                         slow!(self.call_at(call_at, 2, nv as i32))?;
                         self.top = base!() + maxstack!();
                         if r!(cb).is_nil() {
-                            ip = unsafe { ip.add(1) };
+                            skip!(1);
                         } else {
                             r!(a + 2) = r!(cb);
                             // SAFETY: a `TForLoop` is always followed by its `Jmp`.
@@ -2941,12 +3182,36 @@ impl Vm {
                         r!(a) = Value::Func(f);
                         save!();
                         self.top = base!() + maxstack!();
-                        self.check_gc();
+                        gc!();
                     }
                 }
             }
         }
     }
+}
+
+/// The instructions 5.1 runs from `seg` to `ip` in `p`'s code, for the budget hook
+/// ([`Proto::uncounted`] left out); 1 for a run that started before the hook was set, whose
+/// start the VM did not keep.
+#[cold]
+fn ran_since(seg: *const Op, ip: *const Op, p: &Proto) -> u64 {
+    let code = p.code.as_ptr_range();
+    let (s, i) = (seg as usize, ip as usize);
+    if s < code.start as usize || s > i || i > code.end as usize {
+        return 1;
+    }
+    let size = std::mem::size_of::<Op>();
+    let (s, i) = (
+        (s - code.start as usize) / size,
+        (i - code.start as usize) / size,
+    );
+    let free = if p.uncounted.is_empty() {
+        0
+    } else {
+        let at = |pc: usize| p.uncounted.partition_point(|&u| (u as usize) < pc);
+        at(i) - at(s)
+    };
+    (i - s - free) as u64
 }
 
 /// 5.1's `getobjname` over a prototype: a local's name, else what a symbolic run from the start

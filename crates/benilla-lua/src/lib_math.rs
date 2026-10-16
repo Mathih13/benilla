@@ -76,7 +76,8 @@ pub fn open(vm: &mut Vm) {
         .set(k, Value::Num(std::f64::consts::PI))
         .unwrap();
     vm.set_global("math", Value::Table(t));
-    // `luaopen_math` registers `math_pow` as the global `__pow`, which the VM calls for `^`.
+    // 5.0's `luaopen_math` registers `math_pow` as the global `__pow`, as the client's does; the
+    // VM's `^` is 5.1's and reads no global.
     let pow = vm.new_native("__pow", |vm, n| bin(vm, n, f64::powf));
     vm.set_global("__pow", pow);
     open_bit(vm);
@@ -102,7 +103,9 @@ fn un(vm: &mut Vm, nargs: usize, f: fn(f64) -> f64) -> R<usize> {
 }
 
 /// A two-argument C call such as `fmod(luaL_checknumber(L, 1), luaL_checknumber(L, 2))`: gcc
-/// evaluated the arguments right to left, so the second is checked first.
+/// evaluated the arguments right to left, so the second is checked first. The order is the
+/// x86-64 Linux C build's on every platform (clang on arm64 checks the first); the client's MSVC
+/// x86-32 order is later work, as are its `rand` (#1258) and number text (#1376).
 fn bin_rev(vm: &mut Vm, nargs: usize, f: fn(f64, f64) -> f64) -> R<usize> {
     let b = vm.check_number(nargs, 2)?;
     let a = vm.check_number(nargs, 1)?;
@@ -168,8 +171,9 @@ fn max(vm: &mut Vm, nargs: usize) -> R<usize> {
 }
 
 /// glibc's `rand()`: `random_r`'s additive feedback generator (`TYPE_3`, `r[i] = r[i-3] +
-/// r[i-31]`), as the script host's 5.1 build called it. Its state is the process's in C, shared by
-/// every VM; here it is the VM's own, so a fork or a clone draws its own sequence.
+/// r[i-31]`), as the script host's 5.1 build called it on Linux, on every platform. The client
+/// runs MSVC's clock-seeded `rand`, which is later work (#1258). Its state is the process's in C,
+/// shared by every VM; here it is the VM's own, so a fork or a clone draws its own sequence.
 #[derive(Clone)]
 pub(crate) struct GlibcRand {
     r: [i32; 34],
