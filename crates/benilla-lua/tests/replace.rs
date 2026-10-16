@@ -52,3 +52,47 @@ fn a_native_that_replaces_the_vm_stops_it() {
         "a native replaced the running Lua VM or its heap"
     );
 }
+
+/// A hook, and host code a collection inside Lua runs (a freed host closure's captures, dropped
+/// through the host's `reentry`), hold the same `&mut Vm`; one that replaces it stops the VM too.
+#[test]
+fn a_hook_or_a_collection_that_replaces_the_vm_stops_it() {
+    use std::rc::Rc;
+    let stopped = |vm: &mut Vm, src: &[u8]| {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.exec(src, b"=t")));
+        r.err()
+            .and_then(|p| p.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    };
+    let mut vm = benilla_lua::new_state();
+    vm.set_hook(
+        10,
+        Rc::new(|vm: &mut Vm| {
+            vm.heap = Default::default();
+            Ok(())
+        }),
+    );
+    assert_eq!(
+        stopped(
+            &mut vm,
+            b"local s = 0 for i = 1, 100 do s = s + i end return s"
+        ),
+        "a native replaced the running Lua VM or its heap"
+    );
+
+    let mut vm = benilla_lua::new_state();
+    vm.reentry = Some(Rc::new(|vm: &mut Vm, f: &mut dyn FnMut()| {
+        *vm = benilla_lua::new_state();
+        f()
+    }));
+    let host: benilla_lua::heap::HostFn = Rc::new(|_: &mut Vm, _| Ok(0));
+    let f = vm.new_host("f", host);
+    vm.set_global("F", f);
+    assert_eq!(
+        stopped(
+            &mut vm,
+            b"F = nil for i = 1, 200000 do local t = {i} end return 1"
+        ),
+        "a native replaced the running Lua VM or its heap"
+    );
+}

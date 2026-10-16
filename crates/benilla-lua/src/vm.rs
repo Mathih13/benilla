@@ -2064,7 +2064,10 @@ impl Vm {
         // captures' destructors may use the state.
         if !self.heap.freed_hosts.is_empty() {
             let freed = std::mem::take(&mut self.heap.freed_hosts);
+            // The host's `reentry` hands them this `&mut Vm`, while Lua may be running on it.
+            let id = self.identity();
             self.as_host(move || drop(freed));
+            self.check_identity(id);
         }
     }
 
