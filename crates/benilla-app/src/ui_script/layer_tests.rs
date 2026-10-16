@@ -3,7 +3,7 @@
 //! row, as 1.12.1 loads FrameXML (`UI_Init 0x48fbf0`: `FrameXML.toc` at `0x48ffed`, the addons at
 //! `0x4900a3`, only the latter through `AddOn_Load`); and a dev build boots without it.
 
-use benilla_ui::script::{EditAction, EditUnit, QuadContent, ScriptValue, UiScript};
+use benilla_ui::script::{EditAction, EditUnit, QuadContent, UiScript};
 
 use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
 
@@ -44,7 +44,7 @@ fn production_load(tag: &str, stock_ui: bool) -> (UiScript, Vec<String>) {
 /// The production in-game load, the layer on unless `stock_ui`, over a hermetic AddOns root that
 /// `addons` fills; `before` runs ahead of the load. The caller holds [`ENV_LOCK`]. Returns the VM
 /// and the load's failures.
-pub(super) fn production_load_with(
+pub(crate) fn production_load_with(
     tag: &str,
     stock_ui: bool,
     before: &str,
@@ -640,10 +640,7 @@ fn the_error_log_lays_out_on_the_trainer_art_as_the_class_trainer_does() {
     // The class trainer's layout, read off its own frames once it has laid itself out.
     s.set_money(50);
     s.set_trainer(Some(super::trainer_tests::menu()));
-    s.fire_event(
-        "TRAINER_SHOW",
-        vec![ScriptValue::Str("Sana Winterhoof".into())],
-    );
+    s.fire_event("TRAINER_SHOW", vec![]);
     s.resolve();
     let trainer = |s: &UiScript, frame: &str| window_rect(s, "ClassTrainerFrame", frame);
     let ref_rows = s

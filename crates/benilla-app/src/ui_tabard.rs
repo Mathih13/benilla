@@ -12,7 +12,6 @@ use benilla_protocol::messages::GUILD_EMBLEM_RESULT_MESSAGES;
 use benilla_ui::script::{TabardHost, TabardIntent, UiScript, TABARD_COUNTS, TABARD_CREATION_COST};
 
 use crate::net::{ClientCommand, EnteredWorldMessage, NetCommands, ObjectStore, SelfPlayer};
-use crate::portrait::PaperDollBooth;
 use crate::ui_guild::GuildState;
 use crate::ui_script::{SweepApp, SweepLeg, UiFeed, UiInput};
 use crate::ui_session::{LatchApp, LatchedWindow, NpcWindow};
@@ -165,7 +164,6 @@ fn feed_tabard(
     script: Option<NonSendMut<UiScript>>,
     mut open: ResMut<TabardOpen>,
     mut design: ResMut<TabardDesign>,
-    mut booth: ResMut<PaperDollBooth>,
     guilds: Res<GuildState>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     commands: Res<NetCommands>,
@@ -195,8 +193,9 @@ fn feed_tabard(
     for _ in 0..std::mem::take(&mut open.pending_events) {
         script.fire_event("TABARD_SAVE_PENDING", vec![]);
     }
-    // `TABARD_CANSAVE_CHANGED` fires when a guild record arrives (`0x5e08e0`); here, when our
-    // identity cache moves.
+    // `TABARD_CANSAVE_CHANGED` on a re-fetched guild record, which refreshes each held member's
+    // tag (`0x5e2890` → `0x5e29c0` → `0x5e08e0`); here, when our identity cache moves. A guild id
+    // change and a player's first create are the field watches' (`crate::field_watch::guild_tag`).
     let gen = guilds.identity_generation();
     let last_gen = last_identity.get(&script);
     if last_gen.is_some() && *last_gen != Some(gen) {
@@ -211,17 +210,12 @@ fn feed_tabard(
         .collect();
     crate::ui_action::show_messages(&mut script, &mut sink, "ui_tabard", lines);
 
-    // The body wears the pane's design while the designer is open; the pane's yaw turns the booth.
+    // The body wears the pane's design while the designer is open; `TabardModel:SetUnit("player")`
+    // mirrors that body.
     let shown = open.vendor.is_some() && script.frame_visible("TabardFrame");
     let current = shown.then(|| script.tabard_design()).flatten();
     if design.0 != current {
         design.0 = current;
-    }
-    if shown {
-        let yaw = script.model_pane_facing("TabardModel");
-        if booth.yaw != yaw {
-            booth.yaw = yaw;
-        }
     }
 }
 

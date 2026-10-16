@@ -49,7 +49,8 @@ mod death;
 pub mod diagnostics;
 mod editbox;
 pub mod instance;
-pub(crate) use editbox::{adopt_text_region, editbox_text_region_wrapper};
+pub(crate) use editbox::{adopt_text_region, apply_xml_bytes, editbox_text_region_wrapper};
+pub(crate) use tooltip::post_load as tooltip_post_load;
 pub(crate) mod addon;
 mod addon_enable;
 pub mod addon_gate;
@@ -66,7 +67,7 @@ mod follow;
 pub(crate) mod font;
 mod font_block;
 mod frame_enum;
-pub use char_name::{check_char_name, NameLists, NoNameLists, CHAR_NAME_SUCCESS};
+pub use char_name::{check_char_name, NameCharsets, NameLists, NoNameLists, CHAR_NAME_SUCCESS};
 mod glue;
 mod glue_addons;
 mod glue_core;
@@ -111,10 +112,14 @@ mod item_text;
 pub mod keybind;
 mod keyboard;
 mod layer_batch;
+mod protected;
+pub(crate) mod taint;
 pub(crate) mod texel;
 pub(crate) mod use_gates;
+mod wheel;
 pub(crate) use keyboard::enable_for_script;
 pub use keyboard::{KeyUp, KeyWalk};
+pub use wheel::WheelWalk;
 mod layout;
 mod layout_cache;
 mod loot;
@@ -202,7 +207,7 @@ pub use battlefield_positions::{BattlefieldFlagView, BattlefieldPositionView};
 pub use battlefield_queue::{BattlefieldListView, BattlefieldMapInfo, BattlefieldQueueSlot};
 pub use battlefield_score::{BattlefieldScoreRow, BattlefieldScores, BattlefieldStatColumn};
 pub use bind_confirm::PendingEquipAnswer;
-pub use calls::{NearestMode, ScriptCall};
+pub use calls::{NearestMode, QueuedCall, ScriptCall};
 pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
 pub use channel::{ChannelCommand, RecruitmentPlan, RecruitmentRun, ZoneChannelRow};
 pub use char_stats::{
@@ -210,7 +215,7 @@ pub use char_stats::{
     BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
 };
 pub use chat_misc::EmoteRequest;
-pub use chat_send::ChatSend;
+pub use chat_send::{ChatGroup, ChatSend, SEND_CHAT_TOKENS};
 pub use chat_types::ChatTypeColor;
 pub use chat_window::{message_group_index, ChatWindowLook, MESSAGE_GROUPS};
 pub use container::{
@@ -222,8 +227,8 @@ pub use cursor::equip::{AutoEquip, BIND_WHEN_EQUIPPED};
 pub use cursor::money::coin_icon;
 pub use cursor::{
     CursorAction, CursorItem, CursorMacro, CursorMerchantItem, CursorMoney, CursorPayload,
-    CursorPetAction, CursorSpell, CursorStablePet, EnchantConfirm, HeldCursor, WorldPick,
-    EQUIPMENT_BAG,
+    CursorPetAction, CursorSpell, CursorStablePet, EnchantAnswer, EnchantConfirm, HeldCursor,
+    ItemPick, WorldPick, EQUIPMENT_BAG,
 };
 pub use cvar_checks::{
     check_base_mip, check_camera_decay, check_camera_distance_max, check_camera_pitch,
@@ -251,11 +256,12 @@ pub use guild::{
 pub use input_verbs::{BindingInput, FiredInput, HeldInput};
 pub use lfg::LfgDungeon;
 pub use lottery::UnservedSend;
-pub use modelframe::ModelPaneFrame;
+pub use modelframe::{CharacterPaneFrame, ModelPaneFrame};
 pub use petition::{
     validate_guild_name, PetitionRecordView, PetitionRequest, PetitionState, PETITION_TYPE_CHARTER,
     PETITION_TYPE_PETITION,
 };
+pub use protected::InputEvents;
 pub use tabard::{
     emblem_mask_path, TabardHost, TabardIntent, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
     TABARD_CREATION_COST,
@@ -290,6 +296,7 @@ pub use quest::{
 pub use quest_log::{QuestLogDetail, QuestLogEntryView, QuestLogObjectiveView, QuestLogState};
 pub(crate) use region::{
     apply_font_parts, apply_wrap_attrs, implicit_creation_anchor_lua, install_loaded_texture,
+    load_texture_file,
 };
 pub use reputation::{FactionEntry, ReputationSend, ReputationState};
 pub use session::SessionRequest;
@@ -574,6 +581,7 @@ fn install_framescript(vm: VmKind) -> mlua::Result<Lua> {
     stdlib::sandbox(&lua)?;
     // Before the stdlib layer, so its aliases bind the 5.0-shaped functions.
     lua50::install(&lua)?;
+    taint::install(&lua)?;
     stdlib::install(&lua)?;
 
     // `0x51bb20` (table `0x8503f4`): `GetTime`, `GetGameTime` and `ConsoleExec`. `ReadFile`,

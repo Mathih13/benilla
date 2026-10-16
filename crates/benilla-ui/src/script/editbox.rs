@@ -20,8 +20,9 @@
 //! and [`seam`]; the OS clipboard is host-side, [`paste`] in and `UiScript::editbox_copy` or
 //! `editbox_cut` out. The host's per-OS keymap sends editing keys as [`EditAction`]s ([`action`]).
 //!
-//! Deviation: word and edge deletes (`Delete{Word,Edge}`), which 1.12 does not have, exist because
-//! the host's OS-native chords (Option/Cmd+Backspace, Ctrl+Backspace/Delete) expect them.
+//! The word deletes are the reference's (`0x77c3f0`, `0x77c310`), and Ctrl+U/K delete to the text's
+//! edges (`0x77c4a0`, `0x77c4d0`). `Delete{Edge}` is the Mac's Cmd+Backspace/Delete, whose chords
+//! are the keymap's.
 
 use mlua::{Lua, Table};
 
@@ -96,6 +97,8 @@ pub(super) fn key_input(lua: &Lua, key: &str) -> bool {
             if with_eb(lua, h, |eb| eb.multi_line).unwrap_or(false) {
                 insert(lua, h, "\n", false);
             } else {
+                // The enter script runs with the gate's edit-box flag up (`0x77b438`-`0x77b459`).
+                let _enter = super::protected::raise(lua, super::protected::Event::Enter);
                 fire_script(lua, id, "OnEnterPressed");
             }
         }
@@ -140,12 +143,19 @@ pub(super) fn action(lua: &Lua, a: EditAction) -> bool {
         },
         EditAction::Delete { unit, back } => match unit {
             EditUnit::Char => delete_dir(lua, h, !back),
-            EditUnit::Word => delete_span(lua, h, |eb| eb.word_boundary(!back)),
+            EditUnit::Word => delete_span(lua, h, |eb| eb.word_delete_target(!back)),
             EditUnit::Edge => delete_span(lua, h, |eb| if back { 0 } else { eb.text.len() }),
             // No keymap deletes by line or row.
             EditUnit::Line | EditUnit::Row => {}
         },
         EditAction::SelectAll => highlight_text(lua, h, 0, -1),
+        EditAction::DeleteToEdge { back } => {
+            if with_eb(lua, h, |eb| eb.delete_to_edge(back)) == Some(true) {
+                sync_text_region(lua, h);
+            }
+        }
+        // In any box, a multi-line one included (`0x77d030`, `0x77cfd0`).
+        EditAction::History { older } => history_step_key(lua, h, older),
     }
     true
 }
@@ -334,8 +344,8 @@ fn set_text(lua: &Lua, h: FrameHandle, s: &str) {
     }
 }
 
-/// Word and edge deletes (no 1.12 counterpart): the selection if any, else the cursor to
-/// `target_of(eb)`.
+/// Word deletes (Ctrl+Backspace and Ctrl+W, `0x77c3f0`) and the Mac's edge delete: the selection
+/// if any, else the cursor to `target_of(eb)`.
 fn delete_span(lua: &Lua, h: FrameHandle, target_of: impl FnOnce(&EditBoxState) -> usize) {
     let changed = with_eb(lua, h, |eb| {
         let t = target_of(eb);
@@ -456,6 +466,18 @@ pub(crate) fn adopt_text_region(lua: &Lua, frame: &Table, region: &Table) -> mlu
     let data = model.region_data.entry(rh).or_default();
     data.text.get_or_insert_with(String::new);
     apply_text_region_justify(data, multi_line);
+    Ok(())
+}
+
+/// An EditBox's `<FontString bytes="N">` (`0x77a225`-`0x77a260`): `SStrToInt` of a non-empty value
+/// caps the box at N - 1 bytes, and a value of 0 or less lifts the cap.
+pub(crate) fn apply_xml_bytes(lua: &Lua, frame: &Table, bytes: &str) -> mlua::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let n = super::binding_abi::s_str_to_int(bytes);
+    let h = frame_handle_of(lua, frame)?;
+    with_eb(lua, h, |eb| eb.max_bytes = (n > 0).then(|| n as usize - 1));
     Ok(())
 }
 

@@ -312,7 +312,8 @@ fn queued_verbs_read_their_flags_through_get_bool_or_default() {
             s.take_script_calls(),
             vec![ScriptCall::TargetByName {
                 name: "Bob".into(),
-                exact: want
+                exact: want,
+                may_cast: true
             }],
             "TargetByName('Bob', {arg})"
         );
@@ -342,6 +343,7 @@ fn queued_verbs_read_their_flags_through_get_bool_or_default() {
                 action: 1,
                 on_self: want,
                 item_locks: Vec::new(),
+                may_cast: true,
             })],
             "UseAction(1, 0, {arg})"
         );
@@ -409,7 +411,8 @@ fn macro_flags_read_get_bool_or_default_with_default_zero() {
 #[test]
 fn tooltip_wrap_flags_read_get_bool_or_default_with_default_zero() {
     let s = script();
-    s.run(r#"TT = CreateFrame("GameTooltip", "TT")"#).unwrap();
+    s.run(r#"TT = CreateFrame("GameTooltip", "TT", nil, "TestTooltipTemplate")"#)
+        .unwrap();
     let pinned = |line: u32| {
         let t: mlua::Table = s
             .lua()

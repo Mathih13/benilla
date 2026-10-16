@@ -595,6 +595,12 @@ impl super::UiScript {
         self.model_ref().glue.screen.clone()
     }
 
+    /// Seed the current glue screen's name. The buffer is the client's (`[0xb41478]`), which a
+    /// glue rebuild (`0x46a7b0`) leaves as it was, so the host carries it into the new VM.
+    pub fn set_glue_screen_name(&mut self, name: &str) {
+        self.model_mut().glue.screen = name.to_string();
+    }
+
     /// A string global's text, `GetGlobalString`'s answer (`0x703bf0` with no gender and no
     /// ordinal takes `0x704350`): the global's string (a number stringified), else the empty
     /// string (`0x882748`).
@@ -852,10 +858,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // The locale name table `0x8558a4` at the locale index `[0xc0e080]` (`0x46ce40`), the same
-    // answer as the in-game binding: benilla is enUS-only.
+    // answer as the in-game binding.
     g.set(
         "GetLocale",
-        lua.create_function(|lua, _: MultiValue| lua.create_string("enUS"))?,
+        lua.create_function(|lua, _: MultiValue| {
+            lua.create_string(super::client::locale_name(lua))
+        })?,
     )?;
 
     // A string argument (`0x46ce68`) or `Usage: SetCurrentScreen("screen")` (`0x837c54`), copied

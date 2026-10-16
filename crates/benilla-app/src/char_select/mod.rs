@@ -9,6 +9,7 @@ pub(crate) use addons::okay_after_clicks;
 mod dialog;
 mod input;
 mod refresh;
+mod roundtrip;
 mod screen;
 
 use benilla_protocol::{CharAction, Character};
@@ -95,7 +96,16 @@ impl Plugin for CharSelectPlugin {
                 OnEnter(ClientState::InWorld),
                 refresh::reset_select_background,
             )
-            .add_systems(Update, (debug_glue_roundtrip, debug_logout_smoke))
+            .add_systems(
+                Update,
+                (
+                    // After the UI tick: the stock arm reads the frames it built and presses its verbs.
+                    roundtrip::debug_glue_roundtrip
+                        .run_if(roundtrip::enabled)
+                        .after(crate::ui_script::UiInput),
+                    debug_logout_smoke.after(crate::player::ControlRestore),
+                ),
+            )
             .add_systems(
                 Update,
                 (
@@ -598,47 +608,6 @@ pub(crate) fn char_delete_refusal_text(strings: &GlueStrings, code: u8) -> Optio
     Some(strings.text(key, fallback))
 }
 
-/// Glue-flow smoke (`WOW_GLUE_ROUNDTRIP=1`): once a roster is up, go to CharCreate, Back to
-/// CharSelect, and exit. Ungated, since it crosses states.
-fn debug_glue_roundtrip(
-    roster: Res<Roster>,
-    state: Res<State<ClientState>>,
-    mut next: ResMut<NextState<ClientState>>,
-    time: Res<Time>,
-    mut exit: MessageWriter<AppExit>,
-    mut phase: Local<u8>,
-    mut mark: Local<f32>,
-) {
-    if std::env::var("WOW_GLUE_ROUNDTRIP").is_err() {
-        return;
-    }
-    let now = time.elapsed_secs();
-    match *phase {
-        0 if !roster.chars.is_empty() && *state.get() == ClientState::CharSelect => {
-            info!(
-                "glue-roundtrip: initial roster = {} char(s) → entering CharCreate",
-                roster.chars.len()
-            );
-            next.set(ClientState::CharCreate);
-            (*phase, *mark) = (1, now);
-        }
-        1 if *state.get() == ClientState::CharCreate && now - *mark > 1.5 => {
-            info!("glue-roundtrip: in CharCreate → Back to CharSelect");
-            next.set(ClientState::CharSelect);
-            (*phase, *mark) = (2, now);
-        }
-        2 if *state.get() == ClientState::CharSelect && now - *mark > 1.5 => {
-            info!(
-                "glue-roundtrip: back at CharSelect, roster = {} char(s) — done",
-                roster.chars.len()
-            );
-            exit.write(AppExit::Success);
-            *phase = 3;
-        }
-        _ => {}
-    }
-}
-
 /// The logout smoke (`WOW_LOGOUT_SMOKE=1`, with `WOW_CHAR`): once in the world, `/logout`, return
 /// to CharSelect, wait for the roster the logout brings on the link the world was entered by,
 /// enter the world again and close the window. The second entry streams a map
@@ -840,6 +809,7 @@ fn debug_select_dialog(
     mut dialog: ResMut<dialog::DeleteDialog>,
     time: Res<Time>,
     entered_at: Res<CharSelectEnteredAt>,
+    unit_names: crate::ui_unit::NameTables,
     mut done: Local<bool>,
 ) {
     if *done {
@@ -855,7 +825,12 @@ fn debug_select_dialog(
     let Some(c) = roster.selected_char() else {
         return;
     };
-    let (guid, name, level, class) = (c.guid, c.name.clone(), c.level, class_name(c.class));
+    let (guid, name, level, class) = (
+        c.guid,
+        c.name.clone(),
+        c.level,
+        class_name(unit_names.get(), c.class),
+    );
     dialog.open_for(guid, name, level, class);
     dialog.typed.set_text(&typed);
     info!("char select: dialog instrument opened the delete confirm");
@@ -935,33 +910,15 @@ pub(crate) fn wow_font(assets: &AssetServer) -> Handle<Font> {
 
 // ── 1.12 display names ──────────────────────────────────────────────────────────────────────────
 
-pub(crate) fn race_name(race: u8) -> &'static str {
-    match race {
-        1 => "Human",
-        2 => "Orc",
-        3 => "Dwarf",
-        4 => "Night Elf",
-        5 => "Undead",
-        6 => "Tauren",
-        7 => "Gnome",
-        8 => "Troll",
-        _ => "?",
-    }
+/// A race's display name from `ChrRaces.dbc` at the install's locale column; `?` for an id with no
+/// row, which the roster's own bytes should not carry.
+pub(crate) fn race_name<'a>(names: crate::ui_unit::UnitNames<'a>, race: u8) -> &'a str {
+    names.race(race).map_or("?", |(name, _)| name)
 }
 
-pub(crate) fn class_name(class: u8) -> &'static str {
-    match class {
-        1 => "Warrior",
-        2 => "Paladin",
-        3 => "Hunter",
-        4 => "Rogue",
-        5 => "Priest",
-        7 => "Shaman",
-        8 => "Mage",
-        9 => "Warlock",
-        11 => "Druid",
-        _ => "?",
-    }
+/// A class's display name from `ChrClasses.dbc` at the install's locale column; `?` for no row.
+pub(crate) fn class_name<'a>(names: crate::ui_unit::UnitNames<'a>, class: u8) -> &'a str {
+    names.class(class).map_or("?", |(name, _)| name)
 }
 
 /// A `Character` with only its identity filled in.
@@ -1009,6 +966,18 @@ pub(crate) fn add_test_systems(app: &mut App, pick: crossbeam_channel::Sender<Ch
 
 #[cfg(test)]
 mod tests {
+    /// The screens' race and class words are the tables' at the install's locale; an id with no
+    /// row, or no table, reads `?`.
+    #[test]
+    fn the_screens_name_race_and_class_from_the_tables() {
+        let korean = crate::ui_unit::TestNames::korean();
+        assert_eq!(race_name(korean.names(), 5), "언데드");
+        assert_eq!(class_name(korean.names(), 11), "드루이드");
+        assert_eq!(race_name(korean.names(), 0), "?");
+        assert_eq!(class_name(korean.names(), 6), "?");
+        assert_eq!(class_name(Default::default(), 1), "?");
+    }
+
     use super::*;
 
     use super::test_character as character;

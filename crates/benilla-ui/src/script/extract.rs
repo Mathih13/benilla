@@ -75,6 +75,11 @@ impl UiScript {
             scope,
         } in list.iter()
         {
+            if zkey.parts().strata == order::Strata::World.index()
+                && super::nameplate::awaits_batch(&model, target)
+            {
+                continue;
+            }
             // Under a ScrollFrame with no rect the callback draws nothing (`0x787253`).
             let Some(clip) = clips.clip(scope) else {
                 continue;
@@ -91,12 +96,13 @@ impl UiScript {
                             zoom: m.zoom,
                             inside_zoom: m.inside_zoom,
                         },
-                        // A `<Model>`/`<PlayerModel>` pane's content hole, named so the app can
-                        // join it to that window's bake. Both kinds share `KindState::Model`, as
-                        // the client's `CGCharacterModelBase` extends `CSimpleModel`.
+                        // A `<Model>`/`<PlayerModel>` pane's content hole. Both kinds share
+                        // `KindState::Model`, as the client's `CGCharacterModelBase` extends
+                        // `CSimpleModel`.
                         Some(crate::widget::KindState::Model(m)) => QuadContent::ModelPane {
                             handle: fh,
                             name: frame.and_then(|f| f.name.clone()),
+                            character: m.character.is_some(),
                             model: m.path.clone(),
                             facing: m.facing,
                             model_scale: m.scale,
@@ -377,6 +383,7 @@ impl UiScript {
                         let fill = data.tex.fill();
                         let has_path = data.tex.path().is_some();
                         let has_texture = has_path || fill.is_some();
+                        let wrap = data.tex.wrap();
                         QuadContent::Texture {
                             path: std::mem::take(&mut data.tex).into_path(),
                             color: has_texture
@@ -392,6 +399,7 @@ impl UiScript {
                             // answer `GetBlendMode` but draw as straight alpha.
                             additive: data.blend == crate::script::BlendMode::Add,
                             tex_coords: data.tex_coords,
+                            wrap,
                             circular: data.circular,
                             portrait_unit: data.portrait_unit,
                             rotation: data.rotation,

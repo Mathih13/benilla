@@ -6,7 +6,7 @@
 //! It runs in [`WorldStage::Net`], before `Input`, so a server teleport snaps, streams and covers
 //! in one frame. Coordinates cross from WoW into Bevy space here (`wow_to_bevy`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use benilla_protocol::{
@@ -106,6 +106,8 @@ impl Plugin for NetPlugin {
             .init_resource::<crate::world_state::WorldStates>()
             .add_message::<TeleportMessage>()
             .add_message::<FieldChanged>()
+            .add_message::<crate::item_watch::ItemNotice>()
+            .add_message::<crate::field_watch::FieldNotice>()
             .add_message::<SelfMoveMessage>()
             .add_message::<SpeedChangeMessage>()
             .add_message::<ClientControlMessage>()
@@ -140,6 +142,9 @@ impl Plugin for NetPlugin {
                     apply_net_updates,
                     tag_self_player,
                     enter_world_on_self_create,
+                    // The create gives control back (`0x5deb56`), in the Net stage ahead of
+                    // `control`'s read of the flags.
+                    crate::player::regain_control_on_arrival.in_set(crate::player::ControlRestore),
                     sample_splines,
                     // Swim state from the water at the feet (the wire never carries it for
                     // creatures), before the clamp so a swimmer is exempt the same frame.
@@ -281,24 +286,6 @@ impl FieldChanged {
     /// The edge's slot in a unit-block array of `len` dwords at `base` (`UNIT_FIELD_AURA[48]`).
     pub fn unit_array_slot(&self, base: u16, len: u16) -> Option<u16> {
         (self.is_unit() && (base..base + len).contains(&self.index)).then(|| self.index - base)
-    }
-}
-
-/// The field edges one feed saw this run, by guid and index: the reference fans a moved field out
-/// to every unit token naming the unit (`0x515e50`).
-#[derive(Default)]
-pub(crate) struct FieldEdges(HashSet<(u64, u16)>);
-
-impl FieldEdges {
-    pub fn collect(reader: &mut MessageReader<FieldChanged>) -> Self {
-        Self(reader.read().map(|e| (e.guid, e.index)).collect())
-    }
-    pub fn moved(&self, guid: u64, index: u16) -> bool {
-        self.0.contains(&(guid, index))
-    }
-    #[cfg(test)]
-    pub fn of(edges: &[(u64, u16)]) -> Self {
-        Self(edges.iter().copied().collect())
     }
 }
 
@@ -564,11 +551,15 @@ impl Objects<'_, '_> {
 
     /// A streamed object's merged descriptor fields, found as `0x468460` does, by guid.
     pub fn object(&self, guid: u64) -> Option<&ObjectFields> {
+        self.store(guid).map(|s| &s.0)
+    }
+
+    /// [`Self::object`] with its component.
+    pub(crate) fn store(&self, guid: u64) -> Option<&ObjectStore> {
         self.index
             .0
             .get(&guid)
             .and_then(|&e| self.stores.get(e).ok())
-            .map(|s| &s.0)
     }
 
     /// Every streamed object, items included.

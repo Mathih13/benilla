@@ -129,14 +129,15 @@ impl<T> Arena<T> {
 mod kinds;
 pub use kinds::{
     model_key, pane_clock_step_ms, slider_fraction, slider_grab, slider_set_value, ArmedSequence,
-    ButtonFont, ButtonState, ButtonVisualState, ColorSelectState, EditAction, EditBoxState,
-    EditOutcome, EditUnit, FrameKind, InsertMode, KindState, KindUpdate, MessageFrameState,
-    MessageLine, MinimapState, ModelFileFacts, ModelFog, ModelLight, ModelPlayHead, ModelState,
-    RegionKind, ScrollFrameState, ScrollingMessageState, SequenceFacts, ShownWrites, SliderState,
-    StatusBarState, TooltipAnchor, TooltipState, MINIMAP_DEFAULT_ARROW_MODEL, MINIMAP_DEFAULT_MASK,
-    MINIMAP_DEFAULT_PLAYER_MODEL, MINIMAP_DEFAULT_ZOOM, MINIMAP_ENGINE_CHILDREN,
-    MINIMAP_ZOOM_LEVELS, TOOLTIP_DOUBLE_GAP, TOOLTIP_FADE_SECS, TOOLTIP_LINE_GAP, TOOLTIP_PAD,
-    TOOLTIP_WRAP_WIDTH,
+    ButtonFont, ButtonState, ButtonVisualState, CharacterPane, ColorSelectState, EditAction,
+    EditBoxState, EditOutcome, EditUnit, FrameKind, InsertMode, KindState, KindUpdate,
+    MessageFrameState, MessageLine, MinimapState, ModelFileFacts, ModelFog, ModelLight,
+    ModelPlayHead, ModelState, PaneArm, PaneCopy, RegionKind, ScrollFrameState,
+    ScrollingMessageState, SequenceFacts, ShownWrites, SliderState, StatusBarState, TooltipAnchor,
+    TooltipState, ANIM_SHUFFLE_LEFT, ANIM_SHUFFLE_RIGHT, ANIM_STAND, MINIMAP_DEFAULT_ARROW_MODEL,
+    MINIMAP_DEFAULT_MASK, MINIMAP_DEFAULT_PLAYER_MODEL, MINIMAP_DEFAULT_ZOOM,
+    MINIMAP_ENGINE_CHILDREN, MINIMAP_ZOOM_LEVELS, TOOLTIP_DOUBLE_GAP, TOOLTIP_FADE_SECS,
+    TOOLTIP_LINE_GAP, TOOLTIP_PAD, TOOLTIP_WRAP_WIDTH, TURN_HOLD_MS,
 };
 
 // ── Frame and Region nodes ───────────────────────────────────────────────────────────────────
@@ -184,8 +185,10 @@ pub struct Frame {
     pub layout_deferred: bool,
     /// `EnableMouse`: the mouse bit (bit 2) of the input mask `[frame+0xcc]`.
     pub mouse_enabled: bool,
-    /// `EnableMouseWheel`, or an `<OnMouseWheel>` script at XML load: the mask's wheel bit (3).
-    /// A frame with the script but not the bit is transparent to the wheel.
+    /// `EnableMouseWheel`, or an `<OnMouseWheel>` script at XML load (`0x76a044`): the mask's
+    /// wheel bit (3), membership in the wheel walk. A frame with the script but not the bit is
+    /// transparent to the wheel. Born set only for the WorldFrame (`0x481b1f`); `EnableMouseWheel`
+    /// and an XML `<OnMouseWheel>` set it later.
     pub mouse_wheel_enabled: bool,
     /// The input mask's char bit (0): membership in the char walk ([`crate::script::keyboard`]),
     /// `0x76af00(0)`. `EnableKeyboard` (`0x776ec0`), XML `enableKeyboard` or a key script at XML
@@ -202,6 +205,9 @@ pub struct Frame {
     pub char_stamp: u64,
     /// The same for the key bucket (kind 1).
     pub key_stamp: u64,
+    /// The same for the wheel bucket (kind 3): at the link or, on a linked frame, at the bit's
+    /// own enable (`0x76af00`).
+    pub wheel_stamp: u64,
     /// `SetClampedToScreen`, geometry flags `0x10`: `0x767a20` shifts the rect back on screen.
     /// Every GameTooltip is born with it here; the stock tooltips get it from their template,
     /// `GameTooltipTemplate.xml:3`.
@@ -303,7 +309,7 @@ pub struct WidgetArena {
     regions: Arena<Region>,
     names: HashMap<String, FrameHandle>,
     next_insertion: u32,
-    /// The next [`Frame::char_stamp`] / [`Frame::key_stamp`].
+    /// The next [`Frame::char_stamp`] / [`Frame::key_stamp`] / [`Frame::wheel_stamp`].
     next_kb_stamp: u64,
     /// Each stratum's level bound, the reference's `bucket+0x8`: one above the highest level a
     /// visible frame has linked at since the last compaction set it. It starts at 0 and only a
@@ -472,6 +478,7 @@ impl WidgetArena {
             f.insertion_seq = seq;
             f.char_stamp = stamp;
             f.key_stamp = stamp;
+            f.wheel_stamp = stamp;
             linked = Some((f.strata, f.level));
             self.next_insertion += 1;
             if let Some(log) = &mut self.link_log {
@@ -572,18 +579,17 @@ impl WidgetArena {
             // The ctor zeroes the layout flags (`0x767680`); the load sets the bit.
             layout_deferred: false,
             mouse_enabled: mouse_enabled_by_ctor(kind),
-            // The WorldFrame ctor takes the wheel (`0x481b1f`); the reference's ScrollFrame and
-            // ScrollingMessageFrame ctors do not, and a stock one takes it from `<OnMouseWheel>`.
-            mouse_wheel_enabled: matches!(
-                kind,
-                FrameKind::ScrollingMessageFrame | FrameKind::ScrollFrame | FrameKind::WorldFrame
-            ),
+            // The WorldFrame ctor takes the wheel (`0x481b1f`); the ScrollFrame and
+            // ScrollingMessageFrame ctors do not (`0x786a40`, `0x787670`), and a frame takes it
+            // from an XML `<OnMouseWheel>` (`0x76a044`) or `EnableMouseWheel`.
+            mouse_wheel_enabled: kind == FrameKind::WorldFrame,
             // The EditBox ctor enables char and key input (`0x779ced`, `0x779cf8`), the
             // WorldFrame's key input alone (`0x481b09`); every other kind is born inert.
             char_enabled: kind == FrameKind::EditBox,
             key_enabled: matches!(kind, FrameKind::EditBox | FrameKind::WorldFrame),
             char_stamp: kb_stamp,
             key_stamp: kb_stamp,
+            wheel_stamp: kb_stamp,
             clamped_to_screen: matches!(kind, FrameKind::GameTooltip),
             hit_rect_insets: [0.0; 4],
             movable: false,
@@ -617,8 +623,11 @@ impl WidgetArena {
                 FrameKind::ColorSelect => {
                     KindState::ColorSelect(kinds::ColorSelectState::default())
                 }
-                // `CGCharacterModelBase` extends `CSimpleModel`, adding only a turn-animation pair,
-                // which is not modelled.
+                // `CGCharacterModelBase` (`0x505680`) extends `CSimpleModel` with its subject, its
+                // turn latch and its own light.
+                FrameKind::PlayerModel | FrameKind::DressUpModel | FrameKind::TabardModel => {
+                    KindState::Model(kinds::ModelState::character())
+                }
                 k if k.is_model() => KindState::Model(kinds::ModelState::default()),
                 FrameKind::Minimap => KindState::Minimap(kinds::MinimapState::default()),
                 FrameKind::GameTooltip => KindState::Tooltip(kinds::TooltipState::default()),
