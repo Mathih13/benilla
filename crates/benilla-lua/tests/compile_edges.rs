@@ -24,3 +24,16 @@ fn a_generic_for_with_more_than_three_values_compiles() {
         "t:1: attempt to perform arithmetic on local `y' (a nil value)"
     );
 }
+
+/// The same leaked register under a `return` in the loop's body: 5.1 asserts the values sit at
+/// the first free local, which they do not, and returns from there, as the C build does.
+#[test]
+fn a_return_in_a_generic_for_with_more_than_three_values_compiles() {
+    let f = "local function f(s, c) if not c then return 1 end end ";
+    let r = |body: &str| run(&format!("{f}{body}"));
+    assert_eq!(r("for k in f, nil, nil, 42 do return k, 5 end"), "nil");
+    assert_eq!(
+        r("local function g(x) return 'g' .. tostring(x) end for k in f, nil, nil, 42 do return g(k) end"),
+        "g1"
+    );
+}

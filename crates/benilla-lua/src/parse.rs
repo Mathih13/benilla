@@ -869,12 +869,13 @@ impl<'a> Parser<'a> {
             if e.has_multret() {
                 self.setmultret(&e);
                 if let (Kind::Call(pc), 1) = (e.k, n) {
-                    // A tail call.
+                    // A tail call. 5.1 asserts its function sits at `nactvar`, which its
+                    // release build does not check and which does not hold in the body of a
+                    // generic `for` over more than three values (see `enterblock`).
                     let fs = self.fs();
                     let Op::Call(a, b, _) = fs.code[pc] else {
                         unreachable!()
                     };
-                    debug_assert_eq!(a, fs.nactvar);
                     fs.code[pc] = Op::TailCall(a, b);
                 }
                 first = self.fsr().nactvar;
@@ -883,10 +884,12 @@ impl<'a> Parser<'a> {
                 first = self.exp2anyreg(&mut e)?;
                 nret = 1;
             } else {
+                // 5.1 asserts the values went to `nactvar` on, unchecked in its release build
+                // and untrue in a generic `for` over more than three values: the return then
+                // reads the registers from `nactvar`, as the C build's does.
                 self.exp2nextreg(&mut e)?;
                 first = self.fsr().nactvar;
                 nret = n as i32;
-                debug_assert_eq!(nret, (self.fsr().freereg - first) as i32);
             }
         }
         self.ret(first, nret)

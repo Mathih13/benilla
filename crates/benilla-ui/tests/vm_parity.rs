@@ -547,6 +547,13 @@ b]])"#),
         return S(R("for k in function() end, nil, nil, 42 do end return 7"),
           R("local n = 0 for k in function(s, c) if c ~= 3 then return (c or 0) + 1 end end, nil, nil, 9, 8 do do local y = k n = n + y end end return n"),
           R("local n = 0 for k, v in function(s, c) if c ~= 2 then return (c or 0) + 1, 10 end end, 1, nil, 4 do n = n + k + v end return n"))"#),
+    ("fix-front_forlist_return", r#"local function R(src) return E(loadstring(src, "=t")) end
+        local f = "local function f(s, c) if not c then return 1 end end "
+        return S(R(f .. "for k in f, nil, nil, 42 do return k, 5 end"),
+          R(f .. "for k in f, nil, nil, 42 do return k, 5, 6 end"),
+          R(f .. "for k in f, nil, nil, 42 do return tostring(k) end"),
+          R(f .. "local function g(x) return 'g' .. tostring(x) end for k in f, nil, nil, 42 do return g(k) end"),
+          R(f .. "for k in f, nil, nil, 42, 43 do return k, 5 end"))"#),
     // ── r2-vm: error handlers as 5.1's `luaG_errormsg` runs them ──
     ("r2-vm handler_reenters", r#"local n = 0
         local ok, e = xpcall(function() error("a", 0) end, function(m) n = n + 1 error("b", 0) end)
