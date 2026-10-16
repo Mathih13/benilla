@@ -740,6 +740,20 @@ impl Lua {
         }
     }
 
+    /// Call `func`, protected and with no arguments, while each named global holds the value
+    /// paired with it, each earlier value put back after: the 1.12 script handler's convention
+    /// (`Vm::call_with_globals`) in one VM call, without a handle per global read or written.
+    pub fn call_with_globals(&self, func: &Function, globals: &[(&str, Value)]) -> Result<()> {
+        let f = self.unref(&func.0);
+        let sets: Vec<(benilla_lua::value::StrRef, benilla_lua::Value)> = globals
+            .iter()
+            .map(|(name, v)| (self.vm().heap.intern(name.as_bytes()), self.unwrap(v)))
+            .collect();
+        self.vm()
+            .call_with_globals(f, &sets)
+            .map_err(|e| self.error_from(e))
+    }
+
     /// A Lua error value as an `Error`: its text, as mlua reports a runtime error. A callback's
     /// panic resumes here, as mlua's `pop_error` resumes it.
     pub(crate) fn error_from(&self, e: benilla_lua::Value) -> Error {
