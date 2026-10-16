@@ -832,8 +832,8 @@ impl Vm {
     #[inline(never)]
     fn type_error(&mut self, v: Value, reg: Option<usize>, op: &str) -> LuaError {
         let t = v.type_name();
-        let fi = self.frames.len() - 1;
-        let named = reg.and_then(|r| self.objname(fi, r));
+        // A register names a value only in a running Lua frame; the host indexes with none.
+        let named = reg.and_then(|r| self.objname(self.frames.len().checked_sub(1)?, r));
         let msg = match named {
             Some((kind, name)) => format!(
                 "attempt to {op} {kind} `{}' (a {t} value)",

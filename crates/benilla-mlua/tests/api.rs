@@ -21,3 +21,18 @@ fn a_stack_level_names_its_function() {
     assert_eq!(mine, seen);
     assert_eq!(caller, f);
 }
+
+/// An index the host makes with no Lua running raises a plain type error, as `lua_gettable`
+/// does with no function to name a variable in.
+#[test]
+fn a_host_index_through_a_bad_index_metamethod_raises() {
+    let lua = Lua::new();
+    lua.load("setmetatable(_G, {__index = true})")
+        .exec()
+        .unwrap();
+    let err = lua.globals().get::<benilla_mlua::Value>("x").unwrap_err();
+    assert!(
+        err.to_string().contains("attempt to index a boolean value"),
+        "{err}"
+    );
+}
