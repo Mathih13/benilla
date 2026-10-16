@@ -32,6 +32,15 @@ pub(crate) struct Parser<'a> {
     name_hint: Option<Vec<u8>>,
 }
 
+/// `sep` then `name` onto a function's name for its key, cut where a key cuts a name
+/// ([`KEY_NAME_MAX`]): a name built along a long chain or deep constructors costs no more.
+fn join_name(out: &mut Vec<u8>, sep: &[u8], name: &[u8]) {
+    for part in [sep, name] {
+        let room = KEY_NAME_MAX.saturating_sub(out.len());
+        out.extend_from_slice(&part[..part.len().min(room)]);
+    }
+}
+
 /// 5.1's `ConsControl`.
 struct ConsControl {
     /// The last list item read.
@@ -56,7 +65,7 @@ pub(crate) fn parse(src: &[u8], chunkname: &[u8], heap: &mut Heap, ccalls: u32) 
         ccalls,
         name_hint: None,
     };
-    p.fs.push(FuncState::new(Rc::from(chunkname), 0, Rc::from(&b""[..])));
+    p.fs.push(FuncState::new(Rc::from(chunkname), 0, Key::default()));
     p.chunk()?;
     p.check(Tok::Eof)?;
     let fs = p.close_func()?;
@@ -715,7 +724,7 @@ impl<'a> Parser<'a> {
                 let fs = self.fsr();
                 let name = &fs.locvars[fs.actvar[fs.nactvar as usize] as usize].name;
                 let mut hint = b"local ".to_vec();
-                hint.extend_from_slice(name);
+                join_name(&mut hint, b"", name);
                 self.name_hint = Some(hint);
             }
             self.explist1()?
@@ -731,7 +740,8 @@ impl<'a> Parser<'a> {
     /// `self`, and the function's name for its key, as written: `a.b.c`, `Frame:OnEvent`.
     fn funcname(&mut self) -> R<(Exp, bool, Vec<u8>)> {
         let (mut v, root) = self.singlevar()?;
-        let mut name = root.to_vec();
+        let mut name = Vec::new();
+        join_name(&mut name, b"", root);
         let mut needself = false;
         loop {
             let sep = match self.tok() {
@@ -743,8 +753,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             let field = self.field(&mut v)?;
-            name.push(sep);
-            name.extend_from_slice(field);
+            join_name(&mut name, &[sep], field);
             if needself {
                 break;
             }
@@ -914,8 +923,7 @@ impl<'a> Parser<'a> {
             let name = self.str_checkname()?;
             if let Some(p) = &cc.prefix {
                 let mut n = p.clone();
-                n.push(b'.');
-                n.extend_from_slice(name);
+                join_name(&mut n, b".", name);
                 hint = Some(n);
             }
             Exp::new(Kind::K(self.string_k(name)?))
@@ -1090,14 +1098,15 @@ impl<'a> Parser<'a> {
         let mut tag: Option<Vec<u8>> = None;
         loop {
             if let (Some(c), Tok::Function) = (callee, self.tok()) {
-                let mut h = c.to_vec();
+                let mut h = Vec::new();
+                join_name(&mut h, b"", c);
                 if let Some(t) = &tag {
-                    h.push(b':');
                     // `/` and `#` structure keys.
-                    h.extend(
-                        t.iter()
-                            .map(|&b| if b == b'/' || b == b'#' { b'_' } else { b }),
-                    );
+                    let t: Vec<u8> = t
+                        .iter()
+                        .map(|&b| if b == b'/' || b == b'#' { b'_' } else { b })
+                        .collect();
+                    join_name(&mut h, b":", &t);
                 }
                 self.name_hint = Some(h);
             }
@@ -1138,7 +1147,15 @@ impl<'a> Parser<'a> {
         // literals.
         let (mut v, mut name, mut last) = if self.tok() == Tok::Name {
             let (v, n) = self.singlevar()?;
-            (v, want.then(|| n.to_vec()), Some(n))
+            (
+                v,
+                want.then(|| {
+                    let mut name = Vec::new();
+                    join_name(&mut name, b"", n);
+                    name
+                }),
+                Some(n),
+            )
         } else {
             (self.prefixexp()?, None, None)
         };
@@ -1147,8 +1164,7 @@ impl<'a> Parser<'a> {
                 Tok::Char(b'.') => {
                     let field = self.field(&mut v)?;
                     if let Some(n) = &mut name {
-                        n.push(b'.');
-                        n.extend_from_slice(field);
+                        join_name(n, b".", field);
                     }
                     last = Some(field);
                     continue;

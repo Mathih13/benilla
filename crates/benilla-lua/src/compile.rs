@@ -217,7 +217,7 @@ pub(crate) struct FuncState {
     pub upvals: Vec<(bool, u16)>,
     pub upval_names: Vec<Bytes>,
     /// The declaration each upvalue captures ([`FuncState::local_decl`]).
-    pub upval_decls: Vec<Bytes>,
+    pub upval_decls: Vec<Decl>,
     pub locvars: Vec<LocVar>,
     /// `locvars` index of each active local, then of those declared but not yet active.
     pub actvar: Vec<u16>,
@@ -235,12 +235,16 @@ pub(crate) struct FuncState {
     pub nparams: u8,
     pub vararg: bool,
     pub source: Bytes,
-    pub key: Bytes,
-    child_names: HashMap<Vec<u8>, u32>,
+    pub key: Key,
+    /// How many children so far have each name, cut as a key cuts it.
+    child_names: HashMap<Bytes, u32>,
+    /// Which declaration of its name each of `locvars` is, from 1, and the count by name.
+    locvar_nth: Vec<u32>,
+    locvar_names: HashMap<Bytes, u32>,
 }
 
 impl FuncState {
-    pub fn new(source: Bytes, linedefined: u32, key: Bytes) -> FuncState {
+    pub fn new(source: Bytes, linedefined: u32, key: Key) -> FuncState {
         FuncState {
             code: Vec::new(),
             lines: Vec::new(),
@@ -267,6 +271,8 @@ impl FuncState {
             source,
             key,
             child_names: HashMap::new(),
+            locvar_nth: Vec::new(),
+            locvar_names: HashMap::new(),
         }
     }
 
@@ -276,35 +282,31 @@ impl FuncState {
 
     /// The declaration of the active local in register `r`, as hot reload tells captured
     /// variables apart: this function's key, the name, and which declaration of that name it is.
-    pub fn local_decl(&self, r: Reg) -> Bytes {
+    /// It shares the key and the name, so a capture costs no copy of either.
+    pub fn local_decl(&self, r: Reg) -> Decl {
         let idx = self.actvar[r as usize] as usize;
-        let name = &self.locvars[idx].name;
-        let nth = self.locvars[..=idx]
-            .iter()
-            .filter(|v| v.name == *name)
-            .count();
-        let mut d = self.key.to_vec();
-        d.push(b'|');
-        d.extend_from_slice(name);
-        d.extend_from_slice(format!("#{nth}").as_bytes());
-        Rc::from(d)
+        Decl {
+            func: self.key.clone(),
+            name: self.locvars[idx].name.clone(),
+            nth: self.locvar_nth[idx],
+        }
+    }
+
+    /// A local declared: which declaration of its name it is.
+    pub(crate) fn count_locvar(&mut self, name: &Bytes) {
+        let n = self.locvar_names.entry(name.clone()).or_insert(0);
+        *n += 1;
+        self.locvar_nth.push(*n);
     }
 
     /// A child's key: this function's, then the child's name, numbered when it repeats. Hot
     /// reload matches functions across an edit by it.
-    pub fn child_key(&mut self, name: Option<Vec<u8>>) -> Bytes {
-        let base = name.unwrap_or_else(|| b"anon".to_vec());
-        let n = self.child_names.entry(base.clone()).or_insert(0);
+    pub fn child_key(&mut self, name: Option<Vec<u8>>) -> Key {
+        let name = name.as_deref().unwrap_or(b"anon");
+        let name: Bytes = Rc::from(&name[..name.len().min(KEY_NAME_MAX)]);
+        let n = self.child_names.entry(name.clone()).or_insert(0);
         *n += 1;
-        let mut k = self.key.to_vec();
-        if !k.is_empty() {
-            k.push(b'/');
-        }
-        k.extend_from_slice(&base);
-        if *n > 1 {
-            k.extend_from_slice(format!("#{n}").as_bytes());
-        }
-        Rc::from(k)
+        self.key.child(&name, *n)
     }
 
     /// The finished prototype (`close_func`, after its final return).
@@ -334,48 +336,34 @@ impl FuncState {
             line_defined: self.linedefined,
             locvars: self.locvars,
             key: self.key,
-            key_counts: Box::new([]),
             chunk_keys: Rc::from(Vec::new()),
             gc_mark: Default::default(),
         }
     }
 }
 
-/// The name a key's last part was numbered from: `anon` for `Init/anon#2`.
-fn key_base(key: &[u8]) -> &[u8] {
-    let last = key.rsplit(|&c| c == b'/').next().unwrap_or(key);
-    match last.iter().rposition(|&c| c == b'#') {
-        Some(i) if i + 1 < last.len() && last[i + 1..].iter().all(u8::is_ascii_digit) => &last[..i],
-        _ => last,
-    }
-}
-
-/// Fill in the whole chunk's key facts once it is compiled: each function's
-/// [`Proto::key_counts`] and the chunk's [`Proto::chunk_keys`].
+/// Fill in the whole chunk's key facts once it is compiled: how many siblings share each key's
+/// name ([`Key::same_counts`]) and the chunk's [`Proto::chunk_keys`].
 pub(crate) fn finish_keys(root: &mut Proto) {
-    fn counts(p: &mut Proto, path: &[u32], keys: &mut Vec<Bytes>) {
-        p.key_counts = path.into();
+    fn counts(p: &Proto, keys: &mut Vec<Key>) {
         keys.push(p.key.clone());
         let mut same: HashMap<&[u8], u32> = HashMap::new();
         for q in &p.protos {
-            *same.entry(key_base(&q.key)).or_insert(0) += 1;
+            *same.entry(q.key.name()).or_insert(0) += 1;
         }
-        let n: Vec<u32> = p.protos.iter().map(|q| same[key_base(&q.key)]).collect();
-        let mut sub = path.to_vec();
-        for (q, n) in p.protos.iter_mut().zip(n) {
-            sub.push(n);
-            counts(Rc::get_mut(q).expect("a fresh prototype"), &sub, keys);
-            sub.pop();
+        for q in &p.protos {
+            q.key.set_count(same[q.key.name()]);
+            counts(q, keys);
         }
     }
-    fn share(p: &mut Proto, keys: &Rc<[Bytes]>) {
+    fn share(p: &mut Proto, keys: &Rc<[Key]>) {
         p.chunk_keys = keys.clone();
         for q in &mut p.protos {
             share(Rc::get_mut(q).expect("a fresh prototype"), keys);
         }
     }
     let mut keys = Vec::new();
-    counts(root, &[], &mut keys);
+    counts(root, &mut keys);
     share(root, &Rc::from(keys));
 }
 
@@ -1300,8 +1288,10 @@ impl<'a> Parser<'a> {
             return Err(SyntaxError(b"too many local variables".to_vec()));
         }
         let fs = self.fs();
+        let name: Bytes = Rc::from(name);
+        fs.count_locvar(&name);
         fs.locvars.push(LocVar {
-            name: Rc::from(name),
+            name,
             reg: 0,
             startpc: 0,
             endpc: 0,

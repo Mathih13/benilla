@@ -4,6 +4,9 @@
 /// Byte strings the compiler, the heap and hot reload share: names, sources, function keys.
 pub type Bytes = std::rc::Rc<[u8]>;
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use crate::value::Value;
 
 pub type Reg = u8;
@@ -151,6 +154,140 @@ pub enum Op {
 // Every instruction is eight bytes: the dispatch loads one word and decodes only its own fields.
 const _: () = assert!(std::mem::size_of::<Op>() == 8);
 
+/// The longest name a function key keeps of a part: a longer name is cut here, so every key costs
+/// one part of bounded size whatever the source spells.
+pub const KEY_NAME_MAX: usize = 128;
+
+/// A function's identity within its chunk, for hot reload ([`Proto::key`]): its enclosing
+/// function's key and one part of its own, so a key shares every part above its own with its
+/// parent and costs one part however deep it is nested. The main function's key has no part.
+#[derive(Clone, Default)]
+pub struct Key(Option<Rc<KeyPart>>);
+
+struct KeyPart {
+    parent: Key,
+    /// The name, at most [`KEY_NAME_MAX`] bytes.
+    name: Bytes,
+    /// Which of the enclosing function's children with this name it is, from 1.
+    nth: u32,
+    /// How many of the enclosing function's children share the name, known once the chunk is
+    /// compiled ([`Key::set_count`]): a numbered key matches across an edit only while it holds.
+    count: Cell<u32>,
+    /// A hash of the whole chain, so a key in a map is hashed in one step.
+    hash: u64,
+}
+
+impl Key {
+    /// The key of a child of this function named `name`, the `nth` of that name.
+    pub fn child(&self, name: &[u8], nth: u32) -> Key {
+        let name = &name[..name.len().min(KEY_NAME_MAX)];
+        let mut h = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&self.0.as_ref().map_or(0, |p| p.hash), &mut h);
+        std::hash::Hash::hash(name, &mut h);
+        std::hash::Hash::hash(&nth, &mut h);
+        Key(Some(Rc::new(KeyPart {
+            parent: self.clone(),
+            name: Rc::from(name),
+            nth,
+            count: Cell::new(0),
+            hash: std::hash::Hasher::finish(&h),
+        })))
+    }
+
+    /// The main function's key.
+    pub fn is_root(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// The part's own name, empty for the main function's key.
+    pub fn name(&self) -> &[u8] {
+        self.0.as_ref().map_or(&[], |p| &p.name)
+    }
+
+    pub(crate) fn set_count(&self, n: u32) {
+        if let Some(p) = &self.0 {
+            p.count.set(n);
+        }
+    }
+
+    fn parts(&self) -> impl Iterator<Item = &KeyPart> {
+        std::iter::successors(self.0.as_deref(), |p| p.parent.0.as_deref())
+    }
+
+    /// Whether each part counts as many siblings of its name as `other`'s does.
+    pub fn same_counts(&self, other: &Key) -> bool {
+        let (mut a, mut b) = (self.parts(), other.parts());
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return true,
+                (Some(x), Some(y)) if x.count.get() == y.count.get() => {}
+                _ => return false,
+            }
+        }
+    }
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Key) -> bool {
+        let (mut a, mut b) = (self.parts(), other.parts());
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return true,
+                (Some(x), Some(y)) => {
+                    if std::ptr::eq(x, y) {
+                        return true;
+                    }
+                    if x.hash != y.hash || x.nth != y.nth || x.name != y.name {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+}
+
+impl Eq for Key {}
+
+impl std::hash::Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.0.as_ref().map_or(0, |p| p.hash).hash(h);
+    }
+}
+
+/// The parts from the outermost, joined by `/`, a repeated name numbered: `Init/anon#2`.
+impl std::fmt::Display for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts: Vec<&KeyPart> = self.parts().collect();
+        parts.reverse();
+        for (i, p) in parts.iter().enumerate() {
+            if i > 0 {
+                f.write_str("/")?;
+            }
+            f.write_str(&String::from_utf8_lossy(&p.name))?;
+            if p.nth > 1 {
+                write!(f, "#{}", p.nth)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.to_string())
+    }
+}
+
+/// The variable an upvalue captures, for hot reload: the function that declares it, its name,
+/// and which declaration of that name in the function it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Decl {
+    pub func: Key,
+    pub name: Bytes,
+    pub nth: u32,
+}
+
 /// A local's name and the registers' lifetime, for error messages.
 #[derive(Clone, Debug)]
 pub struct LocVar {
@@ -170,9 +307,8 @@ pub struct Proto {
     /// upvalues.
     pub upvals: Vec<(bool, u16)>,
     pub upval_names: Vec<Bytes>,
-    /// The declaration each upvalue captures, for hot reload: the declaring function's key, the
-    /// name, and which declaration of that name it is (`MyAddon|x#2`).
-    pub upval_decls: Vec<Bytes>,
+    /// The declaration each upvalue captures, for hot reload.
+    pub upval_decls: Vec<Decl>,
     /// Parameters including `self`.
     pub nparams: u8,
     /// `...`: the extras become the `arg` table in register `nparams`.
@@ -186,12 +322,9 @@ pub struct Proto {
     /// `local helper`), or after the single target it is assigned to (`H.OnShow = function`,
     /// `local f = function`, a constructor's `name = function`), or `anon`; a name used twice
     /// is numbered (`Init/anon#2`). Hot reload matches on it.
-    pub key: Bytes,
-    /// For each part of `key`, how many siblings share its name: a numbered key matches the
-    /// same function across an edit only while these counts hold.
-    pub key_counts: Box<[u32]>,
+    pub key: Key,
     /// Every key of the chunk this function was compiled in.
-    pub chunk_keys: std::rc::Rc<[Bytes]>,
+    pub chunk_keys: std::rc::Rc<[Key]>,
     /// `source`'s id in the heap's chunk list, for profiles and memory censuses.
     pub source_id: u32,
     /// The collection that last marked this prototype's constants (`Heap::collect`).
@@ -225,7 +358,7 @@ impl Proto {
         let fail = |pc: usize, what: &str| -> ! {
             panic!(
                 "benilla-lua compiled bad code: {what} at instruction {pc} of `{}` in {}",
-                String::from_utf8_lossy(&self.key),
+                self.key,
                 String::from_utf8_lossy(&self.source),
             )
         };

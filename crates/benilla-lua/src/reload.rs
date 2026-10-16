@@ -7,8 +7,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::heap::{FuncObj, LuaFunc};
-use crate::proto::Bytes;
-use crate::proto::Proto;
+use crate::proto::{Key, Proto};
 use crate::vm::Vm;
 use crate::SyntaxError;
 
@@ -30,33 +29,36 @@ pub struct Report {
     pub removed: Vec<String>,
 }
 
-fn walk(p: &Rc<Proto>, out: &mut HashMap<Bytes, Rc<Proto>>) {
+// A key's sibling count is a `Cell`, and no part of its hash or equality.
+#[allow(clippy::mutable_key_type)]
+fn walk(p: &Rc<Proto>, out: &mut HashMap<Key, Rc<Proto>>) {
     out.insert(p.key.clone(), p.clone());
     for q in &p.protos {
         walk(q, out);
     }
 }
 
-fn show(k: &[u8]) -> String {
-    String::from_utf8_lossy(k).into_owned()
+fn show(k: &Key) -> String {
+    k.to_string()
 }
 
 impl Vm {
     /// Compile `src` as the chunk `chunkname` and swap each of its functions into the live
     /// closures of the same function. A syntax error leaves everything as it was.
+    #[allow(clippy::mutable_key_type)] // as `walk`
     pub fn hot_reload(&mut self, chunkname: &[u8], src: &[u8]) -> Result<Report, SyntaxError> {
         let root = crate::compile::compile(src, chunkname, &mut self.heap, 0)?;
         let mut fresh = HashMap::new();
         walk(&root, &mut fresh);
         let mut report = Report::default();
-        let mut seen: HashMap<Bytes, bool> = HashMap::new();
+        let mut seen: HashMap<Key, bool> = HashMap::new();
         // Replaced code may still be running in a frame; it is kept until no Lua runs.
         if self.frames_empty() {
             self.retired.clear();
         }
         let mut retired = Vec::new();
         // The keys the old source had, from what its live closures carry.
-        let mut old_keys: Vec<Rc<[Bytes]>> = Vec::new();
+        let mut old_keys: Vec<Rc<[Key]>> = Vec::new();
         for f in self.heap.funcs_mut() {
             let FuncObj::Lua(LuaFunc {
                 proto,
@@ -68,7 +70,7 @@ impl Vm {
                 continue;
             };
             // The main function ran once; it is not swapped.
-            if &*proto.source != chunkname || proto.key.is_empty() {
+            if &*proto.source != chunkname || proto.key.is_root() {
                 continue;
             }
             if !old_keys.iter().any(|k| Rc::ptr_eq(k, &proto.chunk_keys)) {
@@ -81,7 +83,7 @@ impl Vm {
             };
             // The new function's upvalues, by the declaration each captures, from the closure's
             // existing ones; none when the key may now name another function.
-            let remap: Option<Vec<u32>> = if new.key_counts != proto.key_counts {
+            let remap: Option<Vec<u32>> = if !new.key.same_counts(&proto.key) {
                 None
             } else {
                 new.upval_decls
@@ -120,7 +122,7 @@ impl Vm {
         }
         for k in fresh.keys() {
             let had = old_keys.iter().any(|ks| ks.contains(k));
-            if !k.is_empty() && !seen.contains_key(k) && !had {
+            if !k.is_root() && !seen.contains_key(k) && !had {
                 report.added.push(show(k));
             }
         }
