@@ -267,7 +267,10 @@ fn a_lent_vm_is_the_only_way_in_until_it_is_back() {
     let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         lua.with_vm(|_| lua.globals())
     }));
-    assert!(hit.is_err(), "the state's API used while the VM is lent panics");
+    assert!(
+        hit.is_err(),
+        "the state's API used while the VM is lent panics"
+    );
 
     let f = lua
         .create_function(|lua, ()| {
@@ -277,5 +280,9 @@ fn a_lent_vm_is_the_only_way_in_until_it_is_back() {
         .unwrap();
     lua.globals().set("cb", f).unwrap();
     lua.with_vm(|vm| vm.exec(b"cb()", b"=t").map(|_| ()).unwrap());
-    assert_eq!(lua.globals().get::<i64>("seen").unwrap(), 7, "back after the lend");
+    assert_eq!(
+        lua.globals().get::<i64>("seen").unwrap(),
+        7,
+        "back after the lend"
+    );
 }
