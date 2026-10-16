@@ -175,6 +175,8 @@ pub struct Vm {
     /// How the host runs its own code against this VM from inside it (`Vm::as_host`): it makes
     /// the `&mut Vm` it is handed the one its API reaches, as for a callback.
     pub reentry: Option<Reentry>,
+    /// `math.random`'s generator.
+    pub(crate) rand: crate::lib_math::GlibcRand,
 }
 
 /// The host's way in: run the closure with the `&mut Vm` as the VM in effect.
@@ -411,6 +413,7 @@ impl Vm {
             profile: None,
             host: None,
             reentry: None,
+            rand: crate::lib_math::GlibcRand::seeded(1),
         };
         vm.heap.threshold = 2 * vm.heap.bytes.max(32 * 1024);
         vm
