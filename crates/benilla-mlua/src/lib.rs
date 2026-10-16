@@ -678,7 +678,7 @@ impl Lua {
     /// The stack level `level` up, for a traceback: `f` reads it.
     pub fn inspect_stack<R>(&self, level: usize, f: impl FnOnce(&Debug) -> R) -> Option<R> {
         let info = self.vm().frame_info(level)?;
-        Some(f(&Debug { info }))
+        Some(f(&Debug { info, lua: self }))
     }
 
     /// Run `callback` about every `triggers.every_nth_instruction` instructions.
@@ -694,7 +694,7 @@ impl Lua {
                 in_callback(&lua, vm, || {
                     let info = lua.vm().frame_info(0).unwrap_or_default();
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        callback(&lua, &Debug { info })
+                        callback(&lua, &Debug { info, lua: &lua })
                     }));
                     let out = match r {
                         Ok(Ok(_)) => Ok(()),
@@ -1939,8 +1939,9 @@ impl<T> DerefMut for AppDataRefMut<'_, T> {
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 /// One stack level.
-pub struct Debug {
+pub struct Debug<'a> {
     info: benilla_lua::vm::FrameInfo,
+    lua: &'a Lua,
 }
 
 pub struct DebugSource<'a> {
@@ -1956,7 +1957,12 @@ pub struct DebugNames<'a> {
     pub name_what: Option<&'static str>,
 }
 
-impl Debug {
+impl Debug<'_> {
+    /// The function running at this level; a tail call's level names none, as 5.1's does.
+    pub fn function(&self) -> Function {
+        Function(self.lua.make_ref(self.info.func))
+    }
+
     pub fn source(&self) -> DebugSource<'_> {
         let i = &self.info;
         let (source, short_src) = match (i.what, &i.source) {

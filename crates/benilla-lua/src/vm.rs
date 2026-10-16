@@ -337,6 +337,8 @@ pub struct FrameInfo {
     /// How the calling instruction named it: `("global", "foo")`.
     pub name: Option<Vec<u8>>,
     pub namewhat: &'static str,
+    /// The function running at the level (`lua_getinfo`'s `"f"`); nil for a tail call.
+    pub func: Value,
 }
 
 /// What a call produced, for the dispatch loop.
@@ -1774,6 +1776,7 @@ impl Vm {
                     line_defined: p.line_defined,
                     name,
                     namewhat,
+                    func: Value::Func(f.func),
                 }
             }
             None => FrameInfo {
@@ -1783,6 +1786,7 @@ impl Vm {
                 line_defined: 0,
                 name,
                 namewhat,
+                func: Value::Func(f.func),
             },
         }
     }
