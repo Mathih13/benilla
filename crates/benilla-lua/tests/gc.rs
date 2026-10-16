@@ -123,10 +123,29 @@ fn the_builtin_next_outlives_its_globals() {
 #[test]
 fn vararg_calls_collect_as_they_go() {
     let mut vm = benilla_lua::new_state();
-    run(&mut vm, "local function f(...) return arg.n end for i = 1, 200000 do f(i, i) end");
+    run(
+        &mut vm,
+        "local function f(...) return arg.n end for i = 1, 200000 do f(i, i) end",
+    );
     let tables = vm.heap.counts()[1];
     assert!(
         tables < 50000,
         "200000 `arg` tables should not wait for a collection, {tables} live"
+    );
+}
+
+/// A table's growth counts toward the heap, as 5.1's `luaM_reallocvector` charges it: an array
+/// filled to a hundred thousand slots shows in `gcinfo` before any collection.
+#[test]
+fn table_growth_counts_toward_the_heap() {
+    let mut vm = benilla_lua::new_state();
+    let kb = run(
+        &mut vm,
+        "T = {} for i = 1, 100000 do T[i] = i end return gcinfo()",
+    );
+    let kb: f64 = kb.parse().unwrap();
+    assert!(
+        kb > 1000.0,
+        "a 100000-slot array is over a megabyte, gcinfo says {kb} KB"
     );
 }

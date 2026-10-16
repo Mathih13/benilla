@@ -674,7 +674,7 @@ impl Lua {
     // ── the collector ────────────────────────────────────────────────────────────────────────
 
     pub fn used_memory(&self) -> usize {
-        self.vm().heap.bytes
+        self.vm().heap.bytes()
     }
 
     pub fn gc_collect(&self) -> Result<()> {

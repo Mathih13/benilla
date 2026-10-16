@@ -415,7 +415,7 @@ impl Vm {
             reentry: None,
             rand: crate::lib_math::GlibcRand::seeded(1),
         };
-        vm.heap.threshold = 2 * vm.heap.bytes.max(32 * 1024);
+        vm.heap.threshold = 2 * vm.heap.bytes().max(32 * 1024);
         vm
     }
 
@@ -1878,7 +1878,7 @@ impl Vm {
     /// 5.0's `luaC_checkGC`, at a safe point: every live value is on the stack or reachable.
     #[inline]
     pub fn check_gc(&mut self) {
-        if self.heap.bytes >= self.heap.threshold || self.gc_stress {
+        if self.heap.bytes() >= self.heap.threshold || self.gc_stress {
             self.full_gc();
         }
     }

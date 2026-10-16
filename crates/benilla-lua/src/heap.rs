@@ -449,8 +449,9 @@ pub struct Heap {
     funcs: Arena<FuncObj>,
     upvals: Arena<UpvalObj>,
     users: Arena<UserObj>,
-    /// Bytes allocated since the last collection's accounting, an estimate.
-    pub bytes: usize,
+    /// Bytes allocated since the last collection's accounting, an estimate; table resizes are
+    /// added as [`Heap::bytes`] reads it.
+    bytes: usize,
     /// 5.0's `GCthreshold`: a collection runs when `bytes` reaches it.
     pub threshold: usize,
     /// The chunk names prototypes were compiled under, by source id: the owners a profile and
@@ -1013,8 +1014,18 @@ impl Heap {
         }
         // A key whose node is dead (nil value) may name a freed object; 5.0 keeps such keys for
         // `next` and never reads them. They stay as stale handles, compared by identity only.
+        crate::table::take_growth();
         self.bytes = live;
         live
+    }
+
+    /// The live byte estimate: what the last collection found, what was made since, and what
+    /// tables grew by since.
+    pub fn bytes(&mut self) -> usize {
+        self.bytes = self
+            .bytes
+            .saturating_add_signed(crate::table::take_growth());
+        self.bytes
     }
 
     /// Whether a value's object still exists; anything not collectable does.
