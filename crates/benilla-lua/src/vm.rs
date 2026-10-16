@@ -1280,7 +1280,26 @@ impl Vm {
         }
     }
 
+    /// A call from the host or a native into Lua. The running chunk is the caller's again when
+    /// it returns, so the profile and the table census charge what the caller does next to it.
     fn call_at_inner(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<(), LuaError> {
+        let src = self.heap.cur_source;
+        let r = self.call_at_checked(func_idx, nargs, nres);
+        if self.heap.cur_source != src {
+            self.heap.cur_source = src;
+            if self.hooked {
+                self.prof_switch();
+            }
+        }
+        r
+    }
+
+    fn call_at_checked(
+        &mut self,
+        func_idx: usize,
+        nargs: usize,
+        nres: i32,
+    ) -> Result<(), LuaError> {
         self.c_depth += 1;
         let marker = 0u8;
         let here = std::ptr::addr_of!(marker) as usize;
