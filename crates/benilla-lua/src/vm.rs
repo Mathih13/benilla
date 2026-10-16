@@ -772,6 +772,11 @@ impl Vm {
         None
     }
 
+    /// A number naming this VM among every one made, a clone included.
+    pub fn vm_id(&self) -> u64 {
+        self.identity.0
+    }
+
     /// No Lua or native runs on this VM: no call is in progress.
     pub fn frames_empty(&self) -> bool {
         self.frames.is_empty()

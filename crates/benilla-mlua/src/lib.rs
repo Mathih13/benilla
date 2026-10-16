@@ -90,7 +90,11 @@ impl Drop for Inner {
     fn drop(&mut self) {
         // SAFETY: `owned` came from `Box::into_raw` in `Lua::over` and is freed only here; no
         // reference to the VM outlives the last `Lua`, which is going.
-        drop(unsafe { Box::from_raw(self.owned) });
+        let vm = unsafe { Box::from_raw(self.owned) };
+        let id = vm.vm_id();
+        drop(vm);
+        // Its panics' error values went with it. `try_with`: the thread may be ending.
+        let _ = PANICS.try_with(|p| p.borrow_mut().retain(|_, e| e.2 != id));
     }
 }
 
@@ -98,18 +102,19 @@ thread_local! {
     /// The family and VM of the callback running now, if any.
     static RUNNING: Cell<(u64, *mut Vm)> = const { Cell::new((0, std::ptr::null_mut())) };
     /// Each panic a callback raised as a Lua error, by its error value's tag: the payload until
-    /// it resumes in Rust, and its text for `tostring`. Tags rise, so the first entry is the
-    /// oldest; a Lua `pcall` that swallows a panic leaves its entry, and only the latest
-    /// [`PANICS_KEPT`] are kept.
+    /// it resumes in Rust, and its text for `tostring`. An entry a Lua `pcall` swallowed goes
+    /// once the collector frees its error value, or with its VM.
     static PANICS: RefCell<BTreeMap<u64, Panic>> = const { RefCell::new(BTreeMap::new()) };
 }
 
-// ponytail: a bound in place of a `__gc`, which the VM lacks; an older panic's error loses its
-// text and payload, and a callback panicking that often is already a bug report.
-const PANICS_KEPT: usize = 64;
-
-/// A panic raised as a Lua error: its payload until it resumes, and its text.
-type Panic = (Option<Box<dyn Any + Send>>, std::string::String);
+/// A panic raised as a Lua error: its payload until it resumes, its text, and the VM and
+/// userdata that carry it, by which an entry whose error value is gone is pruned.
+type Panic = (
+    Option<Box<dyn Any + Send>>,
+    std::string::String,
+    u64,
+    benilla_lua::value::UserRef,
+);
 
 static NEXT_FAMILY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -155,15 +160,18 @@ fn raise_panic(vm: &mut Vm, payload: Box<dyn Any + Send>) -> LuaError {
         "<panic>".to_owned()
     };
     let tag = PANIC_TAG | NEXT_PANIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    PANICS.with(|p| {
-        let mut p = p.borrow_mut();
-        p.insert(tag, (Some(payload), text));
-        while p.len() > PANICS_KEPT {
-            p.pop_first();
-        }
-    });
     let meta = panic_meta(vm);
     let u = vm.new_user(tag, Some(meta));
+    let V::User(r) = u.unpack() else {
+        unreachable!("a userdata")
+    };
+    let id = vm.vm_id();
+    PANICS.with(|p| {
+        let mut p = p.borrow_mut();
+        // The entries of this VM whose error value the collector freed go first.
+        p.retain(|&t, e| e.2 != id || vm.heap.user_tag(e.3) == Some(t));
+        p.insert(tag, (Some(payload), text, id, r));
+    });
     vm.throw(u)
 }
 
@@ -195,6 +203,12 @@ fn panic_meta(vm: &mut Vm) -> benilla_lua::value::TableRef {
         .set(key, benilla_lua::Value::Table(meta))
         .expect("a string key");
     meta
+}
+
+/// Panics raised as Lua errors this thread still keeps, for a test that they are let go.
+#[doc(hidden)]
+pub fn kept_panics() -> usize {
+    PANICS.with(|p| p.borrow().len())
 }
 
 /// The panic a Lua error value carries, if it is one whose payload has not resumed yet.

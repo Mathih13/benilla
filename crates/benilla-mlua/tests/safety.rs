@@ -83,6 +83,29 @@ fn a_callback_panic_is_a_lua_error_pcall_catches() {
     assert_eq!(lua.load("return 1 + 1").eval::<i64>().unwrap(), 2);
 }
 
+/// A panic Lua caught and dropped is let go: its payload and text go once the collector frees
+/// the error value, and all of a state's go with the state.
+#[test]
+fn a_caught_panic_is_let_go() {
+    let lua = Lua::new();
+    lua.globals().set("boom", panicking(&lua)).unwrap();
+    lua.load("for i = 1, 100 do pcall(boom) end")
+        .exec()
+        .unwrap();
+    assert_eq!(benilla_mlua::kept_panics(), 100);
+    lua.gc_collect().unwrap();
+    lua.load("Kept = {pcall(boom)}").exec().unwrap();
+    assert_eq!(benilla_mlua::kept_panics(), 1);
+    assert_eq!(
+        lua.load("return tostring(Kept[2])")
+            .eval::<String>()
+            .unwrap(),
+        "callback broke"
+    );
+    drop(lua);
+    assert_eq!(benilla_mlua::kept_panics(), 0);
+}
+
 #[test]
 fn an_uncaught_callback_panic_resumes_in_rust() {
     let lua = Lua::new();

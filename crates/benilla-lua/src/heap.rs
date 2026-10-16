@@ -895,6 +895,11 @@ impl Heap {
         self.users.get(u.0)
     }
 
+    /// The tag of userdata `u`, if the handle names a live one.
+    pub fn user_tag(&self, u: UserRef) -> Option<u64> {
+        self.users.is_live(u.0).then(|| self.users.get(u.0).tag)
+    }
+
     pub fn user_mut(&mut self, u: UserRef) -> &mut UserObj {
         self.users.get_mut(u.0)
     }
