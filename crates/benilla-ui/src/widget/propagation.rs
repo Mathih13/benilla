@@ -27,22 +27,33 @@ impl WidgetArena {
     }
 
     /// [`Self::show_step`]'s mark (`0x76ae7b`, `0x764780`), which follows the gate whatever ran
-    /// between them.
+    /// between them. A character pane coming visible asks for a fresh copy of its subject first:
+    /// its show hook builds one while the frame is not yet visible (`0x505d03`, `0x505d3c`,
+    /// `0x505d56`), then chains to the base step (`0x505d44`).
     pub fn show_mark(&mut self, h: FrameHandle) {
         let Some(f) = self.frame_mut(h) else {
             return;
         };
+        if let KindState::Model(m) = &mut f.kind_state {
+            if let Some(c) = &mut m.character {
+                c.request_build();
+            }
+        }
         f.effective_visible = true;
         self.resequence_to_tail(h);
     }
 
     /// The hide transition's own step (`0x76ad50` up to its child walk): nothing unless the frame
     /// is visible (`0x76ad5b`); otherwise it marks itself invisible (`0x76ad93`). The shown bit is
-    /// not consulted. Whether it transitioned.
+    /// not consulted. Whether it transitioned. A character pane releases what `+0x318` holds
+    /// ([`super::ModelState::release_on_hide`]) and keeps the subject it was built from.
     pub fn hide_step(&mut self, h: FrameHandle) -> bool {
         match self.frame_mut(h) {
             Some(f) if f.effective_visible => {
                 f.effective_visible = false;
+                if let KindState::Model(m) = &mut f.kind_state {
+                    m.release_on_hide();
+                }
                 true
             }
             _ => false,
@@ -492,11 +503,19 @@ impl WidgetArena {
             .is_some_and(|f| f.char_enabled || f.key_enabled)
     }
 
-    /// `EnableMouseWheel`, the wheel's own bit, separate from the mouse's.
+    /// `EnableMouseWheel`, the wheel's own bit, separate from the mouse's. A bit newly set on a
+    /// visible frame enters the wheel list now (`0x76af00`), behind the equal levels there.
     pub fn set_mouse_wheel_enabled(&mut self, h: FrameHandle, enabled: bool) {
+        let stamp = self.next_kb_stamp;
+        let mut joined = false;
         if let Some(f) = self.frame_mut(h) {
+            joined = enabled && !f.mouse_wheel_enabled && f.effective_visible;
             f.mouse_wheel_enabled = enabled;
+            if joined {
+                f.wheel_stamp = stamp;
+            }
         }
+        self.next_kb_stamp += u64::from(joined);
     }
 
     pub fn is_mouse_wheel_enabled(&self, h: FrameHandle) -> bool {

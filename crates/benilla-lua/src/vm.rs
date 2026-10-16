@@ -175,6 +175,9 @@ pub struct Vm {
     /// How the host runs its own code against this VM from inside it (`Vm::as_host`): it makes
     /// the `&mut Vm` it is handed the one its API reaches, as for a callback.
     pub reentry: Option<Reentry>,
+    /// `math.random`'s generator.
+    pub(crate) rand: crate::lib_math::GlibcRand,
+    identity: crate::heap::Identity,
 }
 
 /// The host's way in: run the closure with the `&mut Vm` as the VM in effect.
@@ -298,30 +301,33 @@ pub struct Hook {
 #[derive(Clone, Debug, Default)]
 pub struct Profile {
     pub ns: Vec<u64>,
-    /// Segments charged: calls into and returns to each chunk, and its loop iterations.
-    pub segments: Vec<u64>,
     last: Option<(std::time::Instant, u32)>,
 }
 
 impl Profile {
-    fn mark(&mut self, now: std::time::Instant, source: u32) {
+    /// `source` runs from now: the running segment is charged to its chunk. A call or return
+    /// within one chunk reads no clock, so the profile costs what crossing chunks costs.
+    fn mark(&mut self, source: u32) {
+        if self.last.is_some_and(|(_, s)| s == source) {
+            return;
+        }
+        self.charge(std::time::Instant::now(), Some(source));
+    }
+
+    fn charge(&mut self, now: std::time::Instant, next: Option<u32>) {
         if let Some((t, s)) = self.last {
             let s = s as usize;
             if self.ns.len() <= s {
                 self.ns.resize(s + 1, 0);
-                self.segments.resize(s + 1, 0);
             }
             self.ns[s] += now.duration_since(t).as_nanos() as u64;
-            self.segments[s] += 1;
         }
-        self.last = Some((now, source));
+        self.last = next.map(|n| (now, n));
     }
 
     /// Close the running segment: execution left Lua.
     fn close(&mut self) {
-        let now = std::time::Instant::now();
-        self.mark(now, 0);
-        self.last = None;
+        self.charge(std::time::Instant::now(), None);
     }
 }
 
@@ -337,6 +343,8 @@ pub struct FrameInfo {
     /// How the calling instruction named it: `("global", "foo")`.
     pub name: Option<Vec<u8>>,
     pub namewhat: &'static str,
+    /// The function running at the level (`lua_getinfo`'s `"f"`); nil for a tail call.
+    pub func: Value,
 }
 
 /// What a call produced, for the dispatch loop.
@@ -409,8 +417,10 @@ impl Vm {
             profile: None,
             host: None,
             reentry: None,
+            rand: crate::lib_math::GlibcRand::seeded(1),
+            identity: Default::default(),
         };
-        vm.heap.threshold = 2 * vm.heap.bytes.max(32 * 1024);
+        vm.heap.threshold = 2 * vm.heap.bytes().max(32 * 1024);
         vm
     }
 
@@ -1258,8 +1268,11 @@ impl Vm {
             self.in_handler,
             self.in_hook,
         );
+        let id = self.identity();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
             Ok(v) => v,
+            // Another VM in this one's place has its own state to keep.
+            Err(payload) if self.identity() != id => std::panic::resume_unwind(payload),
             Err(payload) => {
                 let (frames, c_depth, top, handlers, in_handler, in_hook) = at;
                 self.close_upvals(top);
@@ -1275,7 +1288,26 @@ impl Vm {
         }
     }
 
+    /// A call from the host or a native into Lua. The running chunk is the caller's again when
+    /// it returns, so the profile and the table census charge what the caller does next to it.
     fn call_at_inner(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<(), LuaError> {
+        let src = self.heap.cur_source;
+        let r = self.call_at_checked(func_idx, nargs, nres);
+        if self.heap.cur_source != src {
+            self.heap.cur_source = src;
+            if self.hooked {
+                self.prof_switch();
+            }
+        }
+        r
+    }
+
+    fn call_at_checked(
+        &mut self,
+        func_idx: usize,
+        nargs: usize,
+        nres: i32,
+    ) -> Result<(), LuaError> {
         self.c_depth += 1;
         let marker = 0u8;
         let here = std::ptr::addr_of!(marker) as usize;
@@ -1423,6 +1455,10 @@ impl Vm {
                     tailcalls: 0,
                     boundary: false,
                 });
+                // 5.1.5's `adjust_varargs` checks the collector for the `arg` table it makes.
+                if proto.vararg {
+                    self.check_gc();
+                }
                 Ok(Called::Lua)
             }
             FuncObj::Native { .. } => {
@@ -1465,10 +1501,13 @@ impl Vm {
             tailcalls: 0,
             boundary: false,
         });
-        let n = match host {
-            Some(h) => h(self, nargs)?,
-            None => f(self, nargs)?,
+        let id = self.identity();
+        let r = match host {
+            Some(h) => h(self, nargs),
+            None => f(self, nargs),
         };
+        self.check_identity(id);
+        let n = r?;
         // A string the native made could not be: it raises here, in its caller.
         if self.heap.oom {
             return Err(self.memory_error());
@@ -1701,7 +1740,7 @@ impl Vm {
     fn prof_switch(&mut self) {
         let src = self.heap.cur_source;
         if let Some(p) = self.profile.as_mut() {
-            p.mark(std::time::Instant::now(), src);
+            p.mark(src);
         }
     }
 
@@ -1709,10 +1748,6 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn hook_count(&mut self, n: u64) -> Result<(), LuaError> {
-        let src = self.heap.cur_source;
-        if let Some(p) = self.profile.as_mut() {
-            p.mark(std::time::Instant::now(), src);
-        }
         if self.in_hook {
             return Ok(());
         }
@@ -1726,9 +1761,31 @@ impl Vm {
         h.counted -= h.step;
         let f = h.f.clone();
         self.in_hook = true;
+        let id = self.identity();
         let r = f(self);
+        self.check_identity(id);
         self.in_hook = false;
         r
+    }
+
+    /// This VM's and its heap's identity ([`crate::heap::Identity`]).
+    #[inline(always)]
+    fn identity(&self) -> (u64, u64) {
+        (self.identity.0, self.heap.identity.0)
+    }
+
+    /// Stop if a native replaced the VM or its heap: the running frames' code and stack are
+    /// gone, and a Lua error would resume them.
+    #[inline(always)]
+    fn check_identity(&self, id: (u64, u64)) {
+        #[cold]
+        #[inline(never)]
+        fn replaced() -> ! {
+            panic!("a native replaced the running Lua VM or its heap");
+        }
+        if self.identity() != id {
+            replaced();
+        }
     }
 
     // ── stack inspection ─────────────────────────────────────────────────────────────────────
@@ -1774,6 +1831,7 @@ impl Vm {
                     line_defined: p.line_defined,
                     name,
                     namewhat,
+                    func: Value::Func(f.func),
                 }
             }
             None => FrameInfo {
@@ -1783,6 +1841,7 @@ impl Vm {
                 line_defined: 0,
                 name,
                 namewhat,
+                func: Value::Func(f.func),
             },
         }
     }
@@ -1867,7 +1926,7 @@ impl Vm {
     /// 5.0's `luaC_checkGC`, at a safe point: every live value is on the stack or reachable.
     #[inline]
     pub fn check_gc(&mut self) {
-        if self.heap.bytes >= self.heap.threshold || self.gc_stress {
+        if self.heap.bytes() >= self.heap.threshold || self.gc_stress {
             self.full_gc();
         }
     }
@@ -2009,14 +2068,14 @@ impl Vm {
                     (fr!().maxstack as usize)
                 };
             }
-            // SAFETY: the upvalue list lives as the code does (`Frame::upvals`), and the
-            // compiler indexes only the upvalues the function has.
+            // SAFETY: the upvalue list lives as the code does (`Frame::upvals`), and
+            // `Proto::verify` checked every index against the function's upvalues.
             macro_rules! upval {
                 ($i:expr) => {
                     unsafe { *fr!().upvals.add($i as usize) }
                 };
             }
-            // SAFETY: the compiler only encodes constants this function has.
+            // SAFETY: `Proto::verify` checked every constant index against the table.
             macro_rules! kv {
                 ($i:expr) => {{
                     let i = $i as usize;
@@ -2030,8 +2089,8 @@ impl Vm {
                     regs = unsafe { self.stack.as_mut_ptr().add(base!()) }
                 };
             }
-            // SAFETY for `r!`: `regs` is current (see above), and the compiler addresses no
-            // register at or past `maxstack` (`Fc::reserve`, `Fc::need`).
+            // SAFETY for `r!`: `regs` is current (see above), and `Proto::verify` checked that no
+            // instruction addresses a register at or past `maxstack`.
             macro_rules! r {
                 ($x:expr) => {
                     *{
@@ -2134,7 +2193,7 @@ impl Vm {
             macro_rules! jump {
                 ($off:expr) => {{
                     let off = $off as isize;
-                    // SAFETY: the compiler's jumps land inside the function.
+                    // SAFETY: `Proto::verify` checked that every jump lands inside the code.
                     ip = unsafe { ip.offset(off) };
                     // A loop's back edge: the place the budget hook is counted.
                     if off < 0 && self.hooked {
@@ -2245,7 +2304,8 @@ impl Vm {
             }
             loop {
                 debug_assert!(unsafe { (*fr!().proto).code.as_ptr_range().contains(&ip) });
-                // SAFETY: every function ends in `Return`, and every jump lands inside it.
+                // SAFETY: `Proto::verify` checked that every function ends in a return and
+                // every jump lands inside it.
                 let op = unsafe { *ip };
                 ip = unsafe { ip.add(1) };
                 match op {

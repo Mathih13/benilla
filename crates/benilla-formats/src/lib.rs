@@ -22,6 +22,12 @@ pub use install::{
     addon_corpus, addon_corpus_candidates, candidates, project_folder, set_project_folder, skipped,
     wow_data,
 };
+/// The install's loose files, asked before the archives by the opens that set the loose flag.
+mod loose;
+pub use loose::{
+    install_index, install_loose_interface_folders, LooseFile, LooseIndex, LooseIndexCell,
+    LooseOpen,
+};
 mod characters;
 pub use characters::{
     equip_blits, equip_column, equip_region_candidates, equip_tex_dir, equip_tile, forearm_dressed,
@@ -63,7 +69,12 @@ mod cfg_configs;
 pub use cfg_configs::{load_realm_configs, RealmConfig, RealmConfigs};
 mod wow_ini;
 pub use wow_ini::client_region;
+/// The client locale, the column a localized DBC string is read from.
+mod locale;
+pub use locale::Locale;
 mod itembagfamily;
+#[cfg(test)]
+mod locale_routing;
 pub use itembagfamily::{load_item_bag_families, ItemBagFamilyCatalog};
 mod itemclass;
 pub use itemclass::{load_item_classes, ItemClassCatalog};
@@ -77,7 +88,7 @@ pub use factions::{
     FactionInfo, FactionTemplate, Reaction,
 };
 mod creature_types;
-pub use creature_types::{load_creature_type_flags, CreatureTypeFlags};
+pub use creature_types::{load_creature_type_table, CreatureTypeTable};
 /// The chat language scramble, the reference's `0x49b560`.
 mod garble;
 pub use garble::{garble, garble_chat, Garble, FLUENT_SKILL};
@@ -118,6 +129,8 @@ pub use lock::{
 };
 mod lock_type;
 pub use lock_type::{load_lock_type_catalog, LockTypeCatalog};
+mod chr_races;
+pub use chr_races::{load_chr_races, ChrRaces};
 mod chr_classes;
 pub use chr_classes::{load_chr_classes, ChrClasses, PET_NAME_TOKEN_FALLBACK};
 mod pet_stats;

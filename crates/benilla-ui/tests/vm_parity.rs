@@ -2,6 +2,10 @@
 //! and its answer must equal the one that build gave, recorded in `vm_parity.golden` with mlua's
 //! `runtime error: ` and `stack traceback:` wrapper taken out. A new case's answer comes from
 //! the reference, written in by hand.
+//!
+//! The cases that list every global answer with each binding the script host has, not with the
+//! VM, so they live in `vm_parity_surface.golden`, which `BENILLA_BLESS=1` rewrites when a
+//! binding changes; the diff is the review.
 
 use benilla_ui::script::UiScript;
 
@@ -715,6 +719,22 @@ fn run(src: &str) -> String {
 
 /// `name\tanswer`, one case a line, the answer through `escape_default` onto one line.
 const GOLDEN: &str = "tests/vm_parity.golden";
+const SURFACE_GOLDEN: &str = "tests/vm_parity_surface.golden";
+const SURFACE_CASES: &[&str] = &["pairs_globals", "global_surface"];
+
+/// Each answer against its golden line; a difference goes into `failures`.
+fn compare(golden: &str, answers: &[(&str, String)], failures: &mut Vec<String>) {
+    let want: std::collections::HashMap<&str, &str> =
+        golden.lines().filter_map(|l| l.split_once('\t')).collect();
+    for (name, got) in answers {
+        let got = got.escape_default().to_string();
+        match want.get(name) {
+            Some(w) if *w == got => {}
+            Some(w) => failures.push(format!("{name}\n    got:  {got}\n    want: {w}")),
+            None => failures.push(format!("{name}: no golden answer")),
+        }
+    }
+}
 
 #[test]
 fn every_case_answers_as_the_c_lua_build_did() {
@@ -739,18 +759,21 @@ fn every_case_answers_as_the_c_lua_build_did() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), cases.len(), "case names are unique");
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
-    let golden = std::fs::read_to_string(&path).expect("the golden file");
-    let want: std::collections::HashMap<&str, &str> =
-        golden.lines().filter_map(|l| l.split_once('\t')).collect();
+    let (surface, vm): (Vec<_>, Vec<_>) = answers
+        .into_iter()
+        .partition(|(name, _)| SURFACE_CASES.contains(name));
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if std::env::var_os("BENILLA_BLESS").is_some() {
+        let lines: String = surface
+            .iter()
+            .map(|(n, a)| format!("{n}\t{}\n", a.escape_default()))
+            .collect();
+        std::fs::write(dir.join(SURFACE_GOLDEN), lines).expect("write the golden file");
+    }
     let mut failures = Vec::new();
-    for (name, got) in &answers {
-        let got = got.escape_default().to_string();
-        match want.get(name) {
-            Some(w) if *w == got => {}
-            Some(w) => failures.push(format!("{name}\n    got:  {got}\n    want: {w}")),
-            None => failures.push(format!("{name}: no golden answer")),
-        }
+    for (file, answers) in [(GOLDEN, &vm), (SURFACE_GOLDEN, &surface)] {
+        let golden = std::fs::read_to_string(dir.join(file)).expect("the golden file");
+        compare(&golden, answers, &mut failures);
     }
     assert!(
         failures.is_empty(),

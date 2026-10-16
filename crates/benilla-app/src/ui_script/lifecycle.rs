@@ -6,7 +6,7 @@
 
 use bevy::prelude::*;
 
-use benilla_assets::LockRecover;
+use benilla_assets::{LockRecover, LooseOpen};
 use benilla_ui::script::{GlueNotice, UiScript};
 
 use super::manifest::silenced_ui_load;
@@ -14,17 +14,17 @@ use super::{load_ingame_ui, CursorPayloadHeld, PlayerUiHover, UiClock, UiKeyboar
 use crate::ui_script::addons;
 
 pub(crate) fn setup_script(world: &mut World) {
-    install_glue_side_vm(world, super::glue::GlueScreen::Login);
+    install_glue_side_vm(world, super::glue::GlueScreen::Login.key());
 }
 
 /// Install the VM the world holds outside the world: the stock glue screens' under
-/// [`super::glue::GlueStock`], put up on `screen`, else a boot VM.
+/// [`super::glue::GlueStock`], put up on the screen named `screen`, else a boot VM.
 ///
 /// The IO thread's roster policy follows the VM that is up: the screen asks for its roster only
 /// when the stock glue VM was built and its character select screen loaded, so a run whose stock VM failed to build (logged as an error
 /// by [`new_vm`]) falls back to the park's own enumeration instead of waiting on a screen that
 /// never asks.
-fn install_glue_side_vm(world: &mut World, screen: super::glue::GlueScreen) {
+pub(super) fn install_glue_side_vm(world: &mut World, screen: &str) {
     let stock_asked = world
         .get_resource::<super::glue::GlueStock>()
         .is_some_and(|s| s.0);
@@ -68,10 +68,12 @@ pub(crate) fn strings_vm(world: &mut World) -> Option<UiScript> {
 /// builder `0x46a7b0` then `SET_GLUE_SCREEN` (`0x402b65` at startup, `0x402090` back from the
 /// world). It holds what the glue state holds and nothing of the boot VM's: no `GlobalStrings.lua`,
 /// no emote tokens.
-fn install_glue_vm(world: &mut World, screen: super::glue::GlueScreen) -> bool {
+fn install_glue_vm(world: &mut World, screen: &str) -> bool {
     let Some(mut script) = new_vm(world, UiScript::new_glue) else {
         return false;
     };
+    // The build's size and aspect, and its clear of a pending rebuild (`0x46a7e0`, `0x46a81c`).
+    super::glue::glue_built(world);
     seat_raster_seam_for_load(world, &mut script);
     // The CVar table before the load and the first screen, as the in-game build seeds its own:
     // this VM is born before `cvars::sync_cvars`'s per-VM seed, and the character screen's
@@ -86,11 +88,14 @@ fn install_glue_vm(world: &mut World, screen: super::glue::GlueScreen) -> bool {
     start_server_alert(world, &script);
     // What the glue carries across its rebuild, in place before the screen's `OnShow` reads it.
     super::glue_mgr::seat_glue_build(world, &mut script);
-    super::glue::set_glue_screen(&mut script, screen);
+    // `SetCurrentScreen`'s buffer is the client's (`[0xb41478]`) and outlives the Lua state: a
+    // rebuild signals what it holds (`0x46b9a2`), and the screen's handler writes the same name.
+    script.set_glue_screen_name(screen);
+    super::glue::signal_glue_screen(&mut script, screen);
     info!(
         "ui_script: stock glue up in {:.0} ms on \"{}\" ({} load failure(s))",
         start.elapsed().as_secs_f32() * 1000.0,
-        screen.key(),
+        screen,
         failures.len()
     );
     // Up means the screen that asks for the roster exists: the stock files loaded far enough to
@@ -136,6 +141,11 @@ fn new_vm<E: std::fmt::Display>(
     world: &mut World,
     make: fn() -> Result<UiScript, E>,
 ) -> Option<UiScript> {
+    // The client globals the VM holds that no rebuild resets: `[0xcf4d24]`, written only by
+    // `SetEuropeanNumbers` (`0x771c40`), outlives a `ReloadUI` and a logout.
+    let european_numbers = world
+        .get_non_send_resource::<UiScript>()
+        .is_some_and(UiScript::european_numbers);
     let mut script = match make() {
         Ok(s) => s,
         Err(e) => {
@@ -144,6 +154,11 @@ fn new_vm<E: std::fmt::Display>(
             return None;
         }
     };
+    script.set_european_numbers(european_numbers);
+    // `[0xc0e080]`, which start-up sets once from `Wow.ini`, so every VM answers `GetLocale` alike.
+    script.set_locale(super::client_locale().index());
+    // `[0x882730]`, `Wow.ini`'s `Region`, read once alike and handed to the name check.
+    script.set_client_region(super::client_region());
     seed_vm_clock(world, &mut script);
     install_addon_asset_resolvers(world, &mut script);
     info!("ui_script: new VM, session {}", script.session());
@@ -170,29 +185,26 @@ fn seed_vm_clock(world: &mut World, script: &mut UiScript) {
     }
 }
 
-/// Wire `Interface\AddOns\` art and fonts: the decoder's loose-file root and the VM's texture,
-/// size and font probes, so the path forms of `SetTexture` and `SetFont` answer the reference's
-/// 1|nil load verdict, and a region with no authored size on an axis takes it from its art as the
-/// client's virtual size getters do. Each probe resolves [`addons::root`] through the store its
-/// renderer reads, so the answer is what draws; they test existence, not decode.
+/// Wire the loose files into art and fonts: the decoder's AddOns folder, beside the install's
+/// index it already reads, and the VM's texture, size and font probes, so the path forms of
+/// `SetTexture` and `SetFont` answer the reference's 1|nil load verdict, and a region with no
+/// authored size on an axis takes it from its art as the client's virtual size getters do. Each
+/// probe resolves through the store and the open its renderer reads (an interface texture's,
+/// [`LooseOpen::Index`], and a font face's, [`LooseOpen::BareNameFirst`]), so the answer is what
+/// draws; they test existence, not decode.
 fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
-    let root = addons::root();
     let Some(mut assets) = world.get_resource_mut::<benilla_assets::WorldAssets>() else {
         return;
     };
-    assets.set_loose_addon_root(root.clone());
+    assets.set_loose_addon_root(addons::root());
+    let loose = assets.loose().clone();
     let chain = assets.chain.clone();
     let size_chain = chain.clone();
-    let size_root = root.clone();
+    let size_loose = loose.clone();
     let font_chain = chain.clone();
-    let font_root = root.clone();
+    let font_loose = loose.clone();
     script.set_texture_probe(Box::new(move |path| {
-        benilla_assets::sprite_candidates(path).iter().any(|c| {
-            chain.lock_recover().contains(c)
-                || root
-                    .as_deref()
-                    .is_some_and(|r| benilla_assets::loose_addon_file(r, c).is_some())
-        })
+        benilla_assets::sprite_found(&chain, &loose, path)
     }));
     // Keyed by the path exactly as the region carries it, so a hit allocates nothing (this is
     // asked per zero-size textured region per layout pass); misses are cached too.
@@ -202,11 +214,11 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
         if let Some(cached) = sizes.borrow().get(path) {
             return *cached;
         }
-        let measured = benilla_assets::sprite_dimensions(&size_chain, size_root.as_deref(), path);
+        let measured = benilla_assets::sprite_dimensions(&size_chain, &size_loose, path);
         sizes.borrow_mut().insert(path.to_string(), measured);
         measured
     }));
-    // Existence over the same two stores, in the same order, as `ui_text::engine`'s face loader,
+    // Existence over the same stores, in the same order, as `ui_text::engine`'s face loader,
     // memoised because a path's answer cannot change and an addon may call `SetFont` every frame.
     let seen: std::cell::RefCell<std::collections::HashMap<String, bool>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
@@ -214,9 +226,8 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
         if let Some(&cached) = seen.borrow().get(path) {
             return cached;
         }
-        let found = font_root.as_deref().is_some_and(|r| {
-            benilla_assets::loose_addon_file(r, &benilla_assets::normalize_path(path)).is_some()
-        }) || font_chain.lock_recover().contains(path);
+        let found = font_loose.find(path, LooseOpen::BareNameFirst).is_some()
+            || font_chain.lock_recover().contains(path);
         seen.borrow_mut().insert(path.to_string(), found);
         found
     }));
@@ -375,6 +386,9 @@ enum LoadSeat {
 /// state edge because the initial transition runs after `PostStartup`: a capture booting straight
 /// into `InWorld` still loads after [`benilla_assets::AssetSet::Open`].
 pub(crate) fn load_ingame_ui_on_world_entry(world: &mut World) {
+    // Before the load, as `0x48f590` runs before `0x48fbf0`: an addon's file scope sets the mask
+    // after it, and a `/reload` never takes this step.
+    crate::minimap::restore_default_mask(world);
     load_ingame_ui_seated(world, LoadSeat::Roster);
 }
 
@@ -442,7 +456,7 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
     // streams in.
     if let Some(record) = world
         .get_resource::<crate::char_select::Roster>()
-        .and_then(record_from_roster)
+        .and_then(|roster| record_from_roster(roster, crate::ui_unit::world_unit_names(world)))
     {
         script.set_player_record(record);
     }
@@ -455,9 +469,12 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
             script.set_player_xp(live.xp.0, live.xp.1);
         }
         None => {
-            if let Some(seat) = world
-                .get_resource::<crate::char_select::Roster>()
-                .and_then(seat_from_roster)
+            if let Some(seat) =
+                world
+                    .get_resource::<crate::char_select::Roster>()
+                    .and_then(|roster| {
+                        seat_from_roster(roster, crate::ui_unit::world_unit_names(world))
+                    })
             {
                 script.set_unit("player", Some(seat));
             }
@@ -604,10 +621,11 @@ fn roster_sex(gender: u8) -> u8 {
 /// the descriptor.
 pub(crate) fn record_from_roster(
     roster: &crate::char_select::Roster,
+    names: crate::ui_unit::UnitNames<'_>,
 ) -> Option<benilla_ui::script::PlayerRecord> {
     let row = roster.pending_row()?;
-    let race = crate::ui_unit::race_names(row.race);
-    let class = crate::ui_unit::class_names(row.class);
+    let race = names.race(row.race);
+    let class = names.class(row.class);
     Some(benilla_ui::script::PlayerRecord {
         name: row.name.clone(),
         race: race.map(|(n, f)| (n.to_string(), f.to_string())),
@@ -623,10 +641,11 @@ pub(crate) fn record_from_roster(
 /// to say.
 pub(crate) fn seat_from_roster(
     roster: &crate::char_select::Roster,
+    names: crate::ui_unit::UnitNames<'_>,
 ) -> Option<benilla_ui::script::UnitState> {
     let row = roster.pending_row()?;
-    let race = crate::ui_unit::race_names(row.race);
-    let class = crate::ui_unit::class_names(row.class);
+    let race = names.race(row.race);
+    let class = names.class(row.class);
     let sex = roster_sex(row.gender);
     Some(benilla_ui::script::UnitState {
         // Before the player object exists the reference answers `UnitExists("player")`
@@ -826,7 +845,7 @@ pub(crate) fn end_ui_session(world: &mut World) {
         Some(crate::char_select::ClientState::CharSelect) => super::glue::GlueScreen::CharSelect,
         _ => super::glue::GlueScreen::Login,
     };
-    install_glue_side_vm(world, screen);
+    install_glue_side_vm(world, screen.key());
 }
 
 /// [`end_ui_session`] up to the new VM: the shutdown tail, the folds and the host values reset.
@@ -898,7 +917,7 @@ pub(crate) struct ReloadUiPending(pub(crate) bool);
 /// cascade itself (`0x490168`), firing the `PLAYER_LOGIN` it armed and `PLAYER_ENTERING_WORLD`;
 /// ours fire from [`crate::ui_unit`]'s feed on the new VM's first `Update`, once it has re-seated
 /// the player. In-world only, as the reference's gate (`0x494a50(0xa)`) is; elsewhere the request
-/// is dropped.
+/// is dropped, and the glue's own rebuild is [`super::glue::run_pending_glue_rebuild`]'s.
 pub(crate) fn run_pending_reload(world: &mut World) {
     if !std::mem::take(&mut world.resource_mut::<ReloadUiPending>().0) {
         return;
@@ -1095,6 +1114,79 @@ pub(crate) fn is_emote_token_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The roster's stand-in `"player"` and the record `UnitRace`/`UnitClass` read carry the
+    /// table's names at the install's locale, and the tokens beside them.
+    #[test]
+    fn the_roster_seat_and_record_name_race_and_class_from_the_tables() {
+        let mut c = crate::char_select::test_character(7, "Harness");
+        c.race = 4; // Night Elf
+        c.class = 5; // Priest
+        let roster = crate::char_select::Roster::with_pending_pick(vec![c], 7);
+        let korean = crate::ui_unit::TestNames::korean();
+        let seat = seat_from_roster(&roster, korean.names()).expect("a pick seats");
+        assert_eq!(seat.race.as_deref(), Some("나이트 엘프"));
+        assert_eq!(seat.race_file.as_deref(), Some("NightElf"));
+        assert_eq!(seat.class.as_deref(), Some("사제"));
+        assert_eq!(seat.class_file.as_deref(), Some("PRIEST"));
+        let record = record_from_roster(&roster, korean.names()).expect("a pick records");
+        assert_eq!(
+            record.race,
+            Some(("나이트 엘프".to_string(), "NightElf".to_string()))
+        );
+        assert_eq!(
+            record.class,
+            Some(("사제".to_string(), "PRIEST".to_string()))
+        );
+    }
+
+    /// Every VM, glue and in-game, answers `GetLocale` with the install's locale (`[0xc0e080]`).
+    #[test]
+    fn every_new_vm_is_seated_with_the_installs_locale() {
+        let mut world = World::new();
+        let want = super::super::client_locale();
+        let in_game = new_vm(&mut world, UiScript::new).expect("a VM");
+        let glue = new_vm(&mut world, UiScript::new_glue).expect("a glue VM");
+        for script in [in_game, glue] {
+            assert_eq!(script.locale(), want.index());
+            let answer = script.eval::<String>("return GetLocale()").unwrap();
+            assert_eq!(answer, want.name());
+            assert_eq!(script.client_region(), super::super::client_region());
+        }
+    }
+
+    /// `[0xcf4d24]` has one writer, `SetEuropeanNumbers` (`0x771c40`), and nothing resets it, so
+    /// the VM that replaces a dying one (a `ReloadUI`, a logout, a login) opens with its value.
+    #[test]
+    fn the_european_numbers_switch_outlives_the_vm_that_set_it() {
+        let mut world = World::new();
+        let first = UiScript::new().unwrap();
+        assert!(!first.european_numbers(), "off at boot");
+        world.insert_non_send_resource(first);
+        let text = |world: &World| {
+            let script = world.non_send_resource::<UiScript>();
+            script
+                .run("F = CreateFrame('Frame'):CreateFontString() F:SetText('1.5')")
+                .unwrap();
+            script.eval::<String>("return F:GetText()").unwrap()
+        };
+        world
+            .non_send_resource::<UiScript>()
+            .run("SetEuropeanNumbers(1)")
+            .unwrap();
+        for _ in 0..2 {
+            let next = new_vm(&mut world, UiScript::new).expect("a VM");
+            world.insert_non_send_resource(next);
+            assert_eq!(text(&world), "1,5");
+        }
+        world
+            .non_send_resource::<UiScript>()
+            .run("SetEuropeanNumbers(false)")
+            .unwrap();
+        let next = new_vm(&mut world, UiScript::new).expect("a VM");
+        world.insert_non_send_resource(next);
+        assert_eq!(text(&world), "1.5");
+    }
 
     #[test]
     fn the_entry_edge_parks_the_boot_vm_and_the_session_end_returns_it() {

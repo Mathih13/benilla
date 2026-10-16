@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ast::Bytes;
 use crate::heap::Heap;
 use crate::lex::SyntaxError;
 use crate::parse::Parser;
+use crate::proto::Bytes;
 use crate::proto::*;
 use crate::value::Value;
 

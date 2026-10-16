@@ -443,7 +443,8 @@ fn collectgarbage(vm: &mut Vm, nargs: usize) -> R<usize> {
 
 /// 1.12's `gcinfo()` (`0x703200`): live and threshold kilobytes.
 fn gcinfo(vm: &mut Vm, _nargs: usize) -> R<usize> {
-    vm.push(Value::Num((vm.heap.bytes >> 10) as f64));
+    let kb = vm.heap.bytes() >> 10;
+    vm.push(Value::Num(kb as f64));
     vm.push(Value::Num((vm.heap.threshold >> 10) as f64));
     Ok(2)
 }

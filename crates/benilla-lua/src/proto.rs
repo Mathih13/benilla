@@ -1,7 +1,9 @@
 //! Compiled functions: 5.1.5's register machine, with each test fused with the jump after it
 //! and the common operand shapes given ops of their own.
 
-use crate::ast::Bytes;
+/// Byte strings the compiler, the heap and hot reload share: names, sources, function keys.
+pub type Bytes = std::rc::Rc<[u8]>;
+
 use crate::value::Value;
 
 pub type Reg = u8;
@@ -204,5 +206,262 @@ impl Proto {
             .rev()
             .find(|l| l.reg == reg && (l.startpc as usize) <= pc && pc < l.endpc as usize)
             .map(|l| &l.name)
+    }
+}
+
+impl Proto {
+    /// Check, once per compiled function, every fact the interpreter's unchecked reads take on
+    /// trust: each register an instruction touches is below `maxstack`, each constant, upvalue
+    /// and child index exists, each jump lands inside the code, and the code ends in a return,
+    /// so execution never runs off it. A failure is a code generator bug, and it stops here
+    /// instead of becoming a read outside the frame.
+    pub(crate) fn verify(&self) {
+        self.verify_in(None);
+    }
+
+    /// `parent`: the enclosing function's register count and upvalue count, which this
+    /// function's upvalue descriptions index.
+    fn verify_in(&self, parent: Option<(u16, usize)>) {
+        let fail = |pc: usize, what: &str| -> ! {
+            panic!(
+                "benilla-lua compiled bad code: {what} at instruction {pc} of `{}` in {}",
+                String::from_utf8_lossy(&self.key),
+                String::from_utf8_lossy(&self.source),
+            )
+        };
+        let n = self.code.len();
+        let (nk, nup, nproto) = (self.consts.len(), self.upval_names.len(), self.protos.len());
+        if !matches!(self.code.last(), Some(Op::Return(..) | Op::Return1(_))) {
+            fail(n, "no final return");
+        }
+        if self.lines.len() != n {
+            fail(n, "a line per instruction");
+        }
+        if (self.nparams as usize + self.vararg as usize) > self.maxstack as usize
+            || self.maxstack as usize > MAXSTACK + 5
+        {
+            fail(0, "the register count");
+        }
+        if self.upvals.len() != nup {
+            fail(0, "the upvalue count");
+        }
+        if let Some((pmax, pups)) = parent {
+            for &(in_stack, i) in &self.upvals {
+                if (in_stack && i >= pmax) || (!in_stack && i as usize >= pups) {
+                    fail(0, "an upvalue the enclosing function lacks");
+                }
+            }
+        }
+        for (pc, &op) in self.code.iter().enumerate() {
+            let reg = |r: usize| {
+                if r >= self.maxstack as usize {
+                    fail(pc, "a register past maxstack");
+                }
+            };
+            let k = |i: usize| {
+                if i >= nk {
+                    fail(pc, "a constant past the table");
+                }
+            };
+            let rk = |x: Rk| {
+                if x >= RK_CONST {
+                    k((x - RK_CONST) as usize)
+                } else {
+                    reg(x as usize)
+                }
+            };
+            let to = |skip: usize, off: i32| {
+                let t = pc as i64 + 1 + skip as i64 + off as i64;
+                if t < 0 || t >= n as i64 {
+                    fail(pc, "a jump outside the code");
+                }
+            };
+            let r = |x: Reg| reg(x as usize);
+            let ku = |i: u16| k(i as usize);
+            match op {
+                Op::Move(x, y) | Op::Unm(x, y) | Op::Not(x, y) => {
+                    r(x);
+                    r(y);
+                }
+                Op::LoadK(x, i) | Op::GetGlobal(x, i) | Op::SetGlobal(x, i) => {
+                    r(x);
+                    k(i as usize);
+                }
+                Op::LoadNil(x, y) => {
+                    if y < x {
+                        fail(pc, "an empty nil range");
+                    }
+                    r(y);
+                }
+                Op::LoadBool(x, _) | Op::Close(x) | Op::NewTable(x, ..) | Op::Return1(x) => r(x),
+                Op::SetListTop(x, _) => r(x),
+                Op::GetUpval(x, u) | Op::SetUpval(x, u) => {
+                    if u as usize >= nup {
+                        fail(pc, "an upvalue past the list");
+                    }
+                    r(x);
+                }
+                Op::GetTable(x, y, z) => {
+                    r(x);
+                    r(y);
+                    rk(z);
+                }
+                Op::SetTable(x, y, z) | Op::Pow(x, y, z) => {
+                    r(x);
+                    rk(y);
+                    rk(z);
+                }
+                Op::GetField(x, y, i)
+                | Op::AddK(x, y, i)
+                | Op::SubK(x, y, i)
+                | Op::MulK(x, y, i)
+                | Op::DivK(x, y, i) => {
+                    r(x);
+                    r(y);
+                    ku(i);
+                }
+                Op::SetField(x, i, z) => {
+                    r(x);
+                    ku(i);
+                    rk(z);
+                }
+                Op::SelfOp(x, y, z) => {
+                    reg(x as usize + 1);
+                    r(y);
+                    rk(z);
+                }
+                Op::SelfField(x, y, i) => {
+                    reg(x as usize + 1);
+                    r(y);
+                    ku(i);
+                }
+                Op::Add(x, y, z) | Op::Sub(x, y, z) | Op::Mul(x, y, z) | Op::Div(x, y, z) => {
+                    r(x);
+                    r(y);
+                    r(z);
+                }
+                Op::AddKR(x, i, z)
+                | Op::SubKR(x, i, z)
+                | Op::MulKR(x, i, z)
+                | Op::DivKR(x, i, z) => {
+                    r(x);
+                    ku(i);
+                    r(z);
+                }
+                Op::Concat(x, y, z) => {
+                    if z <= y {
+                        fail(pc, "a concat of fewer than two values");
+                    }
+                    r(x);
+                    r(z);
+                }
+                Op::Jmp(off) => to(0, off),
+                Op::JmpCmp(_, y, z, off) => {
+                    r(y);
+                    r(z);
+                    to(0, off);
+                }
+                Op::JmpCmpK(_, y, i, off) => {
+                    r(y);
+                    k(i as usize);
+                    to(0, off);
+                }
+                Op::JmpCmpKR(_, i, z, off) => {
+                    k(i as usize);
+                    r(z);
+                    to(0, off);
+                }
+                Op::JmpIf(x, _, off) => {
+                    r(x);
+                    to(0, off);
+                }
+                Op::TestSet(x, y, _, off) => {
+                    r(x);
+                    r(y);
+                    to(0, off);
+                }
+                // Arguments `a+1..a+b-1`, results `a..a+c-2`; a count of zero is up to the top,
+                // which the stack covers at run time.
+                Op::Call(x, nb, nc) => {
+                    let x = x as usize;
+                    reg(x + (nb as usize).saturating_sub(1));
+                    reg(x + (nc as usize).saturating_sub(2));
+                }
+                Op::TailCall(x, nb) => reg(x as usize + (nb as usize).saturating_sub(1)),
+                // `Return(a, 1)` returns nothing, and its `a` may be the first free register.
+                Op::Return(x, nb) => {
+                    if nb > 1 {
+                        reg(x as usize + nb as usize - 2);
+                    } else if x as usize > self.maxstack as usize {
+                        fail(pc, "a return past maxstack");
+                    }
+                }
+                Op::ForPrep(x, off) | Op::ForLoop(x, off) | Op::ForLoopUp(x, off) => {
+                    reg(x as usize + 3);
+                    to(0, off);
+                }
+                Op::TForPrep(x, off) => {
+                    reg(x as usize + 2);
+                    to(0, off);
+                }
+                // The loop variables `a+3..a+2+b`; past a nil, the jump after it is skipped.
+                Op::TForLoop(x, nb) => {
+                    reg(x as usize + 2 + (nb as usize).max(1));
+                    to(1, 0);
+                }
+                Op::SetList(x, _, cnt) => reg(x as usize + cnt as usize),
+                Op::Closure(x, i) => {
+                    if i as usize >= nproto {
+                        fail(pc, "a child function past the list");
+                    }
+                    r(x);
+                }
+            }
+        }
+        for p in &self.protos {
+            p.verify_in(Some((self.maxstack, nup)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compiled(src: &str) -> Proto {
+        let mut heap = crate::heap::Heap::default();
+        let p = crate::compile::compile(src.as_bytes(), b"=t", &mut heap, 0).unwrap();
+        (*p).clone()
+    }
+
+    fn rejects(p: Proto) -> String {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.verify()));
+        let e = r.expect_err("the verifier refuses it");
+        e.downcast_ref::<String>().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn the_verifier_refuses_code_the_interpreter_would_read_past() {
+        let mut p = compiled("local a = 1 return a");
+        p.code[0] = Op::Move(p.maxstack as Reg, 0);
+        assert!(rejects(p).contains("a register past maxstack"));
+
+        let mut p = compiled("local a = 1 return a");
+        p.code[0] = Op::LoadK(0, p.consts.len() as u32);
+        assert!(rejects(p).contains("a constant past the table"));
+
+        let mut p = compiled("local a = 1 return a");
+        p.code[0] = Op::Jmp(p.code.len() as i32);
+        assert!(rejects(p).contains("a jump outside the code"));
+
+        let mut p = compiled("local a = 1 return a");
+        *p.code.last_mut().unwrap() = Op::Move(0, 0);
+        assert!(rejects(p).contains("no final return"));
+
+        let mut p = compiled("local u = 1 F = function() return u end");
+        let mut child = (*p.protos[0]).clone();
+        child.code[0] = Op::GetUpval(0, 5);
+        p.protos[0] = std::rc::Rc::new(child);
+        assert!(rejects(p).contains("an upvalue past the list"));
     }
 }

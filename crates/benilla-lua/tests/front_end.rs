@@ -1,6 +1,11 @@
 //! The front end over every Lua chunk in the addon corpus and the install's interface files: each
 //! compiles, but for the corpus chunks the script host's C Lua build rejected, which must fail
 //! with the message it gave.
+//!
+//! Each compiled chunk's shape (constants in order, register count, parameters, locals,
+//! upvalues, line runs) must also be the one the C build gave it, as `front_end.digest`
+//! records: a line per chunk, a hash of its source and a hash of the C build's shape. A chunk
+//! whose source is not in it (another corpus version) is not checked against it.
 
 use std::path::{Path, PathBuf};
 
@@ -146,6 +151,86 @@ const REJECTED: &[(&str, &str)] = &[
     ("TipBuddy/TipBuddy.xml:OnUpdate", "TipBuddy/TipBuddy.xml:OnUpdate:3: `=' expected near `should'"),
 ];
 
+/// One function's shape, the parts of a 5.1 `string.dump` the code generator must match. Its
+/// `Debug` text is what `front_end.digest` hashes, so a field's type and order stay as the C
+/// build's undump wrote them.
+#[derive(Debug, PartialEq)]
+struct Shape {
+    linedefined: u32,
+    nups: u8,
+    numparams: u8,
+    vararg: bool,
+    maxstack: u8,
+    /// Each instruction's line, runs of one line taken as one: 5.1 spends two instructions on
+    /// a test benilla fuses into one.
+    lines: Vec<u32>,
+    consts: Vec<String>,
+    locals: Vec<String>,
+    upvals: Vec<String>,
+    protos: Vec<Shape>,
+}
+
+fn shape(p: &benilla_lua::proto::Proto, heap: &benilla_lua::heap::Heap) -> Shape {
+    use benilla_lua::value::V;
+    Shape {
+        linedefined: p.line_defined,
+        nups: p.upvals.len() as u8,
+        numparams: p.nparams,
+        vararg: p.vararg,
+        maxstack: (p.maxstack - 1) as u8,
+        lines: {
+            let mut l = p.lines.clone();
+            l.dedup();
+            l
+        },
+        consts: p
+            .consts
+            .iter()
+            .map(|v| match v.unpack() {
+                V::Nil => "nil".to_string(),
+                V::Bool(b) => format!("{b}"),
+                V::Num(n) => format!("{n:?}"),
+                V::Str(s) => format!("{:?}", String::from_utf8_lossy(heap.str(s))),
+                v => panic!("constant {v:?}"),
+            })
+            .collect(),
+        locals: p
+            .locvars
+            .iter()
+            .map(|l| String::from_utf8_lossy(&l.name).into_owned())
+            .collect(),
+        upvals: p
+            .upval_names
+            .iter()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect(),
+        protos: p.protos.iter().map(|q| shape(q, heap)).collect(),
+    }
+}
+
+/// FNV-1a, 64 bits: stable across platforms and Rust versions, which `DefaultHasher` is not.
+fn fnv64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// `front_end.digest`: each source hash's shape hash, as the C build compiled it.
+fn read_digest() -> std::collections::HashMap<u64, u64> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/front_end.digest");
+    std::fs::read_to_string(path)
+        .expect("the digest file")
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(a, b)| {
+            (
+                u64::from_str_radix(a, 16).unwrap(),
+                u64::from_str_radix(b, 16).unwrap(),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn every_chunk_compiles_as_the_c_build_compiled_it() {
     let mut chunks = Vec::new();
@@ -171,4 +256,30 @@ fn every_chunk_compiles_as_the_c_build_compiled_it() {
         .collect();
     println!("{} chunks, {} rejected", chunks.len(), got.len());
     assert_eq!(got, want);
+
+    let recorded = read_digest();
+    let mut heap = benilla_lua::heap::Heap::default();
+    let (mut checked, mut differ) = (0, Vec::new());
+    for c in &chunks {
+        let Some(&want) = recorded.get(&fnv64(&c.bytes)) else {
+            continue;
+        };
+        let chunkname = format!("@{}", c.name);
+        let p = benilla_lua::compile(&c.bytes, chunkname.as_bytes(), &mut heap, 0).unwrap();
+        checked += 1;
+        if fnv64(format!("{:?}", shape(&p, &heap)).as_bytes()) != want {
+            differ.push(c.name.as_str());
+        }
+    }
+    println!("{checked} chunks checked against the digest");
+    assert!(
+        checked > 0 || !corpus,
+        "the corpus shares no chunk with the digest"
+    );
+    assert!(
+        differ.is_empty(),
+        "{} chunks compile to another shape than the C build's: {:?}",
+        differ.len(),
+        &differ[..differ.len().min(20)]
+    );
 }

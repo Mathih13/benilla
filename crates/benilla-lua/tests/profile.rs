@@ -78,10 +78,9 @@ fn chunk_names_nothing_refers_to_are_collected() {
             "=[benilla-lua compat]",
             "@Interface\\AddOns\\Kept\\Kept.lua",
             "return 7",
-            "=driver"
         ],
-        "the host, the compat chunk and the file whose functions and table live, the chunk a \
-         global holds, and the one charged last"
+        "the host, the compat chunk, the file whose functions and table live and the chunk a \
+         global holds; back in the host, the driver chunk is charged nothing"
     );
     assert!(
         vm.heap.sources.len() < 20_000,
@@ -96,4 +95,48 @@ fn chunk_names_nothing_refers_to_are_collected() {
     assert_eq!(vm.heap.sources.len(), before);
     let order = vm.heap.sources_in_order();
     assert_eq!(&**order.last().unwrap().1, b"=again");
+}
+
+/// Code that calls into another chunk through a native (`pcall`, a `sort` comparator, a `gsub`
+/// function, an `__index` metamethod) is charged its own work after the call returns: the
+/// chunk running is the caller's again, for the profile and for the tables it makes.
+#[test]
+fn work_after_a_call_through_a_native_lands_on_the_caller() {
+    for (name, call) in [
+        ("pcall", "pcall(B)"),
+        ("sort", "local t = {3, 1, 2} table.sort(t, BLess)"),
+        ("gsub", "string.gsub('abc', '%w', B)"),
+        ("__index", "local _ = BIndexed.missing"),
+    ] {
+        let mut vm = benilla_lua::new_state();
+        vm.exec(
+            b"function B() return 'x' end function BLess(a, b) return a < b end \
+              BIndexed = setmetatable({}, {__index = function() return 1 end})",
+            b"@Interface\\AddOns\\B\\B.lua",
+        )
+        .unwrap();
+        let a = format!(
+            "function A() {call} local s = 0 for i = 1, 300000 do s = s + i end \
+             Made = {{}} for i = 1, 300 do Made[i] = {{}} end end"
+        );
+        vm.exec(a.as_bytes(), b"@Interface\\AddOns\\A\\A.lua")
+            .unwrap();
+        vm.set_profiling(true);
+        vm.exec(b"A()", b"=driver").unwrap();
+        let p = vm.profile.as_ref().unwrap().clone();
+        let (ia, ib) = (
+            source_id(&vm, b"@Interface\\AddOns\\A\\A.lua"),
+            source_id(&vm, b"@Interface\\AddOns\\B\\B.lua"),
+        );
+        let ns = |i: usize| p.ns.get(i).copied().unwrap_or(0);
+        assert!(
+            ns(ia) > 10 * ns(ib),
+            "{name}: A's loop is A's, A {} ns, B {} ns",
+            ns(ia),
+            ns(ib)
+        );
+        let census = vm.heap.census();
+        assert!(census[ia].tables >= 300, "{name}: {:?}", census[ia]);
+        assert!(census[ib].tables < 5, "{name}: {:?}", census[ib]);
+    }
 }

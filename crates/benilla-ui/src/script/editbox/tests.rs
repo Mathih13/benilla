@@ -1105,7 +1105,8 @@ fn click_places_cursor_and_drag_selects() {
     s.mouse_button(124.9, 60.0, "LeftButton", false);
 }
 
-/// Ctrl+arrows jump word boundaries (alnum runs); Ctrl+Shift extends the selection there.
+/// Ctrl+arrows jump word boundaries (runs of non-spaces; Right ends at the next word's start);
+/// Ctrl+Shift extends the selection there.
 #[test]
 fn ctrl_arrows_jump_words() {
     let mut s = script();
@@ -1122,8 +1123,8 @@ fn ctrl_arrows_jump_words() {
     });
     assert_eq!(
         s.focused_editbox_text_ui().unwrap().caret_x,
-        21.0,
-        "end of 'abc'"
+        28.0,
+        "start of 'def', past the space"
     );
     s.editbox_action(EditAction::Move {
         unit: EditUnit::Word,
@@ -1133,7 +1134,7 @@ fn ctrl_arrows_jump_words() {
     assert_eq!(
         s.focused_editbox_text_ui().unwrap().caret_x,
         49.0,
-        "end of 'def'"
+        "end of the text"
     );
     s.editbox_action(EditAction::Move {
         unit: EditUnit::Word,
@@ -1184,9 +1185,9 @@ fn copy_cut_and_the_password_placeholder() {
     assert_eq!(s.eval::<String>("return P:GetText()").unwrap(), "");
 }
 
-/// Word and edge deletes, the host's OS-native chords with no 1.12 counterpart: a word delete
-/// takes the adjacent alphanumeric run and the separators toward it, an edge delete clears to the
-/// line's end, and either deletes a live selection instead.
+/// Word deletes (`0x77c3f0`, `0x77c310`) take the spaces next to the caret and the non-space run
+/// beside them; the Mac's edge delete (Cmd+Backspace) clears to the text's edge; either deletes a
+/// live selection instead.
 #[test]
 fn word_and_edge_deletes() {
     let mut s = script();
@@ -1619,33 +1620,68 @@ fn set_number_on_a_numeric_box_empties_it_when_the_text_is_not_all_digits() {
     );
 }
 
-/// `SetMaxBytes`: `SetMaxLetters`'s exact count gate and raw coercion, a byte cap, and -1 as the
-/// no-limit sentinel.
+/// `SetMaxBytes(n)` stores n - 1 for a positive n and -1 otherwise (`0x799012`-`0x799022`),
+/// `GetMaxBytes` answers the stored value plus one (`0x7990e9`), and the insert keeps the text at
+/// or under the stored value (`0x77c040`-`0x77c048`).
 #[test]
-fn set_max_bytes_caps_the_buffer_in_bytes_with_minus_one_unlimited() {
+fn set_max_bytes_keeps_n_minus_one_bytes_and_get_answers_zero_when_unlimited() {
     let s = script();
     s.run(r#"E = CreateFrame("EditBox", "E") E:SetFocus()"#)
         .unwrap();
     let max = |s: &UiScript| s.eval::<i64>("return E:GetMaxBytes()").unwrap();
-    assert_eq!(max(&s), -1, "unlimited from the ctor");
+    assert_eq!(max(&s), 0, "unlimited from the ctor");
     s.run("E:SetMaxBytes(4)").unwrap();
     assert_eq!(max(&s), 4);
-    // Four bytes hold two two-byte letters and not a third.
+    // Three bytes hold one two-byte letter and not a second.
     s.run(r#"E:SetText("ééé")"#).unwrap();
-    assert_eq!(s.eval::<String>("return E:GetText()").unwrap(), "éé");
+    assert_eq!(s.eval::<String>("return E:GetText()").unwrap(), "é");
+    s.run(r#"E:SetText("abcdef")"#).unwrap();
+    assert_eq!(s.eval::<String>("return E:GetText()").unwrap(), "abc");
+    s.run("E:SetMaxBytes(1)").unwrap();
+    assert_eq!(max(&s), 1);
+    s.run(r#"E:SetText("xyz")"#).unwrap();
+    assert_eq!(s.eval::<String>("return E:GetText()").unwrap(), "");
     s.run(r#"E:SetMaxBytes(0) E:SetText("ééé")"#).unwrap();
-    assert_eq!(max(&s), -1, "a non-positive value is unlimited");
+    assert_eq!(max(&s), 0, "a non-positive value is unlimited");
     assert_eq!(s.eval::<String>("return E:GetText()").unwrap(), "ééé");
     s.run(r#"E:SetMaxBytes("3") E:SetText("abcd")"#).unwrap();
     assert_eq!(
         s.eval::<String>("return E:GetText()").unwrap(),
-        "abc",
+        "ab",
         "a numeric string coerces"
     );
     s.run("E:SetMaxBytes(nil)").unwrap();
-    assert_eq!(max(&s), -1, "nil coerces to 0, which is unlimited");
+    assert_eq!(max(&s), 0, "nil coerces to 0, which is unlimited");
     assert!(s.run("E:SetMaxBytes()").is_err(), "too few raises");
     assert!(s.run("E:SetMaxBytes(1, 2)").is_err(), "too many raises");
+}
+
+/// Over the byte cap the box deletes back one character or one whole link (`0x77c066` calling
+/// `0x77c280(-1)`), so a link that does not fit leaves entirely, and the cap counts its escape
+/// bytes where the letter cap does not.
+#[test]
+fn the_byte_cap_sheds_a_whole_link_and_counts_its_escapes() {
+    let s = script();
+    s.run(r#"E = CreateFrame("EditBox", "E") E:SetFocus()"#)
+        .unwrap();
+    let cap = LINK.len() + 2;
+    s.run(&format!("E:SetMaxBytes({cap})")).unwrap();
+    s.run(&format!("E:Insert(\"ab\") E:Insert(\"{LINK}\")"))
+        .unwrap();
+    assert_eq!(
+        text_of(&s),
+        "ab",
+        "ab + the link is {} bytes, over the cap of {}; the link goes whole",
+        LINK.len() + 2,
+        cap - 1
+    );
+    s.run(&format!("E:SetMaxBytes({})", LINK.len() + 1))
+        .unwrap();
+    s.run(&format!("E:SetText(\"{LINK}\")")).unwrap();
+    assert_eq!(text_of(&s), LINK, "the link alone fits exactly");
+    s.run("E:SetMaxLetters(20) E:SetText(\"\")").unwrap();
+    s.run(&format!("E:Insert(\"{LINK}\")")).unwrap();
+    assert_eq!(s.eval::<i64>("return E:GetNumLetters()").unwrap(), 9);
 }
 
 /// A font engine whose lines are 12 tall and which leaves every advance table to the host's round

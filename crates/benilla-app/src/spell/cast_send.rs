@@ -80,10 +80,32 @@ pub(crate) struct HeldCast {
     pub(crate) on_self: bool,
 }
 
+/// Whether the script call being applied passed the protected-action gate's tag 2, which opens
+/// `TryCastSpell` (`0x6e4bc1`, `0x494a50`): the answer the Lua verb got, where the stack that decides
+/// it was still there. A cast the engine starts (a click, a chain, a held press resumed) asks no
+/// gate, so it reads the default, passed; [`crate::script_calls`] sets it per call and resets it.
+#[derive(Resource)]
+pub(crate) struct ScriptCastPermit(bool);
+
+impl Default for ScriptCastPermit {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+impl ScriptCastPermit {
+    /// Whether tag 2 passed for the call being applied.
+    pub(crate) fn allows(&self) -> bool {
+        self.0
+    }
+}
+
 /// Everything the cast-send path reads, as one [`SystemParam`]: [`CastLadder::send`] is the only
 /// way into [`send_spell_cast`], for every caster surface.
 #[derive(SystemParam)]
 pub(crate) struct CastLadder<'w, 's> {
+    /// Absent in a world that never applies script calls.
+    permit: Option<ResMut<'w, ScriptCastPermit>>,
     pub(crate) commands: Res<'w, NetCommands>,
     pub(crate) self_player:
         Query<'w, 's, (Entity, Has<crate::creature_anim::Engaged>), With<SelfPlayer>>,
@@ -125,6 +147,18 @@ pub(crate) enum TargetedBind {
 }
 
 impl CastLadder<'_, '_> {
+    /// Set what the gate's tag 2 allowed the script call about to be applied.
+    pub(crate) fn permit(&mut self, may_cast: bool) {
+        if let Some(permit) = self.permit.as_mut() {
+            permit.0 = may_cast;
+        }
+    }
+
+    /// Whether the ladder may start: `TryCastSpell`'s gate, before its first rung.
+    pub(crate) fn permitted(&self) -> bool {
+        self.permit.as_ref().is_none_or(|p| p.0)
+    }
+
     /// The targeting cursor's commit: the ladder ran when the cursor went up, so the click owes
     /// only `SendCast 0x6e54f0`'s tail (the packet, the pending arm, the GCD), then clears the
     /// word.
@@ -251,6 +285,10 @@ impl CastLadder<'_, '_> {
         on_object: Option<u64>,
         hold: Option<HeldCast>,
     ) {
+        if !self.permitted() {
+            debug!("cast {spell_id} refused by the protected-action gate, silently");
+            return;
+        }
         send_spell_cast(
             spell_id,
             ctx,
@@ -535,7 +573,13 @@ fn send_spell_cast(
         CastCommit::Item { entry, .. } => entry,
         CastCommit::Spell => 0,
     };
-    if cooldowns.not_ready(spell_id, queried_item, def, now) {
+    // The item's own category for this spell replaces the spell's in the category leg (`0x6e1492`).
+    let item_category = items
+        .template_cached(queried_item)
+        .and_then(|t| t.use_spell)
+        .filter(|u| u.spell_id == spell_id)
+        .map_or(0, |u| u.category);
+    if cooldowns.not_ready(spell_id, queried_item, item_category, def, now) {
         debug!("ui_action: cast {spell_id} refused locally — not ready (the validator's rung 1)");
         // The one packet a local refusal sends (`0x609576–0x60960f`, spell leg only): a running
         // repeat with AttributesEx3 0x400000 (wand Shoot) gets `CMSG_CANCEL_CAST`, then the local
@@ -1590,6 +1634,46 @@ mod tests {
             "the item-keyed record never not-readies a bare spell press"
         );
         assert!(world.resource::<CastErrors>().0.is_empty());
+    }
+
+    /// The item press queries with its own spell-slot category (`0x6e1457`-`0x6e1499`): another
+    /// item's running category-28 timer refuses it 0x28, though the spell row carries no category.
+    #[test]
+    fn an_item_press_not_readies_on_its_own_category() {
+        use benilla_protocol::messages::ItemUseSpell;
+        let (mut world, rx) = world();
+        let mut template = crate::items::test_template("Hearthstone");
+        template.use_spell = Some(ItemUseSpell {
+            spell_id: HEARTHSTONE,
+            cooldown_ms: 0,
+            category: 28,
+            category_cooldown_ms: 0,
+        });
+        world
+            .resource_mut::<Items>()
+            .insert_template(6948, Some(template));
+        let other = ItemUseSpell {
+            spell_id: MOUNT,
+            cooldown_ms: 0,
+            category: 28,
+            category_cooldown_ms: 30_000,
+        };
+        world.resource_mut::<crate::spell::Cooldowns>().start_item(
+            7001,
+            &other,
+            None,
+            Instant::now(),
+        );
+
+        send(&mut world, HEARTHSTONE, HEARTH_COMMIT);
+        assert!(
+            rx.try_recv().is_err(),
+            "the shared category holds the press"
+        );
+        assert_eq!(
+            world.resource::<CastErrors>().0,
+            vec![CastFail::local(HEARTHSTONE, 0x28)]
+        );
     }
 
     /// `SendCast 0x6e54f0`: two opcodes, one targets block; a key's lock rides it as

@@ -19,6 +19,20 @@ const EMPTY: Node = Node {
     next: -1,
 };
 
+thread_local! {
+    /// Bytes tables grew or shrank by since the heap last drained it ([`take_growth`]). A table
+    /// cannot reach its heap, and only resizes, which are rare, touch it.
+    // ponytail: per thread, not per heap; two VMs interleaving on one thread may charge each
+    // other a resize until the next collection recounts both. A heap-owned counter would need
+    // every table write to go through the heap.
+    static GROWN: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// The bytes tables grew by since the last call (negative when they shrank).
+pub(crate) fn take_growth() -> isize {
+    GROWN.replace(0)
+}
+
 /// 5.1's `MAXBITS`: `2^MAXBITS` (`MAXASIZE`) is the largest array index kept in the array part.
 const MAXBITS: u32 = 26;
 
@@ -524,6 +538,13 @@ impl Table {
 
     /// 5.1's `resize`.
     fn resize(&mut self, nasize: usize, nhsize: usize) {
+        let before = self.bytes() as isize;
+        self.resize_parts(nasize, nhsize);
+        // 5.1's `luaM_reallocvector` charges `totalbytes` for both parts.
+        GROWN.set(GROWN.get() + self.bytes() as isize - before);
+    }
+
+    fn resize_parts(&mut self, nasize: usize, nhsize: usize) {
         self.hint_key.set(Value::Nil);
         let oldasize = self.array.len();
         let nold = std::mem::take(&mut self.node);

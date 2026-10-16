@@ -54,3 +54,35 @@ fn snapshots_of_a_large_state_are_cheap() {
     // A generous bound: the point is "milliseconds", not seconds.
     assert!(clone_ms < 500.0, "{clone_ms} ms");
 }
+
+/// `math.random` draws from the VM's own generator: a clone continues the sequence on its own,
+/// and reseeding one leaves the other.
+#[test]
+fn a_clone_draws_its_own_random_sequence() {
+    let mut a = benilla_lua::new_state();
+    let draw = |vm: &mut benilla_lua::Vm| -> Vec<f64> {
+        (0..4)
+            .map(|_| {
+                vm.exec(b"r = math.random(1000)", b"=t").unwrap();
+                vm.get_global("r").as_num().unwrap()
+            })
+            .collect()
+    };
+    a.exec(b"math.randomseed(7)", b"=t").unwrap();
+    let mut b = a.clone();
+    let from_a = draw(&mut a);
+    b.exec(b"math.randomseed(99)", b"=t").unwrap();
+    let mut c = a.clone();
+    assert_eq!(
+        draw(&mut c),
+        draw(&mut a),
+        "a clone continues where it was taken"
+    );
+    let mut a2 = benilla_lua::new_state();
+    a2.exec(b"math.randomseed(7)", b"=t").unwrap();
+    assert_eq!(
+        draw(&mut a2),
+        from_a,
+        "the sequence follows the seed, not other VMs"
+    );
+}

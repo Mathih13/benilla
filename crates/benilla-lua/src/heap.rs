@@ -279,6 +279,9 @@ struct Arena<T> {
     mask: usize,
 }
 
+/// An arena's first size, and the least a sweep shrinks it to.
+const ARENA_FIRST: usize = 64;
+
 /// A slot with no live object.
 const FREE: u8 = 0;
 /// A live object a collection has not reached yet.
@@ -332,13 +335,12 @@ impl Dead for UserObj {
 
 impl<T: Dead> Arena<T> {
     fn new() -> Self {
-        const FIRST: usize = 64;
         Arena {
-            items: (0..FIRST).map(|_| T::dead()).collect(),
-            state: vec![FREE; FIRST],
+            items: (0..ARENA_FIRST).map(|_| T::dead()).collect(),
+            state: vec![FREE; ARENA_FIRST],
             free: Vec::new(),
             used: 0,
-            mask: FIRST - 1,
+            mask: ARENA_FIRST - 1,
         }
     }
 
@@ -442,6 +444,7 @@ pub struct Census {
 
 #[derive(Clone)]
 pub struct Heap {
+    pub(crate) identity: Identity,
     strs: Arena<StrObj>,
     /// The intern table: open addressing, linear probing, at most half full.
     strt: Vec<u32>,
@@ -449,8 +452,9 @@ pub struct Heap {
     funcs: Arena<FuncObj>,
     upvals: Arena<UpvalObj>,
     users: Arena<UserObj>,
-    /// Bytes allocated since the last collection's accounting, an estimate.
-    pub bytes: usize,
+    /// Bytes allocated since the last collection's accounting, an estimate; table resizes are
+    /// added as [`Heap::bytes`] reads it.
+    bytes: usize,
     /// 5.0's `GCthreshold`: a collection runs when `bytes` reaches it.
     pub threshold: usize,
     /// The chunk names prototypes were compiled under, by source id: the owners a profile and
@@ -459,11 +463,11 @@ pub struct Heap {
     /// and a new chunk takes a free slot: `None` is a free one. Id 0 is the host's and never
     /// freed. A profile's time for an id carries on into the chunk that takes its slot:
     /// [`Heap::source_seq`] tells the two apart.
-    pub sources: Vec<Option<crate::ast::Bytes>>,
+    pub sources: Vec<Option<crate::proto::Bytes>>,
     /// The rest of the sources' bookkeeping, boxed: the heap sits inside the VM, whose layout
     /// the interpreter loop's code is sensitive to.
     src: Box<SourceBook>,
-    source_ids: std::collections::HashMap<crate::ast::Bytes, u32>,
+    source_ids: std::collections::HashMap<crate::proto::Bytes, u32>,
     /// The chunk whose code runs now; a new table is charged to it.
     pub cur_source: u32,
     /// `intern_with`'s buffer.
@@ -498,9 +502,30 @@ struct SourceBook {
     scan_in: usize,
 }
 
+/// Which VM or heap this is: a fresh number for each one made and each clone. Natives hold
+/// `&mut Vm`, so one could put another VM or heap in place of the running one
+/// (`*vm = new_state()`), freeing the code and stack the running frames point into; the
+/// interpreter compares identities after every native and stops instead ([`Vm::identity`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Identity(pub(crate) u64);
+
+impl Default for Identity {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Identity(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Clone for Identity {
+    fn clone(&self) -> Self {
+        Identity::default()
+    }
+}
+
 impl Default for Heap {
     fn default() -> Self {
         let mut h = Heap {
+            identity: Identity::default(),
             strs: Arena::new(),
             strt: vec![STRT_EMPTY; 128],
             tables: Arena::new(),
@@ -649,7 +674,7 @@ impl Heap {
     // ── tables ───────────────────────────────────────────────────────────────────────────────
 
     /// The id of chunk name `name`, made on first sight, in a freed slot if there is one.
-    pub fn source_id(&mut self, name: &crate::ast::Bytes) -> u32 {
+    pub fn source_id(&mut self, name: &crate::proto::Bytes) -> u32 {
         if let Some(&id) = self.source_ids.get(name) {
             return id;
         }
@@ -715,13 +740,13 @@ impl Heap {
     }
 
     /// The chunk name of source `id`, if the slot holds one.
-    pub fn source_name(&self, id: u32) -> Option<&crate::ast::Bytes> {
+    pub fn source_name(&self, id: u32) -> Option<&crate::proto::Bytes> {
         self.sources.get(id as usize)?.as_ref()
     }
 
     /// The live sources in the order they were first compiled: `(id, name)`.
-    pub fn sources_in_order(&self) -> Vec<(u32, &crate::ast::Bytes)> {
-        let mut v: Vec<(u32, &crate::ast::Bytes)> = self
+    pub fn sources_in_order(&self) -> Vec<(u32, &crate::proto::Bytes)> {
+        let mut v: Vec<(u32, &crate::proto::Bytes)> = self
             .sources
             .iter()
             .enumerate()
@@ -1002,9 +1027,9 @@ impl Heap {
         );
         live += sweep(&mut self.upvals, |_| 24, |_| false, drop);
         live += sweep(&mut self.users, |_| 32, |_| false, drop);
-        let freed = self.strs.free.len();
+        let strs_before = self.strs.live();
         live += sweep(&mut self.strs, |s| 32 + s.bytes().len(), |_| false, drop);
-        let dead_str = self.strs.free.len() != freed;
+        let dead_str = self.strs.live() != strs_before;
         let live_strs = self.strs.live() as u32;
         self.str_gc_at = live_strs + (self.str_id_limit.saturating_sub(live_strs)) / 2;
         if dead_str {
@@ -1013,8 +1038,18 @@ impl Heap {
         }
         // A key whose node is dead (nil value) may name a freed object; 5.0 keeps such keys for
         // `next` and never reads them. They stay as stale handles, compared by identity only.
+        crate::table::take_growth();
         self.bytes = live;
         live
+    }
+
+    /// The live byte estimate: what the last collection found, what was made since, and what
+    /// tables grew by since.
+    pub fn bytes(&mut self) -> usize {
+        self.bytes = self
+            .bytes
+            .saturating_add_signed(crate::table::take_growth());
+        self.bytes
     }
 
     /// Whether a value's object still exists; anything not collectable does.
@@ -1069,6 +1104,10 @@ fn mark_proto(p: &Rc<Proto>, gray: &mut Vec<Value>, epoch: u32) {
 
 /// Free every live object the mark left unmarked, and unmark the rest; answers the bytes that
 /// stay.
+///
+/// The slots past the last live one are given back, and the free list is rebuilt so `alloc`
+/// takes the lowest free slot first: new objects fill the bottom, and the next sweep's range
+/// follows the live set instead of the most the arena ever held.
 fn sweep<T: Dead>(
     a: &mut Arena<T>,
     size: impl Fn(&T) -> usize,
@@ -1078,12 +1117,14 @@ fn sweep<T: Dead>(
     let mut live = 0;
     let n = a.used as usize;
     let (items, state) = (&mut a.items[..n], &mut a.state[..n]);
+    let mut top = 0;
     for i in 0..n {
         match state[i] {
             FREE => {}
             MARKED => {
                 state[i] = LIVE;
                 live += size(&items[i]);
+                top = i + 1;
             }
             _ => {
                 if keep(&items[i]) {
@@ -1092,9 +1133,55 @@ fn sweep<T: Dead>(
                     items[i] = T::dead();
                 }
                 state[i] = FREE;
-                a.free.push(i as u32);
             }
         }
     }
+    a.used = top as u32;
+    a.free.clear();
+    a.free.extend(
+        (0..top as u32)
+            .rev()
+            .filter(|&i| a.state[i as usize] == FREE),
+    );
+    // Halve while a quarter or less is in use, so a spike's arena does not stay that size.
+    let mut len = a.items.len();
+    while len > ARENA_FIRST && top <= len / 4 {
+        len /= 2;
+    }
+    if len < a.items.len() {
+        a.items.truncate(len);
+        a.items.shrink_to_fit();
+        a.state.truncate(len);
+        a.state.shrink_to_fit();
+        a.mask = len - 1;
+    }
     live
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spike of garbage leaves no high-water mark: the arena shrinks back, and what is made
+    /// after fills the bottom, so a sweep's range follows the live set.
+    #[test]
+    fn a_sweep_gives_back_a_spikes_slots() {
+        let mut h = Heap::default();
+        let keep = h.new_table(0, 0);
+        for _ in 0..100_000 {
+            h.new_table(0, 0);
+        }
+        let mode = h.intern(b"__mode");
+        h.collect(&[Value::Table(keep)], &[], &[], mode);
+        assert!(h.tables.items.len() <= 4 * ARENA_FIRST, "the arena shrank");
+        let t = h.new_table(0, 0);
+        assert!(
+            (t.0 as usize) < ARENA_FIRST,
+            "a new table takes a low slot, got {}",
+            t.0
+        );
+        h.collect(&[Value::Table(keep), Value::Table(t)], &[], &[], mode);
+        assert_eq!(h.table(keep).array.len(), 0, "the kept table is intact");
+        assert!(h.tables.used as usize <= ARENA_FIRST);
+    }
 }

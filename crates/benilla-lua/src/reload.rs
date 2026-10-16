@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ast::Bytes;
 use crate::heap::{FuncObj, LuaFunc};
+use crate::proto::Bytes;
 use crate::proto::Proto;
 use crate::vm::Vm;
 use crate::SyntaxError;
