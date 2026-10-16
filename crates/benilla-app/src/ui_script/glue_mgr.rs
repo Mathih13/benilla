@@ -1,4 +1,4 @@
-//! The glue manager, `CGlueMgr` host side, under `WOW_GLUE_STOCK=1`: the screen-state machine of
+//! The glue manager, `CGlueMgr` host side, under the stock glue screens: the screen-state machine of
 //! `CGlueMgr::Update` (`0x46b930`, `screenState` at `0xb41da0`) over the login engine. The IO
 //! thread's parks and [`crate::glue_session::login`]'s policy still do the network; this maps their
 //! messages onto the reference's screen states and fires the glue events the stock GlueXML answers:
@@ -119,7 +119,7 @@
 //!    takes the selection's index (`0x46b5fa`), the CVars are saved (`0x46b6f6`) and the state
 //!    goes to 8 (`0x46b711`). The record byte the call sets on the way (`+0x118`, `0x46b54a`) is
 //!    read nowhere.
-//! 2. The rest is the world entry the native screens make too, the session's pick
+//! 2. The rest is the world entry by the session's pick
 //!    ([`crate::glue_session::roster::send_pick`]): the loading screen and its tip off the picked
 //!    record (`0x406640`, `0x46b614`-`0x46b6e3`), the realmd link closed (`0x46b70c`), the glue
 //!    torn down (`0x46ac90`, the VM leaving with the character screen) and `CMSG_PLAYER_LOGIN`
@@ -164,7 +164,7 @@ use benilla_ui::script::{
     GLUE_STATUS_KEYS,
 };
 
-use crate::glue_session::login::{GlueLogin, LoginNotice};
+use crate::glue_session::login::{GlueLogin, LoginGuardRefused};
 use crate::glue_session::queue::QueueEstimate;
 use crate::glue_session::realm::RunModeRealm;
 use crate::net::{
@@ -369,8 +369,6 @@ struct Operation {
     status: u8,
     done: bool,
     ok: bool,
-    /// The text of a failure the reference has no status for, shown in place of the status's.
-    raw: Option<String>,
     /// A connect or a query whose realm list reply has not come (`0x5abb90` dispatches the reply
     /// on the operation pending).
     awaiting_list: bool,
@@ -394,13 +392,7 @@ impl Operation {
 
     /// `GetStatus`'s text: the status's key once completed, none while it runs (`0x5aaa35`).
     fn text(&self) -> Option<Text> {
-        if !self.done {
-            return None;
-        }
-        Some(match &self.raw {
-            Some(t) => Text::Raw(t.clone()),
-            None => status_text(self.status).0,
-        })
+        self.done.then(|| status_text(self.status).0)
     }
 }
 
@@ -689,7 +681,7 @@ impl GlueMgr {
     /// (`0x5ab1a8`) and the link is dropped; then, link or not, the logon is cancelled
     /// (`0x46d36c`). Only a real drop reaches the handler (`0x46c540`), which zeroes the state
     /// (`0x46c55d`), the operation in flight with it, so no reply completes on the login screen;
-    /// the native session reports no such drop, so here the handler's half runs with the drop.
+    /// the IO thread reports no such drop, so here the handler's half runs with the drop.
     fn disconnect_from_server(&mut self) {
         if self.connected {
             self.connected = false;
@@ -1226,7 +1218,7 @@ impl GlueMgr {
     }
 
     /// A login stage off the IO thread. `glue_up` is whether the stock screens stand: a stage of
-    /// an attempt the native policy made on its own (the `WOW_USER` fast path, a resubmit) shows
+    /// an attempt the run made on its own (the `WOW_USER` fast path, a resubmit) shows
     /// as a login only there.
     fn on_stage(&mut self, stage: LoginStage, glue_up: bool) {
         match stage {
@@ -1239,7 +1231,7 @@ impl GlueMgr {
                     self.cells.result = 0;
                 }
             }
-            // The SRP exchange is inside the native logon's one blocking call.
+            // The SRP exchange is inside the IO thread's one blocking logon call.
             LoginStage::Authenticating => {}
             // The world dial begins: a logon with no realm list to publish is done.
             LoginStage::Handshaking => self.on_logon_done(),
@@ -1255,7 +1247,7 @@ impl GlueMgr {
         }
     }
 
-    /// The account guard refused the run's own credentials ([`LoginNotice::GuardRefused`]):
+    /// The account guard refused the run's own credentials ([`LoginGuardRefused`]):
     /// benilla's refusal of a scripted login on an account its checkout does not declare, before
     /// any logon. It shows as `CGlueMgr::Login`'s own refusal of an empty account does
     /// (`0x46b090`-`0x46b0ac`): `OPEN_STATUS_DIALOG` with `OKAY` and the words, the state left as
@@ -1295,28 +1287,15 @@ impl GlueMgr {
                     self.cells.result = result;
                 }
             }
-            // The character list query's reply never came: the server refused the roster to a
-            // client without Warden (the park's `char_enum`), the one failure it reports. The
-            // query completes failed with the words, and the link is gone.
-            ScreenState::CharList if self.op.kind != OpKind::CharList || self.op.done => {}
-            ScreenState::Connect | ScreenState::CharList => {
-                if self.state == ScreenState::CharList {
-                    self.connected = false;
-                }
+            ScreenState::Connect => {
                 let status = match msg.refusal {
                     Some(LoginRefusal::World(code)) => code,
                     Some(LoginRefusal::Logon(_) | LoginRefusal::LogonProof(_)) => {
                         STATUS_RESPONSE_FAILURE
                     }
-                    None if msg.terminal => STATUS_RESPONSE_FAILURE,
                     None => STATUS_FAILED_TO_CONNECT,
                 };
                 self.op.complete(false, status);
-                // A server refusing a client without Warden has no reference status: its own
-                // words.
-                if msg.terminal && msg.refusal.is_none() {
-                    self.op.raw = Some(msg.reason.clone());
-                }
             }
             _ => {}
         }
@@ -1328,10 +1307,7 @@ impl GlueMgr {
     fn world_failed(&mut self, op: &Operation) {
         let status = op.status;
         if status != STATUS_CANCELLED {
-            let (text, code) = match op.text() {
-                Some(Text::Raw(t)) => (Text::Raw(t), None),
-                _ => status_text(status),
-            };
+            let (text, code) = status_text(status);
             match code.and_then(|c| URL_STATUSES.iter().find(|(s, _)| *s == c)) {
                 Some((_, url)) => self.outbox.push(Outgoing::Open {
                     which: "OKAY_WITH_URL",
@@ -1417,7 +1393,7 @@ impl GlueMgr {
     /// The world server accepted the authentication: the link is up, and in state 2 the
     /// authentication completes `AUTH_OK` (`0x5aab80`), which the tick shows and takes down the
     /// success arm. The realm the link reached is the selected one, as the connect dials only
-    /// `[0xc28134]`'s record (`0x5ab823`); a dial the native policy made on its own selects it.
+    /// `[0xc28134]`'s record (`0x5ab823`); a dial the run made on its own selects it.
     fn on_world_authenticated(&mut self, realm: benilla_protocol::RealmInfo, epoch: u64) {
         self.connected = true;
         self.link = epoch;
@@ -1461,7 +1437,7 @@ impl GlueMgr {
     /// Out of state 2 it fires the event (`0x46c618`); in state 2 a completed, failed operation
     /// opens `OKAY` with its text instead (`0x46c671`-`0x46c68f`). The handler's first test, that
     /// the dropped connection is `ClientServices`' current one (`0x5abd40`, else "Invalid
-    /// disconnect"), has no native counterpart: the IO thread holds one session and reports only
+    /// disconnect"), has no counterpart here: the IO thread holds one session and reports only
     /// its own end.
     fn on_disconnected(&mut self, end: benilla_protocol::SessionEnd, session_over: bool) {
         if end == benilla_protocol::SessionEnd::LoggedOut {
@@ -1777,7 +1753,7 @@ pub(crate) struct LoginNews<'w, 's> {
     renames: MessageReader<'w, 's, CharRenameMessage>,
     login_refusals: MessageReader<'w, 's, CharacterLoginFailedMessage>,
     /// What the login engine decided with no network message behind it.
-    notices: MessageReader<'w, 's, LoginNotice>,
+    notices: MessageReader<'w, 's, LoginGuardRefused>,
     /// The name check's lists, which the glue VM is seated with (`0x6c91a0`).
     names: Option<Res<'w, crate::text_filter::NameFilter>>,
 }
@@ -1815,7 +1791,7 @@ pub(crate) fn read_agreements(cvars: &crate::cvars::Cvars) -> [NoticeState; 4] {
 /// The glue manager's frame: the login engine's news, the per-frame arms, then the events into the
 /// glue VM and its slots seeded. The verbs ran in their own calls ([`GlueHost`]); what is left of
 /// them here is the effects they leave for the frame and the calls a VM made before it was seated.
-/// Runs under `WOW_GLUE_STOCK=1` only.
+/// Runs under the stock screens only.
 ///
 /// No borrow of the manager is held across a call into the VM that can run a handler.
 #[allow(clippy::too_many_arguments)]
@@ -2006,10 +1982,8 @@ pub(crate) fn drive_glue_mgr(
         for msg in news.failures.read() {
             mgr.on_failed(msg);
         }
-        for notice in news.notices.read() {
-            if let LoginNotice::GuardRefused(why) = notice {
-                mgr.on_guard_refused(why);
-            }
+        for LoginGuardRefused(why) in news.notices.read() {
+            mgr.on_guard_refused(why);
         }
         // A session of an attempt a Cancel or a disconnect has passed is not the screen's.
         let generation = crate::net::LoginAbandon::now(asks.abandon.as_deref());

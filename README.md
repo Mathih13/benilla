@@ -67,9 +67,10 @@ benilla builds and runs on macOS, Linux and Windows. You need:
 
 - **A 1.12.1 client (build 5875)** for the game data, in any locale. benilla only reads it, and
   shows its text in the client's language; development runs on English clients.
-- **A 1.12.1 server with Warden off.** [vmangos](https://github.com/vmangos/core) is what
-  development runs against, and it ships with Warden off; cMaNGOS and the other 1.12.1 cores speak
-  the same protocol.
+- **A 1.12.1 server.** [vmangos](https://github.com/vmangos/core) is what development runs
+  against; cMaNGOS and the other 1.12.1 cores speak the same protocol. benilla does not answer
+  Warden, so a server that enforces it disconnects the session after its timeout; vmangos ships
+  with Warden off.
 - **Stable Rust and a C compiler**, which some dependencies build with: on macOS the
   Xcode command line tools, on Linux the ALSA and udev development packages and pkg-config, on
   Windows the MSVC build tools that the Rust installer sets up.
@@ -118,5 +119,5 @@ runtime. The few files under `crates/benilla-app/assets/ui/` are our own, not co
 adapters over stock files, and the settings windows and script error log benilla draws itself.
 
 World of Warcraft is a trademark of Blizzard Entertainment, Inc. Our own code is licensed under
-[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. The vendored component
-under `third_party/`, the kira audio engine, keeps its own upstream license, alongside it.
+[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. The kira audio engine under
+`third_party/` is vendored under the same two licenses, with its author's copyright notices beside it.
