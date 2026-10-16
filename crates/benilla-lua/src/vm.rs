@@ -578,11 +578,8 @@ impl Vm {
         // A protected call of its own, as mlua's `lua_pcall` with no handler: an error inside
         // runs no enclosing `xpcall`'s handler.
         self.handlers.push(None);
-        let r = if frames == 0 {
-            self.unwind_guard(f)
-        } else {
-            f(self)
-        };
+        // A panic that passes leaves the state as at this call (`pcall_at`).
+        let r = self.unwind_guard(f);
         self.handlers.truncate(handlers);
         match r {
             Ok(v) => Ok(v),
@@ -1420,9 +1417,12 @@ impl Vm {
     ) -> Result<(), LuaError> {
         let frames = self.frames.len();
         let c_depth = self.c_depth;
+        let handlers = self.handlers.len();
         self.handlers.push(handler);
-        let r = self.call_at(func_idx, nargs, nres);
-        self.handlers.pop();
+        // A panic that passes leaves this call's handler, frames and depth as they were, so a
+        // native that catches it finds the state as at this call.
+        let r = self.unwind_guard(|vm| vm.call_at(func_idx, nargs, nres));
+        self.handlers.truncate(handlers);
         if let Err(e) = r {
             self.close_upvals(func_idx);
             self.frames.truncate(frames);
