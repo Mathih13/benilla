@@ -495,6 +495,8 @@ struct SourceBook {
     /// The chunk that was running when each slot's chunk was compiled, and that chunk's `seq`
     /// then, so a reused slot is not taken for it: a `loadstring` chunk's parent is its caller's.
     parent: Vec<(u32, u64)>,
+    /// Each slot's chunk's main function [`Proto::code_digest`], as last compiled.
+    main: Vec<u64>,
     next_seq: u64,
     /// Moves whenever a chunk takes or leaves a slot.
     epoch: u64,
@@ -543,6 +545,7 @@ impl Default for Heap {
             src: Box::new(SourceBook {
                 seq: vec![0],
                 parent: vec![(0, 0)],
+                main: vec![0],
                 scan_in: 64,
                 ..Default::default()
             }),
@@ -699,12 +702,14 @@ impl Heap {
                 self.sources[id as usize] = Some(name.clone());
                 book.seq[id as usize] = seq;
                 book.parent[id as usize] = parent;
+                book.main[id as usize] = 0;
                 id
             }
             None => {
                 self.sources.push(Some(name.clone()));
                 book.seq.push(seq);
                 book.parent.push(parent);
+                book.main.push(0);
                 self.sources.len() as u32 - 1
             }
         };
@@ -768,6 +773,16 @@ impl Heap {
     /// compile order once a slot is reused.
     pub fn source_seq(&self, id: u32) -> u64 {
         self.src.seq.get(id as usize).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn set_main_digest(&mut self, id: u32, digest: u64) {
+        self.src.main[id as usize] = digest;
+    }
+
+    /// The [`Proto::code_digest`] of the main function chunk `name` was last compiled with.
+    pub(crate) fn main_digest(&self, name: &[u8]) -> Option<u64> {
+        let &id = self.source_ids.get(name)?;
+        Some(self.src.main[id as usize])
     }
 
     /// The chunk that was running when source `id`'s chunk was compiled, while that chunk still

@@ -28,6 +28,9 @@ pub struct Report {
     pub added: Vec<String>,
     /// Functions only the old source had, with live closures still on the old code.
     pub removed: Vec<String>,
+    /// The chunk's top level, its code outside every function, changed: it ran once, so what
+    /// it set up (a constant, a table, a registration) is as the old code left it.
+    pub top_level_changed: bool,
 }
 
 fn walk(p: &Rc<Proto>, out: &mut HashMap<Bytes, Rc<Proto>>) {
@@ -45,10 +48,14 @@ impl Vm {
     /// Compile `src` as the chunk `chunkname` and swap each of its functions into the live
     /// closures of the same function. A syntax error leaves everything as it was.
     pub fn hot_reload(&mut self, chunkname: &[u8], src: &[u8]) -> Result<Report, SyntaxError> {
+        let old_main = self.heap.main_digest(chunkname);
         let root = crate::compile::compile(src, chunkname, &mut self.heap, 0)?;
         let mut fresh = HashMap::new();
         walk(&root, &mut fresh);
-        let mut report = Report::default();
+        let mut report = Report {
+            top_level_changed: old_main.is_some_and(|d| d != root.code_digest()),
+            ..Report::default()
+        };
         let mut seen: HashMap<Bytes, bool> = HashMap::new();
         // Replaced code may still be running in a frame; it is kept until no Lua runs.
         if self.frames_empty() {

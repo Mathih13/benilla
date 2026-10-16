@@ -121,31 +121,49 @@ fn reload(script: &UiScript, root: &Path, id: usize, path: &Path) -> (String, bo
         return (format!("{shown}: no longer loaded"), false);
     };
     match r {
-        // A file of top-level code only: nothing to swap, and it does not rerun.
-        Ok(r) if r.swapped.is_empty() && r.reshaped.is_empty() && r.added.is_empty() => (
-            format!("{shown}: no function to swap; top-level code runs again only on /reload"),
-            false,
-        ),
-        Ok(r) => {
-            let mut line = format!(
-                "{shown}: {} function(s) swapped into {} closure(s)",
-                r.swapped.len(),
-                r.closures
-            );
-            if !r.reshaped.is_empty() {
-                line += &format!(
-                    "; kept old code for {} (captures changed): {}",
-                    r.reshaped.len(),
-                    r.reshaped.join(", ")
-                );
-            }
-            if !r.added.is_empty() {
-                line += &format!("; {} new, live after /reload", r.added.len());
-            }
-            (line, r.reshaped.is_empty())
-        }
+        Ok(r) => report_line(&shown, &r),
         Err(e) => (format!("{shown}: {e}"), false),
     }
+}
+
+/// What a reload did, in a line, and whether all of it took effect.
+fn report_line(shown: &str, r: &benilla_ui::mlua::benilla_lua::reload::Report) -> (String, bool) {
+    // A new function nested in one that was swapped exists from that one's next call; any other
+    // is made by code that already ran.
+    let (live, later): (Vec<&String>, Vec<&String>) = r.added.iter().partition(|k| {
+        k.rsplit_once('/')
+            .is_some_and(|(parent, _)| r.swapped.iter().any(|s| s == parent))
+    });
+    let mut line = format!(
+        "{shown}: {} function(s) swapped into {} closure(s)",
+        r.swapped.len(),
+        r.closures
+    );
+    if !r.reshaped.is_empty() {
+        line += &format!(
+            "; kept old code for {} (captures changed): {}",
+            r.reshaped.len(),
+            r.reshaped.join(", ")
+        );
+    }
+    if !live.is_empty() {
+        line += &format!("; {} new, live on their parent's next call", live.len());
+    }
+    if !later.is_empty() {
+        line += &format!("; {} new, live after /reload", later.len());
+    }
+    if !r.removed.is_empty() {
+        line += &format!(
+            "; {} removed, still on the old code where held: {}",
+            r.removed.len(),
+            r.removed.join(", ")
+        );
+    }
+    if r.top_level_changed {
+        line += "; top-level code changed, which runs again only on /reload";
+    }
+    let complete = r.reshaped.is_empty() && later.is_empty() && !r.top_level_changed;
+    (line, complete)
 }
 
 /// The line in the default chat frame: green when it applied, red when it did not.
@@ -156,4 +174,41 @@ fn chat(script: &UiScript, line: &str, ok: bool) {
     };
     let (r, g, b) = if ok { (0.4, 1.0, 0.6) } else { (1.0, 0.4, 0.4) };
     let _ = frame.call_method::<()>("AddMessage", (format!("hot reload: {line}"), r, g, b));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use benilla_ui::mlua::benilla_lua::reload::Report;
+
+    #[test]
+    fn the_line_says_what_did_not_take_effect() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let r = Report {
+            closures: 2,
+            swapped: s(&["Outer", "F:SetScript"]),
+            added: s(&["Outer/inner", "NewGlobal"]),
+            removed: s(&["Old"]),
+            top_level_changed: true,
+            ..Default::default()
+        };
+        let (line, complete) = report_line("A.lua", &r);
+        assert_eq!(
+            line,
+            "A.lua: 2 function(s) swapped into 2 closure(s); 1 new, live on their parent's next \
+             call; 1 new, live after /reload; 1 removed, still on the old code where held: Old; \
+             top-level code changed, which runs again only on /reload"
+        );
+        assert!(!complete);
+        let r = Report {
+            closures: 1,
+            swapped: s(&["Outer"]),
+            added: s(&["Outer/inner"]),
+            ..Default::default()
+        };
+        assert!(
+            report_line("A.lua", &r).1,
+            "a nested addition is live at once"
+        );
+    }
 }

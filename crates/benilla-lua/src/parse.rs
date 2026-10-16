@@ -63,6 +63,8 @@ pub(crate) fn parse(src: &[u8], chunkname: &[u8], heap: &mut Heap, ccalls: u32) 
     let mut root = fs.into_proto(p.heap);
     crate::compile::finish_keys(&mut root);
     root.verify();
+    let digest = root.code_digest();
+    p.heap.set_main_digest(root.source_id, digest);
     Ok(Rc::new(root))
 }
 
