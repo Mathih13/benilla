@@ -579,6 +579,26 @@ b]])"#),
           table.insert(o, E(function() local t = chain(n, "__newindex") t.y = 1 return "set" end))
         end
         return table.concat(o, "|")"#),
+    // A collection marks a deleted key dead (5.1.5's `removeentry`): a key set again takes a new
+    // node by `newkey`'s rules, not its old one, so `pairs` order shows it. A key equal to an
+    // existing one keeps that key, `-0` or `0`.
+    ("fix-vm dead_keys", r#"local function order(t) local o = {} for k in pairs(t) do table.insert(o, k) end return table.concat(o, " ") end
+        local o = {}
+        for _, c in {{5, 4}, {6, 5}, {7, 6}, {8, 4}, {13, 10}, {14, 14}} do
+          local n, d = c[1], c[2]
+          local keys = {} for i = 1, n do keys[i] = "k" .. i end
+          local a = {} for i = 1, n do a[keys[i]] = i end
+          local b = {} for i = 1, n do b[keys[i]] = i end
+          a[keys[d]] = nil collectgarbage() a[keys[d]] = 0
+          b[keys[d]] = nil b[keys[d]] = 0
+          table.insert(o, order(a) .. " / " .. order(b))
+        end
+        local z = 0 local nz = -z
+        local function keys(t) local r = {} for k, v in pairs(t) do table.insert(r, tostring(k) .. "=" .. v .. ":" .. tostring(1 / k)) end return table.concat(r, " ") end
+        local t = {} t[nz] = 1 t[0] = 2 table.insert(o, keys(t))
+        local u = {} u[0] = 1 u[nz] = 2 table.insert(o, keys(u))
+        local w = {} w[nz] = 1 w[nz] = nil collectgarbage() w[0] = 2 table.insert(o, keys(w))
+        return table.concat(o, " | ")"#),
     // ── r2-vm: error handlers as 5.1's `luaG_errormsg` runs them ──
     ("r2-vm handler_reenters", r#"local n = 0
         local ok, e = xpcall(function() error("a", 0) end, function(m) n = n + 1 error("b", 0) end)

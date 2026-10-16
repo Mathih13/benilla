@@ -11,12 +11,17 @@ pub struct Node {
     pub val: Value,
     /// The next node in this chain, or -1.
     pub next: i32,
+    /// 5.1.5's `LUA_TDEADKEY`: a collection found the entry empty and its key collectable
+    /// (`removeentry`). A write does not find the key here again, as `luaH_get` does not, so
+    /// setting it takes a node by `newkey`'s rules; `next` still finds it, by identity.
+    pub(crate) dead: bool,
 }
 
 const EMPTY: Node = Node {
     key: Value::Nil,
     val: Value::Nil,
     next: -1,
+    dead: false,
 };
 
 /// A heap's bytes of table growth not yet in its count: shared by every table the heap made, so a
@@ -403,16 +408,15 @@ impl Table {
         *self.slot_mut(s) = val;
     }
 
-    /// `luaH_set`: the slot for `key`, made if absent. 5.0 makes a key even to store `nil`.
+    /// `luaH_set`: the slot for `key`, made if absent. 5.0 makes a key even to store `nil`. A
+    /// key found keeps its bits (`t[0]` finds a `-0` key and leaves it `-0`); a dead one is not
+    /// found.
     pub fn slot_for(&mut self, key: Value) -> Result<Slot, KeyError> {
         self.flags = 0;
-        if let Some(s) = self.find(key) {
-            // A dead node may hold a collected key whose handle `key` now reuses; C compares the
-            // pointer and so reuses the node, and the key's hash must now be `key`'s own.
-            if let Slot::Node(i) = s {
-                self.node[i].key = key;
-            }
-            return Ok(s);
+        match self.find(key) {
+            Some(Slot::Node(i)) if self.node[i].dead => {}
+            Some(s) => return Ok(s),
+            None => {}
         }
         match key.unpack() {
             V::Nil => Err(KeyError::Nil),
@@ -454,6 +458,7 @@ impl Table {
             }
         }
         self.node[mp].key = key;
+        self.node[mp].dead = false;
         Slot::Node(mp)
     }
 

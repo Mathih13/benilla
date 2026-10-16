@@ -969,12 +969,12 @@ impl Heap {
                     if !self.tables.mark(t.0) {
                         continue;
                     }
-                    let tab = self.tables.get(t.0);
-                    let weak = match tab.meta {
+                    let meta = self.tables.get(t.0).meta;
+                    let weak = match meta {
                         Some(m) => self.weak_mode(m, mode_key),
                         None => 0,
                     };
-                    if let Some(m) = tab.meta {
+                    if let Some(m) = meta {
                         gray.push(Value::Table(m));
                     }
                     let (wk, wv) = (weak & 1 != 0, weak & 2 != 0);
@@ -985,6 +985,7 @@ impl Heap {
                     // since they hold nothing. A table's contents are live objects. Any other
                     // collectable goes gray unless the table holds it weakly.
                     let strs = &mut self.strs;
+                    let tab = self.tables.get_mut(t.0);
                     let mut reach = |v: Value, weak: bool| match v.unpack() {
                         V::Str(s) => {
                             strs.mark(s.id);
@@ -995,14 +996,16 @@ impl Heap {
                     for &v in &tab.array {
                         reach(v, wv);
                     }
-                    for n in &tab.node {
+                    for n in tab.node.iter_mut() {
                         if n.val.is_nil() {
+                            // 5.1.5's `removeentry`: an empty entry's collectable key is dead.
+                            n.dead |= is_collectable(n.key);
                             continue;
                         }
                         reach(n.key, wk);
                         reach(n.val, wv);
                     }
-                    self.tables.get_mut(t.0).weak = weak;
+                    tab.weak = weak;
                 }
                 V::Func(f) => {
                     if !self.funcs.mark(f.0) {
@@ -1056,6 +1059,7 @@ impl Heap {
             for n in tab.node.iter_mut() {
                 if !n.val.is_nil() && (!alive(n.key) || !alive(n.val)) {
                     n.val = Value::Nil;
+                    n.dead = is_collectable(n.key);
                 }
             }
         }
@@ -1082,8 +1086,8 @@ impl Heap {
             let size = self.strt.len();
             self.resize_strt(size);
         }
-        // A key whose node is dead (nil value) may name a freed object; 5.0 keeps such keys for
-        // `next` and never reads them. They stay as stale handles, compared by identity only.
+        // A dead key may name a freed object, whose handle a new one may take; as 5.1's dead key,
+        // it is found only by `next`, by identity (`Table::slot_for`).
         // Every live table's size is counted whole above, its uncounted growth with it.
         self.tables.growth.set(0);
         live += proto_bytes + strt_bytes(self.strt.len());

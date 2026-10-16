@@ -270,3 +270,32 @@ fn a_snapshot_counts_its_own_growth() {
     assert!(kb(&mut snap) - snap_before >= 1500.0);
     assert_eq!(kb(&mut vm), before, "the snapshot's growth counted here");
 }
+
+/// 5.1.5's dead keys: a collection marks a deleted string key dead, so setting it again takes a
+/// node by `newkey`'s rules, and `pairs` walks in the C build's order; a number key is never
+/// dead, and one equal to it keeps its bits.
+#[test]
+fn a_collected_deleted_key_is_set_again_as_a_new_one() {
+    let mut vm = benilla_lua::new_state();
+    let order = "local function order(t) local o = {} for k in pairs(t) do table.insert(o, k) end \
+                 return table.concat(o, ' ') end ";
+    let set = "local t = {} for i = 1, 5 do t['k' .. i] = i end t.k4 = nil ";
+    assert_eq!(
+        run(
+            &mut vm,
+            &format!("{order}{set} collectgarbage() t.k4 = 0 return order(t)")
+        ),
+        "k4 k5 k1 k3 k2"
+    );
+    assert_eq!(
+        run(&mut vm, &format!("{order}{set} t.k4 = 0 return order(t)")),
+        "k5 k1 k4 k3 k2"
+    );
+    assert_eq!(
+        run(
+            &mut vm,
+            "local z = 0 local t = {} t[-z] = 1 t[0] = 2 local k = next(t) return 1 / k"
+        ),
+        "-inf"
+    );
+}
