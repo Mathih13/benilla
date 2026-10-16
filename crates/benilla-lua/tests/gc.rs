@@ -166,7 +166,7 @@ fn a_call_with_globals_puts_them_back() {
     let hf = vm.root(f);
     let t = vm.exec(b"return {name = 'frame'}", b"=t").unwrap()[0];
     let held = [hf, vm.root(t)];
-    let mut name = |vm: &mut benilla_lua::Vm, s: &[u8]| {
+    let name = |vm: &mut benilla_lua::Vm, s: &[u8]| {
         let v = vm.str(s);
         vm.root(v);
         v
