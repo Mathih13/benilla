@@ -218,7 +218,9 @@ pub fn fmt_g(n: f64, prec: usize) -> String {
         return (n as i64).to_string();
     }
     if n.is_nan() {
-        // The sign bit prints: x86's default NaN, from `0/0`, has it set.
+        // The sign bit prints, as glibc prints it: x86's default NaN, from `0/0`, has it set.
+        // Which NaN an operation answers is the host's; the client's MSVC text (`-1.#IND`) is
+        // later work (#1376).
         return if n.is_sign_negative() {
             "-nan".into()
         } else {

@@ -10,7 +10,9 @@ pub type R<T> = Result<T, LuaError>;
 const TWO63: f64 = (1u64 << 63) as f64;
 
 /// 5.1's `lua_number2integer` on x86-64: C's `(ptrdiff_t)` cast, `cvttsd2si`, which truncates
-/// toward zero and answers `INT64_MIN` for a NaN or an out-of-range value.
+/// toward zero and answers `INT64_MIN` for a NaN or an out-of-range value. The x86-64 Linux C
+/// build's answer on every platform (arm64 saturates). The client's MSVC x86-32 conversions are
+/// later work, as its 32-bit `strtoul` is (#1375).
 pub fn c_integer(n: f64) -> i64 {
     if n.is_nan() || !(-TWO63..TWO63).contains(&n) {
         i64::MIN

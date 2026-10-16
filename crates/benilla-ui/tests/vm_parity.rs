@@ -1,7 +1,7 @@
 //! The script host on either VM: every case runs through `UiScript`, and its answer must equal
 //! the one the C Lua build recorded in `vm_parity.golden` (`vm_parity_surface.golden` for the
-//! cases that list every global). `BENILLA_BLESS=1` rewrites both; only the C Lua build may bless
-//! them.
+//! cases that list every global). `BENILLA_BLESS=1` rewrites the answers this platform records
+//! (`PLATFORM_CASES`) and the surface file; only the C Lua build may bless them.
 
 use benilla_ui::script::UiScript;
 
@@ -773,12 +773,74 @@ fn without_mlua_wrapper(s: &str) -> String {
     out
 }
 
-/// `name\tanswer`, one case a line, the answer escaped onto one line.
-fn render(answers: &[(&str, String)]) -> String {
-    answers
-        .iter()
-        .map(|(n, a)| format!("{n}\t{}\n", a.escape_default()))
-        .collect()
+/// Cases whose answer on the C build depends on the platform's C library or compiler, so the
+/// golden file holds one answer per platform, `name@<os>-<arch>`, each blessed there:
+/// - the transcendental functions are the host libm's, rounded differently by glibc and Apple's;
+/// - a NaN prints its sign under glibc (`-nan`), never under Apple's libc, and which NaN a
+///   function answers is the host libm's;
+/// - `luaL_checknumber` on two arguments in one C call (`fmod`, `pow`, `ldexp`, `atan2`) checks
+///   them in the compiler's order: gcc on x86-64 the second first, clang on arm64 the first;
+/// - a `double` past the integer range cast to `ptrdiff_t` or `unsigned long` is undefined: x86-64
+///   answers `INT64_MIN`, arm64 saturates;
+/// - `math.random` is the host `rand`.
+///
+/// benilla-lua pins the reference platform's answers for the compiler and `rand` cases, and runs
+/// the host libm, so it answers as the C build only on the reference platform; elsewhere it skips
+/// these cases.
+const PLATFORM_CASES: &[&str] = &[
+    "fix-libs deg_rad",
+    "fix-libs random_ranges",
+    "fix-libs format_ulong",
+    "sweep string.char",
+    "sweep string.sub",
+    "sweep strsub",
+    "sweep getfenv",
+    "sweep math.mod",
+    "sweep mod",
+    "sweep math.sqrt",
+    "sweep sqrt",
+    "sweep math.log",
+    "sweep math.pow",
+    "sweep math.ldexp",
+    "sweep ldexp",
+    "sweep math.sin",
+    "sweep math.tan",
+    "sweep tan",
+    "sweep math.asin",
+    "sweep math.atan",
+    "sweep math.atan2",
+];
+
+/// The platform benilla-lua's pinned answers are the C build's on: Linux, x86-64, glibc.
+const REFERENCE_PLATFORM: &str = "linux-x86_64";
+
+fn platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The golden key a case's answer is under on `platform`: its name, or for a platform case its
+/// name and the platform.
+fn golden_key(name: &str, platform: &str) -> String {
+    if PLATFORM_CASES.contains(&name) {
+        format!("{name}@{platform}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// The golden file, `key\tanswer` a line, the answer escaped onto one line: each case in order,
+/// a platform case's answers sorted by platform.
+fn render(names: &[&str], golden: &std::collections::BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for name in names {
+        let prefix = format!("{name}@");
+        for (k, a) in golden {
+            if k == name || (PLATFORM_CASES.contains(name) && k.starts_with(&prefix)) {
+                out.push_str(&format!("{k}\t{a}\n"));
+            }
+        }
+    }
+    out
 }
 
 /// Each answer against its golden line; a difference goes into `failures`.
@@ -830,22 +892,87 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
     names.sort_unstable();
     names.dedup();
     assert_eq!(names.len(), cases.len(), "case names are unique");
-    let (surface, vm): (Vec<_>, Vec<_>) = answers
+    for p in PLATFORM_CASES {
+        assert!(names.contains(p), "platform case {p:?} is a case");
+    }
+    // The cases that list every global have a file of their own, one answer each.
+    let (surface, answers): (Vec<_>, Vec<_>) = answers
         .into_iter()
         .partition(|(name, _)| SURFACE_CASES.contains(name));
+    let names: Vec<&str> = answers.iter().map(|c| c.0).collect();
+    let platform = platform();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let golden = std::fs::read_to_string(dir.join(GOLDEN)).expect("the golden file");
+    let mut want: std::collections::BTreeMap<String, String> = golden
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(k, a)| (k.to_string(), a.to_string()))
+        .collect();
+    for k in want.keys() {
+        let (name, on) = k
+            .split_once('@')
+            .map_or((k.as_str(), false), |(n, _)| (n, true));
+        assert_eq!(
+            on,
+            PLATFORM_CASES.contains(&name),
+            "{k}: a platform case's answers are per platform, any other case's one for all"
+        );
+    }
     if std::env::var_os("BENILLA_BLESS").is_some() {
         if cfg!(feature = "benilla-vm") {
             panic!("the golden answers come from the C Lua build");
         }
-        std::fs::write(dir.join(GOLDEN), render(&vm)).expect("write the golden file");
-        std::fs::write(dir.join(SURFACE_GOLDEN), render(&surface)).expect("write the golden file");
+        // This platform's answers replace its own; another platform's stay.
+        for (name, a) in &answers {
+            want.insert(golden_key(name, &platform), a.escape_default().to_string());
+        }
+        std::fs::write(dir.join(GOLDEN), render(&names, &want)).expect("write the golden file");
+        let surface_lines: String = surface
+            .iter()
+            .map(|(n, a)| format!("{n}\t{}\n", a.escape_default()))
+            .collect();
+        std::fs::write(dir.join(SURFACE_GOLDEN), surface_lines).expect("write the golden file");
         return;
     }
     let mut failures = Vec::new();
-    for (file, answers) in [(GOLDEN, &vm), (SURFACE_GOLDEN, &surface)] {
-        let golden = std::fs::read_to_string(dir.join(file)).expect("the golden file");
-        compare(&golden, answers, &mut failures);
+    let mut skipped = Vec::new();
+    for (name, got) in &answers {
+        let got = got.escape_default().to_string();
+        let platform_case = PLATFORM_CASES.contains(name);
+        // benilla-lua answers a platform case as the C build only where its pins were taken.
+        if platform_case && cfg!(feature = "benilla-vm") && platform != REFERENCE_PLATFORM {
+            skipped.push(*name);
+            continue;
+        }
+        match want.get(&golden_key(name, &platform)) {
+            Some(w) if *w == got => {}
+            Some(w)
+                if without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string()
+                    == got => {}
+            Some(w) => {
+                let w = without_mlua_wrapper(&unescape(w))
+                    .escape_default()
+                    .to_string();
+                failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
+            }
+            // A platform case no one has blessed on this platform yet.
+            None if platform_case => skipped.push(*name),
+            None => failures.push(format!(
+                "{name}: no golden answer; bless on the C Lua build"
+            )),
+        }
+    }
+    let surface_golden =
+        std::fs::read_to_string(dir.join(SURFACE_GOLDEN)).expect("the surface golden file");
+    compare(&surface_golden, &surface, &mut failures);
+    if !skipped.is_empty() {
+        eprintln!(
+            "{} platform cases not checked on {platform}: {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
     }
     assert!(
         failures.is_empty(),
