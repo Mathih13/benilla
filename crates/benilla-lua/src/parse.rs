@@ -1038,7 +1038,9 @@ impl<'a> Parser<'a> {
         Ok((n, v))
     }
 
-    fn funcargs(&mut self, f: &mut Exp) -> R<()> {
+    /// `funcargs`; `callee` is the name the call was made through (`SetScript` in
+    /// `f:SetScript(...)`), which names a function literal among the arguments.
+    fn funcargs(&mut self, f: &mut Exp, callee: Option<&[u8]>) -> R<()> {
         let line = self.lx.line;
         let mut args = match self.tok() {
             Tok::Char(b'(') => {
@@ -1051,7 +1053,7 @@ impl<'a> Parser<'a> {
                 let args = if self.tok() == Tok::Char(b')') {
                     Exp::new(Kind::Void)
                 } else {
-                    let (_, args) = self.explist1()?;
+                    let args = self.call_args(callee)?;
                     self.setmultret(&args);
                     args
                 };
@@ -1084,6 +1086,37 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `explist1` for a call's arguments. A function literal among them is named, for its
+    /// hot-reload key, after the callee and the first string argument before it:
+    /// `f:SetScript("OnShow", function ... end)` is `SetScript:OnShow`, so deleting one handler
+    /// and adding another cannot hand the survivor's closure the newcomer's code, as positional
+    /// `anon`, `anon#2` keys would.
+    fn call_args(&mut self, callee: Option<&[u8]>) -> R<Exp> {
+        let mut tag: Option<Vec<u8>> = None;
+        loop {
+            if let (Some(c), Tok::Function) = (callee, self.tok()) {
+                let mut h = c.to_vec();
+                if let Some(t) = &tag {
+                    h.push(b':');
+                    // `/` and `#` structure keys.
+                    h.extend(
+                        t.iter()
+                            .map(|&b| if b == b'/' || b == b'#' { b'_' } else { b }),
+                    );
+                }
+                self.name_hint = Some(h);
+            }
+            if tag.is_none() && self.tok() == Tok::String {
+                tag = Some(self.lx.cur.bytes.clone());
+            }
+            let mut v = self.expr()?;
+            if !self.testnext(Tok::Char(b','))? {
+                return Ok(v);
+            }
+            self.exp2nextreg(&mut v)?;
+        }
+    }
+
     fn prefixexp(&mut self) -> R<Exp> {
         match self.tok() {
             Tok::Char(b'(') => {
@@ -1106,11 +1139,13 @@ impl<'a> Parser<'a> {
 
     /// [`Self::primaryexp`], and with `want` its name when it is a name and fields: `t.a.b`.
     fn primaryexp_named(&mut self, want: bool) -> R<(Exp, Option<Vec<u8>>)> {
-        let (mut v, mut name) = if want && self.tok() == Tok::Name {
+        // `last` is the name the value was last reached by, which names a call's function
+        // literals.
+        let (mut v, mut name, mut last) = if self.tok() == Tok::Name {
             let (v, n) = self.singlevar()?;
-            (v, Some(n.to_vec()))
+            (v, want.then(|| n.to_vec()), Some(n))
         } else {
-            (self.prefixexp()?, None)
+            (self.prefixexp()?, None, None)
         };
         loop {
             match self.tok() {
@@ -1120,22 +1155,27 @@ impl<'a> Parser<'a> {
                         n.push(b'.');
                         n.extend_from_slice(field);
                     }
+                    last = Some(field);
                     continue;
                 }
                 Tok::Char(b'[') => {
                     self.exp2anyreg(&mut v)?;
                     let mut key = self.yindex()?;
                     self.indexed(&mut v, &mut key)?;
+                    last = None;
                 }
                 Tok::Char(b':') => {
                     self.next()?;
-                    let mut key = self.checkname()?;
+                    let method = self.str_checkname()?;
+                    let mut key = Exp::new(Kind::K(self.string_k(method)?));
                     self.self_(&mut v, &mut key)?;
-                    self.funcargs(&mut v)?;
+                    self.funcargs(&mut v, Some(method))?;
+                    last = None;
                 }
                 Tok::Char(b'(') | Tok::String | Tok::Char(b'{') => {
                     self.exp2nextreg(&mut v)?;
-                    self.funcargs(&mut v)?;
+                    self.funcargs(&mut v, last)?;
+                    last = None;
                 }
                 _ => return Ok((v, name)),
             }

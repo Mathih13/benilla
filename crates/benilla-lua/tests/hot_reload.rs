@@ -301,7 +301,8 @@ fn numbered_keys_whose_count_changed_stay_on_the_old_code() {
         "return L[1]() .. ',' .. L[2]()",
     );
     assert_eq!((before.as_str(), after.as_str()), ("1,2", "1,2"));
-    assert_eq!(report.reshaped, ["anon", "anon#2"]);
+    // Named after the call, `table.insert`, and numbered by position.
+    assert_eq!(report.reshaped, ["insert", "insert#2"]);
     assert!(report.swapped.is_empty(), "{report:#?}");
 }
 
@@ -326,4 +327,35 @@ fn a_function_without_a_live_closure_is_not_added() {
     let (_, _, _, report) = three(v, "", v, "return F()");
     assert!(report.added.is_empty(), "{report:#?}");
     assert_eq!(report.swapped, ["F"]);
+}
+
+/// Handlers set through a call are told apart by the call: deleting `OnShow`'s and adding
+/// `OnEvent`'s leaves `OnHide`'s closure on `OnHide`'s code, where positional keys would have
+/// handed it the newcomer's.
+#[test]
+fn handlers_set_through_a_call_keep_their_own_code() {
+    const H1: &str = r#"
+F = {}
+function F:SetScript(name, fn) self[name] = fn end
+F:SetScript("OnShow", function() return "show" end)
+F:SetScript("OnHide", function() return "hide" end)
+"#;
+    const H2: &str = r#"
+F = {}
+function F:SetScript(name, fn) self[name] = fn end
+F:SetScript("OnHide", function() return "hide v2" end)
+F:SetScript("OnEvent", function() return "event" end)
+"#;
+    let mut vm = benilla_lua::new_state();
+    vm.exec(H1.as_bytes(), NAME).unwrap();
+    let r = vm.hot_reload(NAME, H2.as_bytes()).unwrap();
+    assert_eq!(run(&mut vm, "return F.OnHide()"), "hide v2");
+    assert_eq!(
+        run(&mut vm, "return F.OnShow()"),
+        "show",
+        "a removed handler keeps its code"
+    );
+    assert_eq!(r.swapped, ["F:SetScript", "SetScript:OnHide"]);
+    assert_eq!(r.removed, ["SetScript:OnShow"]);
+    assert_eq!(r.added, ["SetScript:OnEvent"]);
 }
