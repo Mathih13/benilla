@@ -1423,7 +1423,7 @@ impl String {
     fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         // SAFETY: as `RefH::get`; `f` holds nothing that reaches the VM.
         let vm = unsafe { &*self.0.vm() };
-        let s = vm.rooted(self.0.id).as_str().expect("a string handle");
+        let s = self.0.get().as_str().expect("a string handle");
         f(vm.heap.str(s))
     }
 

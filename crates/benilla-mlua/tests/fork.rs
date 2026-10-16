@@ -63,3 +63,37 @@ fn a_handle_made_after_the_fork_is_foreign_to_it() {
         "false Lua instance passed Value created from a different main Lua state"
     );
 }
+
+/// A string handle is checked as a table handle is: made after the fork, it names nothing in the
+/// fork, even where the fork has since rooted a string of its own under the same slot.
+#[test]
+fn a_string_made_after_the_fork_is_foreign_to_it() {
+    use benilla_mlua::String as LuaString;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let lua = Lua::new();
+    let slot: Rc<RefCell<Option<LuaString>>> = Default::default();
+    let held = slot.clone();
+    let read = lua
+        .create_function(move |_, ()| {
+            let s = held.borrow().clone().expect("set before the call");
+            Ok(s.to_str()?.to_string())
+        })
+        .unwrap();
+    lua.globals().set("read", read).unwrap();
+    let fork = lua.fork();
+    let _fork_own = fork.create_string("FORK0").unwrap();
+    *slot.borrow_mut() = Some(lua.create_string("TEMPLATE").unwrap());
+    assert_eq!(
+        lua.load("return read()").eval::<String>().unwrap(),
+        "TEMPLATE"
+    );
+    let r: String = fork
+        .load("local ok, e = pcall(read) return tostring(ok) .. ' ' .. tostring(e)")
+        .eval()
+        .unwrap();
+    assert_eq!(
+        r,
+        "false Lua instance passed Value created from a different main Lua state"
+    );
+}
