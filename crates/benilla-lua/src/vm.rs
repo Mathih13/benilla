@@ -300,30 +300,33 @@ pub struct Hook {
 #[derive(Clone, Debug, Default)]
 pub struct Profile {
     pub ns: Vec<u64>,
-    /// Segments charged: calls into and returns to each chunk, and its loop iterations.
-    pub segments: Vec<u64>,
     last: Option<(std::time::Instant, u32)>,
 }
 
 impl Profile {
-    fn mark(&mut self, now: std::time::Instant, source: u32) {
+    /// `source` runs from now: the running segment is charged to its chunk. A call or return
+    /// within one chunk reads no clock, so the profile costs what crossing chunks costs.
+    fn mark(&mut self, source: u32) {
+        if self.last.is_some_and(|(_, s)| s == source) {
+            return;
+        }
+        self.charge(std::time::Instant::now(), Some(source));
+    }
+
+    fn charge(&mut self, now: std::time::Instant, next: Option<u32>) {
         if let Some((t, s)) = self.last {
             let s = s as usize;
             if self.ns.len() <= s {
                 self.ns.resize(s + 1, 0);
-                self.segments.resize(s + 1, 0);
             }
             self.ns[s] += now.duration_since(t).as_nanos() as u64;
-            self.segments[s] += 1;
         }
-        self.last = Some((now, source));
+        self.last = next.map(|n| (now, n));
     }
 
     /// Close the running segment: execution left Lua.
     fn close(&mut self) {
-        let now = std::time::Instant::now();
-        self.mark(now, 0);
-        self.last = None;
+        self.charge(std::time::Instant::now(), None);
     }
 }
 
@@ -1729,7 +1732,7 @@ impl Vm {
     fn prof_switch(&mut self) {
         let src = self.heap.cur_source;
         if let Some(p) = self.profile.as_mut() {
-            p.mark(std::time::Instant::now(), src);
+            p.mark(src);
         }
     }
 
@@ -1737,10 +1740,6 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn hook_count(&mut self, n: u64) -> Result<(), LuaError> {
-        let src = self.heap.cur_source;
-        if let Some(p) = self.profile.as_mut() {
-            p.mark(std::time::Instant::now(), src);
-        }
         if self.in_hook {
             return Ok(());
         }
