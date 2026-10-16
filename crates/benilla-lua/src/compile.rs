@@ -326,8 +326,13 @@ impl FuncState {
             .code
             .iter()
             .any(|op| matches!(op, Op::TestSet(NO_REG, ..))));
+        let uncounted = (0..self.code.len())
+            .filter(|&i| self.cpc.get(i + 1).copied().unwrap_or(self.cpc_next) == self.cpc[i])
+            .map(|i| i as u32)
+            .collect();
         Proto {
             code: self.code,
+            uncounted,
             lines: self.lines,
             consts: self.consts,
             protos: self.protos,

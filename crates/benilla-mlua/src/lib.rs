@@ -729,7 +729,9 @@ impl Lua {
         Some(f(&Debug { info, lua: self }))
     }
 
-    /// Run `callback` about every `triggers.every_nth_instruction` instructions.
+    /// Run `callback` once for every `triggers.every_nth_instruction` instructions, counted as
+    /// 5.1 counts them, at the next loop back edge, call or return rather than the exact
+    /// instruction (`benilla_lua::vm::Hook`).
     pub fn set_hook<F>(&self, triggers: HookTriggers, callback: F) -> Result<()>
     where
         F: Fn(&Lua, &Debug) -> Result<VmState> + 'static,

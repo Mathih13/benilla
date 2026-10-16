@@ -327,6 +327,10 @@ pub struct Proto {
     pub source: Bytes,
     pub line_defined: u32,
     pub locvars: Vec<LocVar>,
+    /// The instructions 5.1 has no word for, ascending: the jump a skipping `LOADBOOL` makes, a
+    /// `LOADNIL` at the head that `luaD_precall`'s clearing stands for, a constant loaded into a
+    /// scratch register. The count hook does not count them, as 5.1 never dispatches them.
+    pub uncounted: Box<[u32]>,
     /// The function's identity within its chunk, stable across edits that leave its name and
     /// nesting alone. A function is named as written (`Frame:OnEvent`, `Frame.Init`,
     /// `local helper`), or after the single target it is assigned to (`H.OnShow = function`,

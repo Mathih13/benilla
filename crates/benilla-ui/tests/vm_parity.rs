@@ -575,7 +575,13 @@ b]])"#),
         local B = ' for k in it, "s", "c", 1, 2, 3, 4, 5, 6 do local x1, x2, x3, x4, x5, x6, x7, x8, x9 '
           .. 'table.insert(o, T(x1)..T(x2)..T(x3)..T(x4)..T(x5)..T(x6)..T(x7)..T(x8)..T(x9)) end return table.concat(o, " ")'
         local I = 'local function it(s, c) n = n + 1 if n > 3 then return nil end if n == 1 then '
-        return S(R(P .. I .. 'local a, b, c2, d = "A", "B", "C", "D" end return n end' .. B),
+        -- First, as no other runs before it: the chunk calling the leaky function is in the VM's
+        -- fast loop until then, and `g`'s frame, entered from the leaky function, clears `w`'s.
+        return S(R(P .. 'local function it(s, c) n = n + 1 if n > 2 then return nil end return n end '
+            .. 'local function w() local a, b, c, d, e, f, g, h, i, j, k, l = "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" end '
+            .. 'local function g(x) if x then local a, b, c, d, e, f, h, i, j, k, l = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 end end '
+            .. 'local function leaky() w() g(false)' .. B .. ' end local r = leaky() return r'),
+          R(P .. I .. 'local a, b, c2, d = "A", "B", "C", "D" end return n end' .. B),
           R(P .. 'local function deep(m) if m > 0 then return deep(m - 1) end local a, b, c, d, e = "P", "Q", "R", "S", "T" end '
             .. I .. 'local function g() local a, b, c2, d, e, f = "A", "B", "C", "D", "E", "F" end g() deep(2) end return n end' .. B),
           R(P .. 'local function two(a, b) local x, y = "X", "Y" end ' .. I .. 'two(1, 2, 3, 4, 5, 6, 7) end return n end' .. B),

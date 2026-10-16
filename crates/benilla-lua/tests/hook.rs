@@ -169,3 +169,123 @@ fn the_hook_counts_every_instruction_lua_runs() {
         }
     }
 }
+
+/// A hook set by host code while Lua runs counts from the next loop back edge or call, as the
+/// C build's counts from the next instruction: past the few instructions in between, the same.
+#[test]
+fn a_hook_set_while_lua_runs_counts_from_there() {
+    // The second runs in the VM's slow loop throughout: its generic `for` reads registers it
+    // has not written.
+    for src in [
+        "local s = 0 arm() for i = 1, 200 do if i > 100 then s = s + i else s = s - 1 end end \
+         local function f(x) return x end arm() for i = 1, 100 do f(i) end",
+        "for k in next, {1, 2}, nil, 1 do end local function g() local a = 1 end g() \
+         local s = 0 arm() for i = 1, 200 do if i > 100 then s = s + i else s = s - 1 end end \
+         local function f(x) return x end arm() for i = 1, 100 do f(i) end",
+    ] {
+        counts_from_the_arming(src);
+    }
+}
+
+fn counts_from_the_arming(src: &str) {
+    let ours = {
+        let mut vm = benilla_lua::new_state();
+        let n = Rc::new(Cell::new(0u64));
+        let seen = n.clone();
+        let arm = vm.new_host(
+            "arm",
+            Rc::new(move |vm: &mut Vm, _| {
+                let seen = seen.clone();
+                vm.set_hook(
+                    1,
+                    Rc::new(move |_: &mut Vm| {
+                        seen.set(seen.get() + 1);
+                        Ok(())
+                    }),
+                );
+                Ok(0)
+            }),
+        );
+        vm.set_global("arm", arm);
+        let r = run(&mut vm, src);
+        assert!(!r.starts_with("<raised>"), "{r}");
+        n.get()
+    };
+    let c = {
+        let lua = mlua::Lua::new();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen = n.clone();
+        let arm = lua
+            .create_function(move |lua, ()| {
+                let seen = seen.clone();
+                lua.set_hook(
+                    mlua::HookTriggers {
+                        every_nth_instruction: Some(1),
+                        ..Default::default()
+                    },
+                    move |_, _| {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Ok(mlua::VmState::Continue)
+                    },
+                )
+            })
+            .unwrap();
+        lua.globals().set("arm", arm).unwrap();
+        lua.load(src).exec().unwrap();
+        n.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    assert!(
+        ours <= c && c - ours <= 10,
+        "{src}: ours {ours}, the C build's {c}"
+    );
+}
+
+/// What the C build's count hook counts for `src`, run at every instruction.
+fn c_instructions(src: &str) -> u64 {
+    let lua = mlua::Lua::new();
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seen = n.clone();
+    lua.set_hook(
+        mlua::HookTriggers {
+            every_nth_instruction: Some(1),
+            ..Default::default()
+        },
+        move |_, _| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(mlua::VmState::Continue)
+        },
+    )
+    .unwrap();
+    lua.load(src).exec().unwrap();
+    n.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The count at every instruction is the C build's: an instruction 5.1 never dispatches is not
+/// counted (the jump a skipping `LOADBOOL` makes, the `LOADNIL` its frame clearing stands for, a
+/// constant loaded into a scratch register), whichever way the code branches.
+#[test]
+fn the_count_is_the_c_builds() {
+    for src in [
+        "local x, y = 1, 2 local b = x < y",
+        "local x, y = 2, 1 local b = x < y",
+        "local x, y = 1, 2 for i = 1, 10 do local b = x < y local c = y < x end",
+        "table.sort({5, 3, 1, 4, 2, 9, 7}, function(a, b) return a < b end)",
+        "local function f() local a, b return a end for i = 1, 10 do f() end",
+        "local b = 'a' < 'b'",
+        "local x = 'a' .. 'b'",
+        "local x = 1 local y = x == 1",
+        "local t = {1, 2, 3} for k, v in pairs(t) do end",
+        "local t = {1, 2, 3} for k in next, t do end",
+        "local function it(s, c) if c < 5 then return c + 1 end end for i in it, nil, 0 do end",
+        "local t = {} for i = 1, 5 do t[i] = i end local s = 0 for i = 5, 1, -1 do s = s + t[i] end",
+        "local a = nil local b = a and 1 or 2 local c = a or 3 local d = not a",
+        "local function f(...) return arg.n end f(1, 2, 3)",
+        "local t = {1, 2, 3, x = 1, y = 2}",
+        "local x = 0 while x < 5 do x = x + 1 end repeat x = x - 1 until x == 0",
+        "local n = 0 for i = 1, 20 do if math.mod(i, 3) == 0 then n = n + 1 elseif i > 10 then n = n - 1 else n = n * 2 end end",
+        "string.gsub('abcabc', 'b', function(c) return c == 'b' and 'x' or c end)",
+        "local t = setmetatable({}, {__index = function(t, k) return k > 2 end}) for i = 1, 5 do local _ = t[i] end",
+    ] {
+        assert_eq!(instructions(src), c_instructions(src), "{src}");
+    }
+}

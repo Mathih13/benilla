@@ -292,11 +292,12 @@ impl Clone for Roots {
 /// The host's hook body; an error it answers is raised where the hook ran.
 pub type HookFn = Rc<dyn Fn(&mut Vm) -> Result<(), LuaError>>;
 
-/// A host hook run every `step` instructions, as 5.1's `LUA_MASKCOUNT` runs one, in every Lua
-/// frame (Lua a library function or a metamethod calls included). The instructions are charged
-/// where a loop jumps back, a call starts and a function returns, the places a non-terminating
-/// script must pass, each charge the instructions run since the last; so the dispatch loop pays
-/// nothing for it until one is set.
+/// A host hook run once for every `step` instructions Lua runs, counted as 5.1's
+/// `LUA_MASKCOUNT` counts them: each instruction 5.1 dispatches, in every Lua frame (Lua a
+/// library function or a metamethod calls included). It does not run at the instruction that
+/// completes a step, as 5.1's does, but at the next loop back edge, call or return, once for each
+/// step completed since. A non-terminating script passes those, so a budget still stops it, and
+/// the dispatch loop pays nothing for the count until a hook is set.
 #[derive(Clone)]
 pub struct Hook {
     pub step: u64,
@@ -1798,6 +1799,8 @@ impl Vm {
 
     // ── the hook ─────────────────────────────────────────────────────────────────────────────
 
+    /// Run `f` once for every `step` instructions, at the next back edge, call or return
+    /// ([`Hook`]).
     pub fn set_hook(&mut self, step: u64, f: HookFn) {
         self.hook = Some(Hook {
             step: step.max(1),
@@ -1829,6 +1832,15 @@ impl Vm {
         let src = self.heap.cur_source;
         if let Some(p) = self.profile.as_mut() {
             p.mark(src);
+        }
+    }
+
+    /// `n` more instructions ran, counted toward the hook's next run without running it.
+    #[cold]
+    #[inline(never)]
+    fn hook_add(&mut self, n: u64) {
+        if let Some(h) = self.hook.as_mut().filter(|_| !self.in_hook) {
+            h.counted += n;
         }
     }
 
@@ -2110,35 +2122,73 @@ impl Vm {
 
     // ── the interpreter ──────────────────────────────────────────────────────────────────────
 
-    /// Run the top Lua frame until the frame that entered with `boundary` returns.
+    /// Run the top Lua frame until the frame that entered with `boundary` returns. The dispatch
+    /// loop has two instantiations: the fast one while no hook or profile is on and no running
+    /// function can read a register it has not written (`clear_below`), the slow one, which counts
+    /// for the hook and clears frames as `luaD_precall`, otherwise. A hook set while the fast
+    /// one runs moves it to the slow one at the next call or loop back edge, a function that
+    /// needs its frames cleared as it is entered.
+    fn execute(&mut self) -> Result<(), LuaError> {
+        loop {
+            let done = if self.hooked || self.clear_below != 0 {
+                self.run::<true>()?
+            } else {
+                self.run::<false>()?
+            };
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
+    /// [`Vm::execute`]'s dispatch loop: `true` when the frame that entered with `boundary` has
+    /// returned, `false` to go on in the other instantiation from the top frame's saved place.
     ///
     /// The register file is addressed through `regs`, a raw pointer to `stack[base]`, as C Lua
     /// keeps `base` in a register. Anything that can grow the stack (a call, a metamethod, an
     /// upvalue that touches the stack) is followed by `refresh!`, which recomputes it.
     // `fr!` carries its own `unsafe`, nested in others at some uses.
     #[allow(unused_unsafe)]
-    fn execute(&mut self) -> Result<(), LuaError> {
+    #[inline(never)]
+    fn run<const SLOW: bool>(&mut self) -> Result<bool, LuaError> {
         // The running frame's state, kept in locals as C Lua's `luaV_execute` keeps it. A Lua
         // call sets it straight from the callee; a return reloads it from the caller's frame.
         // Only the three values every instruction touches live in locals; the rest of the
         // running frame is read from it (`fr!`), so they keep their registers.
-        let mut ip: *const Op;
+        let mut ip: *const Op = std::ptr::null();
         let mut k: *const Value;
         let mut regs: *mut Value;
-        // Where the running frame's current straight run of instructions began: the budget
-        // hook charges `ip - seg` at a back edge, a call and a return, and a forward jump moves
-        // both, so the charge is the instructions executed.
-        let mut seg: *const Op;
+        // While a hook is set, where the current straight run of instructions began, in
+        // `seg_code`'s code: the run is charged at a back edge, a forward jump, a call and a
+        // return (here, as the caller's frame is entered again), so each charge is the
+        // instructions executed.
+        let mut seg: *const Op = std::ptr::null();
+        let mut seg_code: *const Proto = std::ptr::null();
         'frame: loop {
             {
+                if SLOW && self.hooked && !seg.is_null() && seg != ip {
+                    // The last run of the frame returned from; a call's run is charged already.
+                    // SAFETY: the returned function's code is alive: its closure is unreachable
+                    // at most since the return, and nothing has collected since.
+                    let n = ran_since(seg, ip, unsafe { &*seg_code });
+                    if n > 0 {
+                        self.hook_count(n)?;
+                    }
+                }
                 let frame = self.frames.last().expect("a Lua frame");
                 let base = frame.base();
                 ip = frame.ip;
-                seg = ip;
                 k = frame.consts;
                 self.heap.cur_source = frame.source;
-                if self.hooked {
-                    self.prof_switch();
+                if SLOW {
+                    if self.hooked {
+                        seg = ip;
+                        seg_code = frame.proto;
+                        self.prof_switch();
+                    } else {
+                        // No run to keep: a hook set later starts from its first charge.
+                        seg = std::ptr::null();
+                    }
                 }
                 // SAFETY: `precall` grew the stack to cover `base + maxstack`, and the stack never
                 // shrinks.
@@ -2298,38 +2348,70 @@ impl Vm {
                     }
                 }};
             }
-            /// The instructions run since `seg`, the one just fetched included, for the hook.
+            /// The instructions run since `seg`, the one just fetched included, for the hook; one
+            /// when the hook was set during this frame's run.
             macro_rules! ran {
                 () => {
-                    // SAFETY: a live Lua frame's code is alive (see `Frame::proto`).
-                    ran_since(seg, ip, unsafe { &*fr!().proto })
+                    if seg.is_null() {
+                        1
+                    } else {
+                        // SAFETY: `seg_code` is the code of the frame that set `seg`: this one,
+                        // or one that returned since with nothing collected in between; a frame
+                        // entered with no hook set clears `seg`.
+                        ran_since(seg, ip, unsafe { &*seg_code })
+                    }
                 };
+            }
+            /// A run starts here, in the running frame's code.
+            macro_rules! mark {
+                () => {{
+                    seg = ip;
+                    seg_code = fr!().proto;
+                }};
+            }
+            /// A jump forward: the run so far is counted when a hook is set, so a run holds only
+            /// what ran ([`Proto::uncounted`] is found in it), and the hook waits for the next
+            /// back edge, call or return.
+            macro_rules! skip {
+                ($off:expr) => {{
+                    let off = $off as isize;
+                    if SLOW && self.hooked {
+                        let n = ran!();
+                        // SAFETY: the compiler's jumps land inside the function.
+                        ip = unsafe { ip.offset(off) };
+                        mark!();
+                        self.hook_add(n);
+                    } else {
+                        // SAFETY: as above.
+                        ip = unsafe { ip.offset(off) };
+                    }
+                }};
             }
             macro_rules! jump {
                 ($off:expr) => {{
                     let off = $off as isize;
                     if off < 0 && self.hooked {
+                        if !SLOW {
+                            // A hook was set: the slow loop goes on from the loop's head.
+                            // SAFETY: as `skip!`.
+                            ip = unsafe { ip.offset(off) };
+                            save!();
+                            return Ok(false);
+                        }
                         // A loop's back edge: the place a loop is charged.
                         let n = ran!();
                         // SAFETY: `Proto::verify` checked that every jump lands inside the code.
                         ip = unsafe { ip.offset(off) };
-                        seg = ip;
+                        mark!();
                         slow!(self.hook_count(n))?;
                     } else {
-                        // SAFETY: as above.
-                        ip = unsafe { ip.offset(off) };
-                        seg = seg.wrapping_offset(off);
+                        skip!(off);
                     }
                 }};
             }
             /// 5.0's `OP_RETURN`: `n` values from `R(a)` to the caller's frame.
             macro_rules! ret {
                 ($a:expr, $n:expr) => {{
-                    // The frame's last run is charged; the caller's starts where it resumes.
-                    if self.hooked {
-                        let n = ran!();
-                        slow!(self.hook_count(n))?;
-                    }
                     let a = $a;
                     let n: usize = $n;
                     let fi = self.frames.len() - 1;
@@ -2363,7 +2445,12 @@ impl Vm {
                         if nresults == 1 && n >= 1 {
                             self.top = func_idx + 1;
                         }
-                        return Ok(());
+                        // The frame's last run; a return into Lua charges it as it re-enters.
+                        if SLOW && self.hooked {
+                            let n = ran!();
+                            self.hook_count(n)?;
+                        }
+                        return Ok(true);
                     }
                     // Back in the calling Lua frame: a fixed result count restores its top.
                     let caller = self.frames.last().unwrap();
@@ -2685,9 +2772,8 @@ impl Vm {
                         let v = r!(b);
                         if v.truthy() == cond {
                             r!(a) = v;
-                            // SAFETY: as `jump!`; a value's test jumps forward, never a back edge.
-                            ip = unsafe { ip.offset(off as isize) };
-                            seg = seg.wrapping_offset(off as isize);
+                            // A value's test jumps forward, never a back edge.
+                            skip!(off);
                         }
                     }
                     Op::Call(a, b, c) => {
@@ -2699,8 +2785,13 @@ impl Vm {
                         };
                         save!();
                         if self.hooked {
+                            if !SLOW {
+                                // A hook was set: the slow loop makes this call.
+                                fr_mut!().ip = unsafe { ip.sub(1) };
+                                return Ok(false);
+                            }
                             let n = ran!();
-                            seg = ip;
+                            mark!();
                             slow!(self.hook_count(n))?;
                         }
                         // A Lua function without `...`: the frame is pushed here, as C Lua's
@@ -2717,7 +2808,6 @@ impl Vm {
                                 // frame list.
                                 if !shape.precall && self.frames.len() < self.ci_limit {
                                     let np = shape.nparams as usize;
-                                    let cmax = shape.c_maxstack as usize;
                                     let consts = shape.consts;
                                     let nbase = func_idx + 1;
                                     let ftop = nbase + shape.maxstack as usize;
@@ -2737,8 +2827,10 @@ impl Vm {
                                         boundary: false,
                                     };
                                     self.ensure(ftop + 1);
-                                    if nbase < self.clear_below {
+                                    if SLOW && nbase < self.clear_below {
                                         // As `precall`: every register past the arguments.
+                                        // SAFETY: the closure being called holds its code.
+                                        let cmax = unsafe { &*frame.proto }.c_maxstack as usize;
                                         for v in
                                             &mut self.stack[nbase + nargs.min(np)..nbase + cmax]
                                         {
@@ -2754,11 +2846,16 @@ impl Vm {
                                     // Enter the callee from what is in hand, not from the
                                     // frame just written.
                                     ip = frame.ip;
-                                    seg = ip;
                                     k = consts;
                                     self.heap.cur_source = frame.source;
-                                    if self.hooked {
-                                        self.prof_switch();
+                                    if SLOW {
+                                        if self.hooked {
+                                            seg = ip;
+                                            seg_code = frame.proto;
+                                            self.prof_switch();
+                                        } else {
+                                            seg = std::ptr::null();
+                                        }
                                     }
                                     refresh!();
                                     continue;
@@ -2775,6 +2872,8 @@ impl Vm {
                             }
                         }
                         match self.precall(func_idx, nargs, c as i32 - 1)? {
+                            // A function that needs its frames cleared runs in the slow loop.
+                            Called::Lua if !SLOW && self.clear_below != 0 => return Ok(false),
                             Called::Lua => continue 'frame,
                             Called::Done => {
                                 refresh!();
@@ -2796,8 +2895,13 @@ impl Vm {
                         // A call like any other for the budget: a tail-recursive loop passes
                         // no back edge and no `Call`.
                         if self.hooked {
+                            if !SLOW {
+                                // A hook was set: the slow loop makes this call.
+                                fr_mut!().ip = unsafe { ip.sub(1) };
+                                return Ok(false);
+                            }
                             let n = ran!();
-                            seg = ip;
+                            mark!();
                             slow!(self.hook_count(n))?;
                         }
                         // 5.1's `OP_TAILCALL` resolves `__call` first, so a callable table's
@@ -2812,6 +2916,7 @@ impl Vm {
                         );
                         if !is_lua {
                             match self.precall(func_idx, nargs, -1)? {
+                                Called::Lua if !SLOW && self.clear_below != 0 => return Ok(false),
                                 Called::Lua => continue 'frame,
                                 Called::Done => {
                                     refresh!();
@@ -2828,7 +2933,7 @@ impl Vm {
                         let b0 = base!();
                         self.close_upvals(b0);
                         let dest = fr!().func_idx();
-                        if dest < self.clear_below {
+                        if SLOW && dest < self.clear_below {
                             // `OP_TAILCALL`'s order, where code may read what it leaves: the
                             // callee's frame is made where its function sits, registers cleared,
                             // then moved down whole over this one, and the place it was made
@@ -2861,6 +2966,9 @@ impl Vm {
                                 // tail calls cannot overflow, a count no traceback reaches.
                                 f.tailcalls = me.tailcalls.saturating_add(1);
                                 f.boundary = me.boundary;
+                                if !SLOW && self.clear_below != 0 {
+                                    return Ok(false);
+                                }
                                 continue 'frame;
                             }
                             Ok(Called::Done) => unreachable!("a Lua callee"),
@@ -2906,11 +3014,13 @@ impl Vm {
                         );
                         let idx = idx + step;
                         if idx <= limit {
-                            jump!(off);
-                            // Canonical numbers in, a canonical number out.
+                            // Canonical numbers in, a canonical number out; written before
+                            // the jump, as `OP_FORLOOP` writes them, so a jump that leaves this
+                            // loop (to the slow one) finds them.
                             let v = Value::num_raw(idx);
                             r!(a) = v;
                             r!(a + 3) = v;
+                            jump!(off);
                         }
                     }
                     Op::ForLoop(a, off) => {
@@ -2925,11 +3035,13 @@ impl Vm {
                         } else {
                             limit <= idx
                         } {
-                            jump!(off);
-                            // Canonical numbers in, a canonical number out.
+                            // Canonical numbers in, a canonical number out; written before
+                            // the jump, as `OP_FORLOOP` writes them, so a jump that leaves this
+                            // loop (to the slow one) finds them.
                             let v = Value::num_raw(idx);
                             r!(a) = v;
                             r!(a + 3) = v;
+                            jump!(off);
                         }
                     }
                     // The client's `TFORPREP` (`0x6f94a2`): a table generator becomes the raw
@@ -2982,8 +3094,7 @@ impl Vm {
                                         }
                                     }
                                     if k.is_nil() {
-                                        ip = unsafe { ip.add(1) };
-                                        seg = seg.wrapping_add(1);
+                                        skip!(1);
                                     } else {
                                         r!(a + 2) = k;
                                         // SAFETY: a `TForLoop` is always followed by its `Jmp`.
@@ -3005,8 +3116,7 @@ impl Vm {
                         slow!(self.call_at(call_at, 2, nv as i32))?;
                         self.top = base!() + maxstack!();
                         if r!(cb).is_nil() {
-                            ip = unsafe { ip.add(1) };
-                            seg = seg.wrapping_add(1);
+                            skip!(1);
                         } else {
                             r!(a + 2) = r!(cb);
                             // SAFETY: a `TForLoop` is always followed by its `Jmp`.
@@ -3080,8 +3190,9 @@ impl Vm {
     }
 }
 
-/// The instructions from `seg` to `ip` in `p`'s code, for the budget hook; 1 for a run that
-/// started before the hook was set, whose start the VM did not keep.
+/// The instructions 5.1 runs from `seg` to `ip` in `p`'s code, for the budget hook
+/// ([`Proto::uncounted`] left out); 1 for a run that started before the hook was set, whose
+/// start the VM did not keep.
 #[cold]
 fn ran_since(seg: *const Op, ip: *const Op, p: &Proto) -> u64 {
     let code = p.code.as_ptr_range();
@@ -3089,7 +3200,18 @@ fn ran_since(seg: *const Op, ip: *const Op, p: &Proto) -> u64 {
     if s < code.start as usize || s > i || i > code.end as usize {
         return 1;
     }
-    ((i - s) / std::mem::size_of::<Op>()) as u64
+    let size = std::mem::size_of::<Op>();
+    let (s, i) = (
+        (s - code.start as usize) / size,
+        (i - code.start as usize) / size,
+    );
+    let free = if p.uncounted.is_empty() {
+        0
+    } else {
+        let at = |pc: usize| p.uncounted.partition_point(|&u| (u as usize) < pc);
+        at(i) - at(s)
+    };
+    (i - s - free) as u64
 }
 
 /// 5.1's `getobjname` over a prototype: a local's name, else what a symbolic run from the start
