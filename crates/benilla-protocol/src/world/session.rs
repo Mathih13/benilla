@@ -18,15 +18,6 @@ const HANDSHAKE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// waits forever; a bound tells a server that died mid-queue from a long wait.
 const QUEUE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// The server requires Warden. Deviation: benilla cannot answer it. The answers come from a module,
-/// native Win32 x86 code the server sends, which the client maps, links and runs in its own
-/// process (`0x7a79d0`); the client itself parses none of the payload (`0x6ca5c0`). benilla runs no
-/// such code on any platform, so it has nothing that could answer. vmangos ships Warden off
-/// (`Warden.WinEnabled`, `Warden.OSXEnabled`) and kicks a client that leaves a request unanswered
-/// for 30 s (`Warden.cpp`), so the connect refuses rather than log in to be kicked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WardenRequired;
-
 /// The world server refused the session. Its code is from `messages`' `AUTH_*` block, not
 /// [`crate::AuthReject`]'s, whose numbers overlap with unrelated meanings.
 #[derive(Debug, Clone, Copy)]
@@ -46,17 +37,6 @@ impl std::fmt::Display for WorldAuthReject {
 
 impl std::error::Error for WorldAuthReject {}
 
-impl std::fmt::Display for WardenRequired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "this server requires the Warden anticheat, which benilla does not implement"
-        )
-    }
-}
-
-impl std::error::Error for WardenRequired {}
-
 /// An authenticated world-server session with 1.12 header obfuscation active.
 pub struct WorldSession {
     stream: TcpStream,
@@ -75,15 +55,18 @@ pub struct WorldSession {
 pub(super) struct LinkFacts {
     /// Roster guid to race, so [`WorldSession::player_login`] can pick the chat language.
     roster_races: std::collections::HashMap<u64, u8>,
-    /// The rested billing minutes the admitting `SMSG_AUTH_RESPONSE` carried. Deviation: `0` when
-    /// the body is too short, where the reference leaves its global as it was; this field lives
-    /// per connection, with nothing earlier to keep.
-    billing_time_rested: u32,
+    /// The billing group the last `SMSG_AUTH_RESPONSE` to carry one gave. Deviation: zeros until
+    /// one does, where the reference's words are never initialised (the session is allocated
+    /// without zero-fill, `ui/billing` in benilla-re).
+    billing: messages::Billing,
     /// `SMSG_ADDON_INFO`'s per-record status bytes in order; `None` until the server answers.
     /// vmangos sends it once per connection, after the authentication
     /// (`WorldSocket.cpp:446-448`), and the reference applies it to add-on records that outlive
     /// the world session (`0x5b4260` → `0x51da70`), so every login on the link reads it.
     addon_info: Option<Vec<messages::AddonRecord>>,
+    /// The server sent `SMSG_WARDEN_DATA` before the world entry, which was read past
+    /// ([`WorldSession::recv`]).
+    warden_asked: bool,
 }
 
 /// What a world connect reports on its way to `SMSG_AUTH_RESPONSE`.
@@ -162,18 +145,21 @@ impl WorldSession {
             tutorial_flags: None,
         };
 
-        // AUTH_RESPONSE is not always first, so others are skipped; Warden data ends the connect.
+        // AUTH_RESPONSE is not always first, so others are skipped.
         loop {
-            match session.recv()? {
-                ServerPacket::AuthResponse {
-                    result,
-                    billing_time_rested,
-                    ..
-                } if result == messages::AUTH_OK => {
-                    // The reference keeps the last AUTH_RESPONSE's billing group.
-                    session.link.billing_time_rested = billing_time_rested.unwrap_or(0);
-                    break;
-                }
+            let packet = session.recv()?;
+            // Either admitting code may carry the group and one without leaves the last
+            // (`0x5b41f9`): vmangos sends it on the first queue response and not on the closing
+            // `AUTH_OK` (`World.cpp:374-381`, `WorldSession.cpp:961-967`).
+            if let ServerPacket::AuthResponse {
+                billing: Some(billing),
+                ..
+            } = packet
+            {
+                session.link.billing = billing;
+            }
+            match packet {
+                ServerPacket::AuthResponse { result, .. } if result == messages::AUTH_OK => break,
                 // Queued, not refused: the server re-sends as we move up and ends with `AUTH_OK`.
                 ServerPacket::AuthResponse {
                     result,
@@ -193,9 +179,6 @@ impl WorldSession {
                 ServerPacket::AuthResponse { result, .. } => {
                     return Err(WorldAuthReject { code: result }.into())
                 }
-                ServerPacket::Other {
-                    opcode: opcode::SMSG_WARDEN_DATA,
-                } => return Err(WardenRequired.into()),
                 _ => continue,
             }
         }
@@ -209,9 +192,9 @@ impl WorldSession {
         Ok(session)
     }
 
-    /// Rested billing minutes (`GetBillingTimeRested`); always 0 from vmangos (`World.cpp:331`).
-    pub fn billing_time_rested(&self) -> u32 {
-        self.link.billing_time_rested
+    /// The connection's billing group; vmangos sends no time and no rest (`World.cpp:327-331`).
+    pub fn billing(&self) -> messages::Billing {
+        self.link.billing
     }
 
     /// The tutorial bank captured during the login handshake, if any.
@@ -230,10 +213,25 @@ impl WorldSession {
     pub fn recv(&mut self) -> Result<ServerPacket> {
         let packet = recv_packet(&mut self.stream, Some(self.crypto.decrypter()))?;
         // `SMSG_ADDON_INFO` can reach any of the handshake's read loops, so it is caught here.
-        if let ServerPacket::AddonInfo { records } = &packet {
-            self.link.addon_info = Some(records.clone());
+        match &packet {
+            ServerPacket::AddonInfo { records } => self.link.addon_info = Some(records.clone()),
+            // Deviation: benilla runs no Warden module and answers nothing, where the reference
+            // hands `SMSG_WARDEN_DATA` to the module its connect loads (`0x6ca2f0`, `0x6ca5c0`)
+            // and sends that module's answer as `CMSG_WARDEN_DATA` (`0x6ca6a0`). The message is
+            // read past like any stray and the login goes on; what follows is the server's policy
+            // (vmangos kicks after `Warden.ClientResponseDelay`, `Warden.cpp:686-691`).
+            ServerPacket::Other {
+                opcode: opcode::SMSG_WARDEN_DATA,
+            } => self.link.warden_asked = true,
+            _ => {}
         }
         Ok(packet)
+    }
+
+    /// Whether the server sent `SMSG_WARDEN_DATA` on this link before the world entry, which
+    /// was read past unanswered ([`Self::recv`]).
+    pub fn warden_asked(&self) -> bool {
+        self.link.warden_asked
     }
 
     /// The next packet a request at character select reads past, or `None` for one whose body did
@@ -276,18 +274,49 @@ impl WorldSession {
                     self.link.roster_races = characters.iter().map(|c| (c.guid, c.race)).collect();
                     return Ok(characters);
                 }
-                // Warden can arm on either side of SMSG_AUTH_RESPONSE, so this step refuses it too.
-                ServerPacket::Other {
-                    opcode: opcode::SMSG_WARDEN_DATA,
-                } => return Err(WardenRequired.into()),
-                // Kept for the world entry when the server sends it this early.
-                ServerPacket::TutorialFlags(flags) => {
-                    self.tutorial_flags = Some(flags.bytes);
-                    continue;
-                }
-                // The server interleaves account-data / cache packets here; skip them.
-                _ => continue,
+                other => self.note_stray(other),
             }
+        }
+    }
+
+    /// Look at the link while character select waits for the app: the reference keeps servicing
+    /// the connection there, and a drop ends the session (`CGlueMgr::NetDisconnectHandler`,
+    /// `0x46c540`). A closed or failed socket is an error, a packet sent unasked is read as a
+    /// stray, a quiet link is `Ok`. Nothing is sent, and a read waits only on a packet begun.
+    pub fn poll_link(&mut self) -> Result<()> {
+        self.stream
+            .set_nonblocking(true)
+            .context("polling the world socket")?;
+        let peeked = self.stream.peek(&mut [0u8; 1]);
+        self.stream
+            .set_nonblocking(false)
+            .context("restoring the world socket")?;
+        match peeked {
+            Ok(0) => bail!("world stream closed: the server ended the connection"),
+            Ok(_) => {
+                if let Some(packet) = self.recv_parsed()? {
+                    self.note_stray(packet);
+                }
+                Ok(())
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(anyhow!("world stream closed: {e}")),
+        }
+    }
+
+    /// A packet at character select that is not the answer being waited for: the tutorial bank
+    /// is kept for the world entry when the server sends it this early; the account-data, cache
+    /// and Warden packets the server interleaves here are skipped.
+    fn note_stray(&mut self, packet: ServerPacket) {
+        if let ServerPacket::TutorialFlags(flags) = packet {
+            self.tutorial_flags = Some(flags.bytes);
         }
     }
 

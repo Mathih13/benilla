@@ -37,12 +37,10 @@ fn open(which: &'static str, key: Option<&'static str>) -> Outgoing {
     }
 }
 
-fn failed(refusal: Option<LoginRefusal>, terminal: bool) -> LoginFailedMessage {
+fn failed(refusal: Option<LoginRefusal>) -> LoginFailedMessage {
     LoginFailedMessage {
         refusal,
         reason: "test".into(),
-        terminal,
-        dial: None,
     }
 }
 
@@ -92,7 +90,7 @@ fn a_proof_0x0a_changes_no_dialog() {
     m.tick();
     settle(&mut m);
     m.outbox.clear();
-    m.on_failed(&failed(Some(LoginRefusal::LogonProof(0x0a)), false));
+    m.on_failed(&failed(Some(LoginRefusal::LogonProof(0x0a))));
     m.tick();
     settle(&mut m);
     assert!(m.outbox.is_empty(), "{:?}", m.outbox);
@@ -182,7 +180,7 @@ fn a_logon_refusal_opens_its_result_and_ends_the_logon() {
         m.login("a".into(), "b".into());
         settle(&mut m);
         m.outbox.clear();
-        m.on_failed(&failed(refusal, false));
+        m.on_failed(&failed(refusal));
         m.tick();
         settle(&mut m);
         assert_eq!(m.outbox, [open(which, Some(key))], "{refusal:?}");
@@ -306,7 +304,7 @@ fn a_world_refusal_opens_its_status_and_url() {
         button: None,
     };
     let mut m = connected();
-    m.on_failed(&failed(Some(LoginRefusal::World(0x1c)), false));
+    m.on_failed(&failed(Some(LoginRefusal::World(0x1c))));
     m.tick();
     settle(&mut m);
     assert_eq!(
@@ -326,7 +324,7 @@ fn a_world_refusal_opens_its_status_and_url() {
     assert_eq!(m.state, ScreenState::Idle);
 
     let mut m = connected();
-    m.on_failed(&failed(Some(LoginRefusal::World(0x0d)), false));
+    m.on_failed(&failed(Some(LoginRefusal::World(0x0d))));
     m.tick();
     settle(&mut m);
     assert_eq!(
@@ -342,7 +340,7 @@ fn a_world_refusal_opens_its_status_and_url() {
     );
 
     let mut m = connected();
-    m.on_failed(&failed(None, false));
+    m.on_failed(&failed(None));
     m.tick();
     settle(&mut m);
     assert_eq!(
@@ -363,7 +361,7 @@ fn a_world_refusal_opens_its_status_and_url() {
     // With no realm held the arm asks for the list (`0x46c06e` → `0x46b8d0` with 1).
     let mut m = connected();
     m.holder.clear();
-    m.on_failed(&failed(None, false));
+    m.on_failed(&failed(None));
     m.tick();
     settle(&mut m);
     assert_eq!(
@@ -441,7 +439,7 @@ fn the_authentication_puts_the_character_screen_up() {
     m.state = ScreenState::Connect;
     let alpha = || vec![crate::glue_session::roster::test_character(7, "Alpha")];
     m.on_roster(alpha(), RosterCause::Asked, 0);
-    m.on_roster(alpha(), RosterCause::Park, 0);
+    m.on_roster(alpha(), RosterCause::Unasked, 0);
     m.tick();
     settle(&mut m);
     assert!(
@@ -499,14 +497,12 @@ fn the_character_list_query_loads_the_roster_on_its_reply() {
         m.tick();
         settle(&mut m);
         assert!(m.outbox.is_empty(), "a running query shows no text");
-        // Rosters nothing asked for are not this screen's.
-        for cause in [RosterCause::Park, RosterCause::Changed] {
-            m.on_roster(
-                vec![crate::glue_session::roster::test_character(1, "Stray")],
-                cause,
-                0,
-            );
-        }
+        // A roster nothing asked for is not this screen's.
+        m.on_roster(
+            vec![crate::glue_session::roster::test_character(1, "Stray")],
+            RosterCause::Unasked,
+            0,
+        );
         m.tick();
         settle(&mut m);
         assert!(m.outbox.is_empty());
@@ -614,39 +610,6 @@ fn a_late_roster_reply_is_dropped_unless_it_lands_before_the_tick() {
     assert!(m.roster.is_empty() && !m.op.done);
     m.on_roster(late(), RosterCause::Asked, 5);
     assert!(m.op.done && m.op.ok);
-}
-
-/// A server that wants Warden refuses the roster ask with its words (a terminal login failure):
-/// the query completes failed and the next tick opens `OKAY` with them (`0x46c173`), where state 3
-/// would otherwise stand on its `CANCEL` dialog for ever. The link is gone.
-#[test]
-fn a_terminal_failure_fails_the_character_list_query_with_its_words() {
-    let mut m = fresh();
-    m.connected = true;
-    m.get_character_list();
-    settle(&mut m);
-    m.park_out.clear();
-    m.outbox.clear();
-    m.on_failed(&failed(None, true));
-    m.tick();
-    settle(&mut m);
-    let words = || Text::Raw("test".into());
-    assert_eq!(
-        m.outbox,
-        [
-            Outgoing::Update {
-                text: words(),
-                button: None,
-            },
-            Outgoing::Open {
-                which: "OKAY",
-                text: Some(words()),
-                data: None,
-            },
-        ]
-    );
-    assert_eq!(m.state, ScreenState::Idle);
-    assert!(!m.connected);
 }
 
 /// A roster ask that failed on the stream completes the query `CHAR_LIST_FAILED`
@@ -1369,7 +1332,7 @@ fn a_world_status_past_the_table_reads_its_number() {
         let mut m = fresh();
         m.state = ScreenState::Connect;
         m.holder = vec![realm("Fake")];
-        m.on_failed(&failed(Some(LoginRefusal::World(code)), false));
+        m.on_failed(&failed(Some(LoginRefusal::World(code))));
         m.tick();
         settle(&mut m);
         m.outbox
@@ -1947,7 +1910,7 @@ fn a_failed_logons_dialog_is_pressed_in_state_1() {
         m.settle();
         m.outbox.clear();
         m.login_out.clear();
-        m.on_failed(&failed(Some(LoginRefusal::Logon(0x04)), false));
+        m.on_failed(&failed(Some(LoginRefusal::Logon(0x04))));
     }
     frame(&shared, &mut s);
     let m = shared.get();
@@ -2043,7 +2006,7 @@ fn a_call_before_the_seat_runs_on_the_seating_frame() {
         .add_message::<crate::net::CharActionResultMessage>()
         .add_message::<crate::net::CharRenameMessage>()
         .add_message::<crate::net::CharacterLoginFailedMessage>()
-        .add_message::<LoginNotice>()
+        .add_message::<LoginGuardRefused>()
         .add_message::<RealmListMessage>()
         .add_message::<DisconnectedMessage>()
         .add_message::<GlueLogin>()
@@ -2088,7 +2051,7 @@ fn stock_app() -> (
         .add_message::<crate::net::CharActionResultMessage>()
         .add_message::<crate::net::CharRenameMessage>()
         .add_message::<crate::net::CharacterLoginFailedMessage>()
-        .add_message::<LoginNotice>()
+        .add_message::<LoginGuardRefused>()
         .init_resource::<AddonInfoReply>()
         .add_message::<RealmListMessage>()
         .add_message::<DisconnectedMessage>()
@@ -2201,7 +2164,7 @@ fn the_select_cells_outlive_the_glue_vm() {
 /// `CANCEL` dialog; the logon's stage and a refusal re-text it with the reference's keys; and the
 /// agreements gate it.
 #[test]
-fn the_stock_login_reaches_the_native_login_and_shows_its_status() {
+fn the_stock_login_reaches_the_login_engine_and_shows_its_status() {
     let _ = benilla_formats::wow_data_or_skip!();
     let (mut app, rx, _) = stock_app();
 
@@ -2233,7 +2196,7 @@ fn the_stock_login_reaches_the_native_login_and_shows_its_status() {
     assert_eq!(dialog(&app), Some(("CANCEL".into(), connecting)));
 
     app.world_mut()
-        .write_message(failed(Some(LoginRefusal::Logon(0x04)), false));
+        .write_message(failed(Some(LoginRefusal::Logon(0x04))));
     app.update();
     let unknown = vm(&app).global_text("LOGIN_UNKNOWN_ACCOUNT");
     assert!(!unknown.is_empty());
@@ -2250,8 +2213,7 @@ fn the_account_guards_refusal_opens_the_stock_okay_dialog() {
     let (mut app, rx, _) = stock_app();
     assert_eq!(dialog(&app), None);
     let why = "WOW_USER=other is not the account this checkout declares.";
-    app.world_mut()
-        .write_message(LoginNotice::GuardRefused(why.into()));
+    app.world_mut().write_message(LoginGuardRefused(why.into()));
     app.update();
     assert_eq!(dialog(&app), Some(("OKAY".into(), why.into())));
     assert_eq!(mgr(&app).state, ScreenState::Idle);
@@ -2312,7 +2274,7 @@ fn the_stock_realm_list_dialog_after_a_world_failure_closes_on_its_reply() {
     assert_eq!(mgr(&app).state, ScreenState::Idle);
 }
 
-/// The status dialog's Cancel is `StatusDialogClick`, which abandons the native attempt.
+/// The status dialog's Cancel is `StatusDialogClick`, which abandons the attempt in flight.
 #[test]
 fn the_status_dialogs_cancel_abandons_the_attempt() {
     let _ = benilla_formats::wow_data_or_skip!();
@@ -2437,31 +2399,22 @@ fn pump(
                 lists.write(RealmListMessage { realms, failed });
             }
             E::LoginFailed {
-                refusal,
-                reason,
-                terminal,
-                dial,
+                refusal, reason, ..
             } => {
-                failures.write(LoginFailedMessage {
-                    refusal,
-                    reason,
-                    terminal,
-                    dial,
-                });
+                failures.write(LoginFailedMessage { refusal, reason });
             }
             E::CharacterList {
                 characters,
                 realm,
                 cause,
                 epoch,
-                generation,
+                ..
             } => {
                 rosters.write(CharListMessage {
                     characters,
                     realm,
                     cause,
                     epoch,
-                    generation,
                 });
             }
             E::WorldAuthenticated {
@@ -2495,15 +2448,10 @@ fn pump(
                     .renames
                     .write(crate::net::CharRenameMessage { result, renamed });
             }
-            E::Connected {
-                billing_time_rested,
-                tutorial_flags,
-                ..
-            } => {
-                char_writes.entered.write(crate::net::EnteredWorldMessage {
-                    billing_time_rested,
-                    tutorial_flags,
-                });
+            E::Connected { tutorial_flags, .. } => {
+                char_writes
+                    .entered
+                    .write(crate::net::EnteredWorldMessage { tutorial_flags });
             }
             E::CharacterLoginFailed { result } => {
                 char_writes
@@ -2536,7 +2484,7 @@ fn live_app_with(
     // The race and class rows the roster's names come from, off the player's own chain.
     let data = benilla_formats::wow_data().expect("callers skip without an install");
     let mut chain = benilla_formats::open_chain(&data).expect("open chain");
-    let cycles = fake::spawn_cycles_asking();
+    let cycles = fake::spawn_cycles();
     let mut app = App::new();
     app.init_resource::<Time>()
         .init_non_send_resource::<SharedGlueMgr>()
@@ -2581,7 +2529,7 @@ fn live_app_with(
         .add_message::<crate::net::CharRenameMessage>()
         .add_message::<crate::net::EnteredWorldMessage>()
         .add_message::<crate::net::CharacterLoginFailedMessage>()
-        .add_message::<LoginNotice>()
+        .add_message::<LoginGuardRefused>()
         .add_message::<crate::net::LoggedOutMessage>()
         .init_resource::<AddonInfoReply>()
         .add_message::<RealmListMessage>()
@@ -3622,9 +3570,9 @@ fn three_addon_app(reply: Option<&dyn Fn(&fake::World)>) -> (App, fake::Realmd, 
 /// The stock select runs end to end with nothing stubbed: its `OnShow` reaches
 /// `GetCharacterListUpdate` past `UpdateAddonButton`, the add-ons button shows for the registry
 /// the server's reply left, and the stock `AddonList` opens, shows each row through the glue
-/// verbs, toggles through its checkboxes, and Okay writes the files the native screen writes.
+/// verbs, toggles through its checkboxes, and Okay writes each character's enable file.
 #[test]
-fn the_stock_addon_list_opens_toggles_and_saves_like_the_native_screen() {
+fn the_stock_addon_list_opens_toggles_and_saves() {
     let _ = benilla_formats::wow_data_or_skip!();
     let _l = crate::local_state::test_env::ENV_LOCK
         .lock()
@@ -3702,22 +3650,6 @@ fn the_stock_addon_list_opens_toggles_and_saves_like_the_native_screen() {
         text("Alpha-Charlie.txt"),
         "Alpha: disabled\nBeta: disabled\n",
         "a character with no file gets one, as every node the All view set is dirty"
-    );
-
-    // The native screen, given the same clicks on the same files, writes the same bytes.
-    let (native_home, _native_guard) = addon_home("native");
-    three_addons(&native_home);
-    let chars: Vec<String> = roster3().iter().map(|c| c.name.clone()).collect();
-    // All view: Alpha off and Beta off, then the view on Alpha with Beta on, as above.
-    crate::char_select::okay_after_clicks(
-        "Alpha",
-        &chars,
-        &[(None, 0, false), (None, 1, false), (Some(0), 1, true)],
-    );
-    assert_eq!(
-        stock,
-        enable_files(&native_home),
-        "the stock AddOns screen's files are the native screen's, byte for byte"
     );
 }
 
@@ -4190,11 +4122,9 @@ fn entry_app(refuse: bool) -> (App, fake::World) {
         w.remove_resource::<State<ClientState>>();
         w.remove_resource::<NextState<ClientState>>();
         w.insert_resource(cvars);
-        w.insert_resource(super::super::glue::GlueStock(true));
         // The roster the IO thread already published, as the session's edges took it.
         w.insert_resource(crate::glue_session::roster::Roster::with_chars(roster3()));
         w.init_resource::<crate::glue_session::roster::RunPick>();
-        w.init_resource::<crate::glue::dialog::GlueDialog>();
     }
     app.add_plugins(bevy::state::app::StatesPlugin)
         .insert_state(ClientState::CharSelect)
@@ -4321,13 +4251,9 @@ fn the_logout_smokes_stock_reentry_goes_through_enter_world() {
     // Off the first row, so the re-entry's own selection shows.
     vm(&app).run("CharacterSelect_SelectCharacter(3)").unwrap();
     app.world_mut()
-        .run_system_once(
-            |stock: crate::ui_script::glue::StockGlueProbe,
-             mut roster: ResMut<crate::glue_session::roster::Roster>,
-             pick: Res<crate::net::CharPick>| {
-                crate::glue_session::logout_smoke::reenter_first(stock.vm(), &mut roster, &pick);
-            },
-        )
+        .run_system_once(|stock: crate::ui_script::glue::StockGlueProbe| {
+            crate::glue_session::roster::press_enter_world(stock.vm(), 0);
+        })
         .unwrap();
     app.update();
     assert_eq!(
@@ -4382,6 +4308,40 @@ fn the_runs_own_stock_pick_goes_through_enter_world() {
         [0x12u64.to_le_bytes().to_vec()],
         "the armed row, Bravo"
     );
+}
+
+/// The run's own selection (`WOW_CHARSELECT_PICK`) on the stock screens is the screen's own: once
+/// it has its roster, the row is selected as a click selects it, and the screen stays up.
+#[test]
+fn the_runs_own_stock_selection_selects_on_the_screen() {
+    let _ = benilla_formats::wow_data_or_skip!();
+    let _l = crate::local_state::test_env::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_home, _guard) = addon_home("run-select");
+    let (mut app, world) = entry_app(false);
+    app.world_mut()
+        .insert_resource(crate::glue_session::roster::RunPick::selecting(0x12));
+    app.add_systems(
+        Update,
+        crate::glue_session::roster::enter_run_pick.after(drive_glue_mgr),
+    );
+    app.update();
+    assert_eq!(
+        vm(&app)
+            .eval::<i64>("return CharacterSelect.selectedIndex")
+            .unwrap(),
+        2,
+        "the armed row, Bravo"
+    );
+    for _ in 0..3 {
+        app.update();
+    }
+    assert_ne!(mgr(&app).state, ScreenState::EnterWorld);
+    assert_eq!(client_state(&app), ClientState::CharSelect);
+    assert!(world
+        .bodies(benilla_protocol::messages::opcode::CMSG_PLAYER_LOGIN)
+        .is_empty());
 }
 
 /// A refused login (vmangos's result 1) that lands once the client is in the world comes back to

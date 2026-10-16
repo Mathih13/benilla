@@ -1009,7 +1009,7 @@ mod tests {
     use crate::chat_bubble::BubbleConfig;
     use crate::minimap::MinimapZoom;
     use crate::nameplates::NameConfig;
-    use crate::player::camera::{FollowConfig, FollowStyle, LookConfig, FOLLOW_SPEED_RANGE};
+    use crate::player::camera::{FollowConfig, FollowStyle, LookConfig};
     use crate::player::camera_zoom::ZoomLimit;
     use crate::portrait::PaneRate;
     use crate::sound::SoundConfig;
@@ -1525,17 +1525,25 @@ mod tests {
             FollowStyle::Smart,
             "and only that one"
         );
-        apply(&mut app, "cameraYawSmoothSpeed", "270");
-        assert_eq!(res::<FollowConfig>(&app).yaw_speed, 270.0);
-        // Past the validator's 360 (`0x50c000`): refused, 270 stands.
-        assert_eq!(
-            apply(&mut app, "cameraYawSmoothSpeed", "9000"),
-            SetOutcome::Vetoed
-        );
-        assert_eq!(
-            res::<FollowConfig>(&app).yaw_speed,
-            *FOLLOW_SPEED_RANGE.end()
-        );
+        // The validator's [0.1, 360] (`0x50c000`) is the range, not the stock slider's 90 to 270:
+        // a value inside it is stored and used as is (`0x512d75`).
+        for (text, want) in [("270", 270.0), ("360", 360.0), ("0.2", 0.2), ("30", 30.0)] {
+            assert_eq!(
+                apply(&mut app, "cameraYawSmoothSpeed", text),
+                SetOutcome::Changed,
+                "{text}"
+            );
+            assert_eq!(res::<FollowConfig>(&app).yaw_speed, want, "{text}");
+        }
+        // Outside it: refused, and the last stored value stands.
+        for text in ["360.5", "400", "9000", "0", "0.05", "-30"] {
+            assert_eq!(
+                apply(&mut app, "cameraYawSmoothSpeed", text),
+                SetOutcome::Vetoed,
+                "{text}"
+            );
+            assert_eq!(res::<FollowConfig>(&app).yaw_speed, 30.0, "{text}");
+        }
         // The max orbit lands as yards on the knob: `cameraDistanceMax` x the factor, held to
         // [0, 50]; the factor is not held to its slider's 1 to 2.
         apply(&mut app, "cameraDistanceMaxFactor", "1");
@@ -2302,89 +2310,6 @@ mod tests {
 
     fn res<T: Resource>(app: &App) -> &T {
         app.world().resource::<T>()
-    }
-
-    /// The last character entered survives a quit: two launches over one `benilla-config/` with the
-    /// real [`CvarPlugin`] and [`crate::glue_session::roster`] systems, so the screen's host write
-    /// must reach the file through the registry's dirty/compose path.
-    #[test]
-    fn entering_the_world_survives_the_quit_and_comes_back_selected() {
-        use crate::client_state::ClientState;
-        use crate::glue_session::roster::Roster;
-        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
-        let _l = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = std::env::temp_dir().join(format!("benilla-lastchar-{}", std::process::id()));
-        std::fs::remove_dir_all(&tmp).ok();
-        let _c = EnvGuard::unset("WOW_CAPTURE");
-        let _u = EnvGuard::unset("WOW_UI_SCALE");
-        let _f = EnvGuard::unset("WOW_FARCLIP");
-        let _d = EnvGuard::unset("WOW_CLUTTER_DENSITY");
-        let _w = EnvGuard::unset("WOW_CHAR");
-        let _s = EnvGuard::unset("WOW_CHARSELECT_PICK");
-        let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
-        let roster = || {
-            (1..=4)
-                .map(|g| crate::glue_session::roster::test_character(g, &format!("Char{g}")))
-                .collect::<Vec<_>>()
-        };
-
-        // ── Launch 1: the roster lands, and the player enters the world as the third row. ────
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut app = cvar_app();
-        app.add_plugins(bevy::state::app::StatesPlugin);
-        crate::glue_session::roster::add_test_systems(&mut app, tx);
-        app.update(); // Startup loads the (absent) file; the first Update seeds the VM table
-        app.world_mut().write_message(crate::net::CharListMessage {
-            characters: roster(),
-            realm: None,
-            cause: benilla_protocol::RosterCause::Park,
-            epoch: 0,
-            generation: 0,
-        });
-        app.update();
-        assert_eq!(
-            app.world().resource::<Roster>().selected(),
-            Some(0),
-            "nothing remembered yet, so the first row — the behaviour that was already right",
-        );
-        app.world_mut().resource_mut::<Roster>().pending_pick = Some(3); // guid 3 = row 2
-        app.update();
-        app.world_mut().write_message(AppExit::Success);
-        app.update();
-
-        let text = std::fs::read_to_string(tmp.join("config.toml")).unwrap();
-        assert!(
-            text.contains("lastCharacterIndex = \"2\""),
-            "entering the world must reach the file, 0-based like Config.wtf:\n{text}"
-        );
-
-        // ── Launch 2: a fresh client over the same folder, and the roster arrives. ───────────
-        let (tx, _rx2) = crossbeam_channel::unbounded();
-        let mut app = cvar_app();
-        app.add_plugins(bevy::state::app::StatesPlugin);
-        crate::glue_session::roster::add_test_systems(&mut app, tx);
-        app.update();
-        app.world_mut().write_message(crate::net::CharListMessage {
-            characters: roster(),
-            realm: None,
-            cause: benilla_protocol::RosterCause::Park,
-            epoch: 0,
-            generation: 0,
-        });
-        app.update();
-
-        assert_eq!(
-            app.world().resource::<Roster>().selected(),
-            Some(2),
-            "the second launch must stand the SAME character on the stage — the whole report",
-        );
-        assert_eq!(
-            *app.world().resource::<State<ClientState>>().get(),
-            ClientState::CharSelect,
-        );
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

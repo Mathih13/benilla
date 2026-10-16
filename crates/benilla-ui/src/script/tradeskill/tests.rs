@@ -233,10 +233,16 @@ fn do_trade_skill_and_getters_no_op_on_a_header_index() {
     assert!(s
         .eval::<bool>("return GetTradeSkillIcon(1) == nil")
         .unwrap());
+    // But the made counts, which answer 1, 1 on a header and past the last row (`0x4fdd13`).
     assert_eq!(
         s.eval::<(i64, i64)>("return GetTradeSkillNumMade(1)")
             .unwrap(),
-        (0, 0)
+        (1, 1)
+    );
+    assert_eq!(
+        s.eval::<(i64, i64)>("return GetTradeSkillNumMade(99)")
+            .unwrap(),
+        (1, 1)
     );
     assert!(s
         .eval::<bool>("return GetTradeSkillCooldown(1) == nil")
@@ -516,7 +522,7 @@ fn no_snapshot_shapes_unknown_line_and_nil_info() {
     assert_eq!(
         s.eval::<(i64, i64)>("return GetTradeSkillNumMade(1)")
             .unwrap(),
-        (0, 0)
+        (1, 1)
     );
     assert!(s
         .eval::<bool>("return GetTradeSkillCooldown(1) == nil")
@@ -859,6 +865,34 @@ fn invslot_filter_drops_recipes_and_emptied_groups() {
 
     s.run("SetTradeSkillInvSlotFilter(0, 1, 1)").unwrap();
     assert_eq!(s.eval::<i64>("return GetNumTradeSkills()").unwrap(), 10);
+}
+
+/// Each slot name is a `_G` read (`0x703bf0`), so an `__index` that calls a verb runs inside
+/// `GetTradeSkillInvSlots`; the Model must be free for it.
+#[test]
+fn inv_slot_names_are_read_with_the_model_free() {
+    let mut s = UiScript::new().unwrap();
+    let mut st = state();
+    st.recipes
+        .iter_mut()
+        .find(|r| r.name == "Wind Cloak")
+        .unwrap()
+        .product_inv_type = 16;
+    s.set_trade_skill(Some(st));
+    s.run(
+        r#"setmetatable(_G, { __index = function(t, k)
+               if string.find(k, "SLOT$") then
+                   CreateFrame("Frame"):SetWidth(10)
+                   return "<" .. k .. ">"
+               end
+           end })"#,
+    )
+    .unwrap();
+    assert_eq!(
+        s.eval::<(String, String)>("return GetTradeSkillInvSlots()")
+            .unwrap(),
+        ("<CHESTSLOT>".to_string(), "<BACKSLOT>".to_string())
+    );
 }
 
 /// A one-hand weapon (InventoryType 13, `0x18000`) lists both hand slots and passes either.

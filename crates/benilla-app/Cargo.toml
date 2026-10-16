@@ -35,11 +35,18 @@ half = "2"
 include_dir = "0.7"
 # The 1.12 chat filters (`text_filter`), with one `RegexSet` for the any-match pass per line.
 regex = "1"
+# The same filters' word boundaries: `regex` has no look-around, and the client's word class is
+# its own table, not Unicode's.
+fancy-regex = { version = "0.18", default-features = false, features = ["std", "unicode", "perf"] }
 # `getrusage` for perf CPU time; `localtime_r` for the log stamp; the audio clock and render
 # thread's realtime policy on macOS.
 libc = "0.2"
 # PNG encoding only: the macOS cursor's NSImage data and screenshots.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# The "no WoW install" error dialog (`no_install`): AppKit, Win32 and, on Linux, `zenity`; no GTK.
+# `xdg-portal` is the Linux backend that carries the message dialog; `wayland` is its file-dialog
+# parent handle, which a message dialog without a parent never reads.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # Thread-to-ECS channels: crossbeam's `Receiver` is `Sync`, so it is a resource without a mutex.
 crossbeam-channel = "0.5"
 benilla-assets = { path = "../benilla-assets", default-features = false }

@@ -161,7 +161,7 @@ fn probe_key_by_name(name: &str) -> Option<KeyCode> {
         "Right" => KeyCode::ArrowRight,
         "Home" => KeyCode::Home,
         "End" => KeyCode::End,
-        // Enter at character select enters the world (`char_select::input`): `/logout` then
+        // Enter at character select enters the world (`CharacterSelect_OnKeyDown`): `/logout` then
         // `Enter` is a relog in one process, since `WOW_CHAR` applies once (`run_mode`).
         "Enter" => KeyCode::Enter,
         // The SCREENSHOT binding's key; a Lua `TakeScreenshot()` skips the binding. On macOS it
@@ -328,8 +328,8 @@ fn fire_probe_lua(
         return;
     }
     let Some(script) = script else {
-        // Between the world-entry edge and the entry load the boot VM is parked
-        // (`ui_script::ParkedBootVm`): not an entry yet.
+        // Between the world-entry edge and the entry load the glue VM is parked
+        // (`ui_script::ParkedGlueVm`): not an entry yet.
         probe.was_ready = false;
         return;
     };
@@ -365,10 +365,10 @@ fn fire_probe_lua(
     }
 }
 
-/// `WOW_PROBE_GLUE_LUA="<chunk>"`: under `WOW_GLUE_STOCK=1`, runs the chunk once in the stock
-/// glue VM `WOW_PROBE_GLUE_LUA_AT` seconds (default 10) into the run, to press the login screen's
-/// buttons headlessly; `WOW_PROBE_GLUE_SHOT=<path>` then saves one PNG
-/// `WOW_PROBE_GLUE_SHOT_AFTER` seconds (default 1) later. The chunk is never logged: it may carry
+/// `WOW_PROBE_GLUE_LUA="<chunk>"`: runs the chunk once in the stock glue VM
+/// `WOW_PROBE_GLUE_LUA_AT` seconds (default 10) into the run, to press the login screen's buttons
+/// headlessly; `WOW_PROBE_GLUE_SHOT=<path>` then saves one PNG `WOW_PROBE_GLUE_SHOT_AFTER` seconds
+/// (default 1) later. The chunk is never logged: it may carry
 /// a typed password.
 pub(crate) struct ProbeGlueLuaPlugin;
 
