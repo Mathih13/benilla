@@ -286,9 +286,11 @@ impl Clone for Roots {
 /// The host's hook body; an error it answers is raised where the hook ran.
 pub type HookFn = Rc<dyn Fn(&mut Vm) -> Result<(), LuaError>>;
 
-/// A host hook run about every `step` instructions. It is checked where a loop jumps back and
-/// where a call starts, the places a non-terminating script must pass, counting a loop's body
-/// length per iteration; so the dispatch loop pays nothing for it until one is set.
+/// A host hook run every `step` instructions, as 5.1's `LUA_MASKCOUNT` runs one, in every Lua
+/// frame (Lua a library function or a metamethod calls included). The instructions are charged
+/// where a loop jumps back, a call starts and a function returns, the places a non-terminating
+/// script must pass, each charge the instructions run since the last; so the dispatch loop pays
+/// nothing for it until one is set.
 #[derive(Clone)]
 pub struct Hook {
     pub step: u64,
@@ -1809,7 +1811,8 @@ impl Vm {
         }
     }
 
-    /// `n` more instructions ran; past the step, the hook runs.
+    /// `n` more instructions ran, as 5.1's `LUA_MASKCOUNT` counts them: the hook runs once for
+    /// each `step` they complete.
     #[cold]
     #[inline(never)]
     fn hook_count(&mut self, n: u64) -> Result<(), LuaError> {
@@ -1820,17 +1823,17 @@ impl Vm {
             return Ok(());
         };
         h.counted += n;
-        if h.counted < h.step {
-            return Ok(());
+        while let Some(h) = self.hook.as_mut().filter(|h| h.counted >= h.step) {
+            h.counted -= h.step;
+            let f = h.f.clone();
+            self.in_hook = true;
+            let id = self.identity();
+            let r = f(self);
+            self.check_identity(id);
+            self.in_hook = false;
+            r?;
         }
-        h.counted -= h.step;
-        let f = h.f.clone();
-        self.in_hook = true;
-        let id = self.identity();
-        let r = f(self);
-        self.check_identity(id);
-        self.in_hook = false;
-        r
+        Ok(())
     }
 
     /// This VM's and its heap's identity ([`crate::heap::Identity`]).
@@ -2097,11 +2100,16 @@ impl Vm {
         let mut ip: *const Op;
         let mut k: *const Value;
         let mut regs: *mut Value;
+        // Where the running frame's current straight run of instructions began: the budget
+        // hook charges `ip - seg` at a back edge, a call and a return, and a forward jump moves
+        // both, so the charge is the instructions executed.
+        let mut seg: *const Op;
         'frame: loop {
             {
                 let frame = self.frames.last().expect("a Lua frame");
                 let base = frame.base();
                 ip = frame.ip;
+                seg = ip;
                 k = frame.consts;
                 self.heap.cur_source = frame.source;
                 if self.hooked {
@@ -2255,20 +2263,38 @@ impl Vm {
                     }
                 }};
             }
+            /// The instructions run since `seg`, the one just fetched included, for the hook.
+            macro_rules! ran {
+                () => {
+                    // SAFETY: a live Lua frame's code is alive (see `Frame::proto`).
+                    ran_since(seg, ip, unsafe { &*fr!().proto })
+                };
+            }
             macro_rules! jump {
                 ($off:expr) => {{
                     let off = $off as isize;
-                    // SAFETY: `Proto::verify` checked that every jump lands inside the code.
-                    ip = unsafe { ip.offset(off) };
-                    // A loop's back edge: the place the budget hook is counted.
                     if off < 0 && self.hooked {
-                        slow!(self.hook_count((-off) as u64))?;
+                        // A loop's back edge: the place a loop is charged.
+                        let n = ran!();
+                        // SAFETY: `Proto::verify` checked that every jump lands inside the code.
+                        ip = unsafe { ip.offset(off) };
+                        seg = ip;
+                        slow!(self.hook_count(n))?;
+                    } else {
+                        // SAFETY: as above.
+                        ip = unsafe { ip.offset(off) };
+                        seg = seg.wrapping_offset(off);
                     }
                 }};
             }
             /// 5.0's `OP_RETURN`: `n` values from `R(a)` to the caller's frame.
             macro_rules! ret {
                 ($a:expr, $n:expr) => {{
+                    // The frame's last run is charged; the caller's starts where it resumes.
+                    if self.hooked {
+                        let n = ran!();
+                        slow!(self.hook_count(n))?;
+                    }
                     let a = $a;
                     let n: usize = $n;
                     let fi = self.frames.len() - 1;
@@ -2626,6 +2652,7 @@ impl Vm {
                             r!(a) = v;
                             // SAFETY: as `jump!`; a value's test jumps forward, never a back edge.
                             ip = unsafe { ip.offset(off as isize) };
+                            seg = seg.wrapping_offset(off as isize);
                         }
                     }
                     Op::Call(a, b, c) => {
@@ -2637,7 +2664,9 @@ impl Vm {
                         };
                         save!();
                         if self.hooked {
-                            slow!(self.hook_count(1))?;
+                            let n = ran!();
+                            seg = ip;
+                            slow!(self.hook_count(n))?;
                         }
                         // A Lua function without `...`: the frame is pushed here, as C Lua's
                         // `luaD_precall` does for it, without the general path.
@@ -2682,6 +2711,7 @@ impl Vm {
                                     // Enter the callee from what is in hand, not from the
                                     // frame just written.
                                     ip = frame.ip;
+                                    seg = ip;
                                     k = consts;
                                     self.heap.cur_source = frame.source;
                                     if self.hooked {
@@ -2723,7 +2753,9 @@ impl Vm {
                         // A call like any other for the budget: a tail-recursive loop passes
                         // no back edge and no `Call`.
                         if self.hooked {
-                            slow!(self.hook_count(1))?;
+                            let n = ran!();
+                            seg = ip;
+                            slow!(self.hook_count(n))?;
                         }
                         // 5.1's `OP_TAILCALL` resolves `__call` first, so a callable table's
                         // Lua `__call` replaces this frame too.
@@ -2884,6 +2916,7 @@ impl Vm {
                                     }
                                     if k.is_nil() {
                                         ip = unsafe { ip.add(1) };
+                                        seg = seg.wrapping_add(1);
                                     } else {
                                         r!(a + 2) = k;
                                         // SAFETY: a `TForLoop` is always followed by its `Jmp`.
@@ -2906,6 +2939,7 @@ impl Vm {
                         self.top = base!() + maxstack!();
                         if r!(cb).is_nil() {
                             ip = unsafe { ip.add(1) };
+                            seg = seg.wrapping_add(1);
                         } else {
                             r!(a + 2) = r!(cb);
                             // SAFETY: a `TForLoop` is always followed by its `Jmp`.
@@ -2977,6 +3011,18 @@ impl Vm {
             }
         }
     }
+}
+
+/// The instructions from `seg` to `ip` in `p`'s code, for the budget hook; 1 for a run that
+/// started before the hook was set, whose start the VM did not keep.
+#[cold]
+fn ran_since(seg: *const Op, ip: *const Op, p: &Proto) -> u64 {
+    let code = p.code.as_ptr_range();
+    let (s, i) = (seg as usize, ip as usize);
+    if s < code.start as usize || s > i || i > code.end as usize {
+        return 1;
+    }
+    ((i - s) / std::mem::size_of::<Op>()) as u64
 }
 
 /// 5.1's `getobjname` over a prototype: a local's name, else what a symbolic run from the start
