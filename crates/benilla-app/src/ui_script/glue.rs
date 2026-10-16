@@ -88,6 +88,24 @@ impl StockVm<'_> {
         self.0.is_some_and(|s| s.frame_visible(name))
     }
 
+    /// A Lua chunk's string value, as a stock function's caller reads it; `None` with no VM, for
+    /// `nil`, and on a raise, which is logged.
+    pub(crate) fn text(&self, chunk: &str) -> Option<String> {
+        self.0?
+            .eval::<Option<String>>(chunk)
+            .inspect_err(|e| error!("glue probe: {chunk} raised: {e}"))
+            .ok()
+            .flatten()
+    }
+
+    /// A Lua chunk's number value; `None` with no VM and on a raise, which is logged.
+    pub(crate) fn number(&self, chunk: &str) -> Option<f64> {
+        self.0?
+            .eval::<f64>(chunk)
+            .inspect_err(|e| error!("glue probe: {chunk} raised: {e}"))
+            .ok()
+    }
+
     /// Run a Lua chunk, the way a button's handler calls a stock function; a raise is logged.
     pub(crate) fn press(&self, chunk: &str) {
         if let Some(Err(e)) = self.0.map(|s| s.run(chunk)) {
@@ -99,10 +117,10 @@ impl StockVm<'_> {
 /// Run condition: the stock glue screens are up, the switch on and no character in the world.
 pub(crate) fn glue_ui_up(
     stock: Option<Res<GlueStock>>,
-    state: Option<Res<State<crate::char_select::ClientState>>>,
+    state: Option<Res<State<crate::client_state::ClientState>>>,
 ) -> bool {
     stock.is_some_and(|s| s.0)
-        && state.is_none_or(|s| *s.get() != crate::char_select::ClientState::InWorld)
+        && state.is_none_or(|s| *s.get() != crate::client_state::ClientState::InWorld)
 }
 
 /// Run condition: the switch is on, whether or not a character is in the world.
@@ -323,8 +341,8 @@ pub(crate) fn run_pending_glue_rebuild(world: &mut World) {
     }
     world.resource_mut::<GlueRebuild>().requested = false;
     let in_world = world
-        .get_resource::<State<crate::char_select::ClientState>>()
-        .is_some_and(|s| *s.get() == crate::char_select::ClientState::InWorld);
+        .get_resource::<State<crate::client_state::ClientState>>()
+        .is_some_and(|s| *s.get() == crate::client_state::ClientState::InWorld);
     let screen = world
         .get_non_send_resource::<UiScript>()
         .filter(|s| s.vm_kind() == benilla_ui::script::VmKind::Glue)
@@ -638,7 +656,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(commands);
         world.insert_resource(GlueStock(true));
-        world.insert_resource(State::new(crate::char_select::ClientState::Login));
+        world.insert_resource(State::new(crate::client_state::ClientState::Login));
         world.init_non_send_resource::<super::super::glue_mgr::SharedGlueMgr>();
         world.init_resource::<GlueRebuild>();
         super::super::lifecycle::setup_script(&mut world);
@@ -694,7 +712,7 @@ mod tests {
         run_pending_glue_rebuild(&mut world);
         assert_eq!(session(&world), rebuilt, "once");
 
-        world.insert_resource(State::new(crate::char_select::ClientState::InWorld));
+        world.insert_resource(State::new(crate::client_state::ClientState::InWorld));
         world.resource_mut::<GlueRebuild>().request();
         run_pending_glue_rebuild(&mut world);
         assert_eq!(session(&world), rebuilt, "a suspended glue builds nothing");

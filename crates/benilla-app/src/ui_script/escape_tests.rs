@@ -34,8 +34,10 @@ fn one_item_backpack() -> ContainerState {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     ContainerState {
@@ -282,8 +284,10 @@ fn escape_closes_an_open_stack_split_frame() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(

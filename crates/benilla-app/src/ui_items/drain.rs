@@ -1786,8 +1786,10 @@ mod bind_confirm_tests {
                 cooldown: None,
                 readable: false,
                 creator: None,
+                gift_creator: None,
                 flags: 0,
                 enchants: Vec::new(),
+                spell_0: false,
             },
         );
         ContainerState {

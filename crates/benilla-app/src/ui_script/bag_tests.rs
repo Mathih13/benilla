@@ -407,8 +407,10 @@ fn bag_tooltip_hangs_left_when_the_slot_sits_in_the_right_half() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(
@@ -491,8 +493,10 @@ fn hovered_bag_tooltip_fills_itself_when_the_stats_land() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(
@@ -605,8 +609,10 @@ fn vendor_bag_hover_shows_sell_price_and_arms_the_pouch_cursor() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     slots.insert(
@@ -634,8 +640,10 @@ fn vendor_bag_hover_shows_sell_price_and_arms_the_pouch_cursor() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(
@@ -828,8 +836,10 @@ fn drag_across_two_slots_queues_the_same_move_a_click_pickup_would() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(
@@ -921,8 +931,10 @@ fn a_second_bag_window_feeds_and_paints_via_the_bag_bar() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(
@@ -1064,8 +1076,10 @@ pub(super) fn open_backpack_with_a_five_stack(s: &mut UiScript) -> (f32, f32) {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(
@@ -1475,7 +1489,9 @@ fn the_bar_bag_buttons_name_themselves_on_hover() {
         guid: 0x70d,
         equip_slots: vec![20],
         creator: None,
+        gift_creator: None,
         enchants: Vec::new(),
+        spell_0: false,
     });
     s.set_inventory_slots(inv);
     hover(&mut s, "CharacterBag0Slot");
