@@ -848,35 +848,6 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// The C Lua build hands Lua an error from a Rust callback through mlua's wrapper:
-/// `runtime error: ` before the message, and a Rust-side `stack traceback:` block after it.
-/// Neither Lua nor the 1.12 client writes either, and benilla's own VM raises the message alone,
-/// so the wrapper is taken out of a golden answer before it is compared; the message must match.
-fn without_mlua_wrapper(s: &str) -> String {
-    let s = s.replace("runtime error: ", "");
-    let mut out = String::new();
-    let mut rest = s.as_str();
-    while let Some(i) = rest.find("\nstack traceback:") {
-        out.push_str(&rest[..i]);
-        rest = &rest[i + "\nstack traceback:".len()..];
-        // The block's lines each open with a tab; one newline after it goes with it.
-        while let Some(r) = rest.strip_prefix("\n\t") {
-            rest = r.find('\n').map_or("", |j| &r[j..]);
-        }
-        rest = rest.strip_prefix('\n').unwrap_or(rest);
-        rest = rest.strip_prefix("stack traceback:").map_or(rest, |r| {
-            // A second block straight after the first, as a rethrown error carries.
-            let mut r = r;
-            while let Some(x) = r.strip_prefix("\n\t") {
-                r = x.find('\n').map_or("", |j| &x[j..]);
-            }
-            r.strip_prefix('\n').unwrap_or(r)
-        });
-    }
-    out.push_str(rest);
-    out
-}
-
 /// Cases whose answer on the C build depends on the platform's C library or compiler, so the
 /// golden file holds one answer per platform, `name@<os>-<arch>`, each blessed there:
 /// - the transcendental functions are the host libm's, rounded differently by glibc and Apple's;
@@ -996,17 +967,7 @@ fn compare(golden: &str, answers: &[(&str, String)], failures: &mut Vec<String>)
         let got = got.escape_default().to_string();
         match want.get(name) {
             Some(w) if *w == got => {}
-            Some(w)
-                if without_mlua_wrapper(&unescape(w))
-                    .escape_default()
-                    .to_string()
-                    == got => {}
-            Some(w) => {
-                let w = without_mlua_wrapper(&unescape(w))
-                    .escape_default()
-                    .to_string();
-                failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
-            }
+            Some(w) => failures.push(format!("{name}\n    got:  {got}\n    want: {w}")),
             None => failures.push(format!("{name}: no golden answer")),
         }
     }
@@ -1081,9 +1042,9 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
             let recorded: Vec<String> = want
                 .iter()
                 .filter(|(k, _)| k.starts_with(&prefix))
-                .map(|(_, a)| without_mlua_wrapper(&unescape(a)))
+                .map(|(_, a)| unescape(a))
                 .collect();
-            match check_items(name, &without_mlua_wrapper(got), &recorded) {
+            match check_items(name, got, &recorded) {
                 Some((f, unchecked, n)) => {
                     failures.extend(f);
                     unchecked_items += unchecked;
@@ -1096,17 +1057,7 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
         let got = got.escape_default().to_string();
         match own {
             Some(w) if *w == got => {}
-            Some(w)
-                if without_mlua_wrapper(&unescape(w))
-                    .escape_default()
-                    .to_string()
-                    == got => {}
-            Some(w) => {
-                let w = without_mlua_wrapper(&unescape(w))
-                    .escape_default()
-                    .to_string();
-                failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
-            }
+            Some(w) => failures.push(format!("{name}\n    got:  {got}\n    want: {w}")),
             None => failures.push(format!("{name}: no golden answer")),
         }
     }
