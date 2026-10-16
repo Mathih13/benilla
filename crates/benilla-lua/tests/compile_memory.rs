@@ -1,7 +1,7 @@
 //! Compiling takes memory in proportion to the source: what hot reload keeps of a function's
 //! identity (its key, each captured variable's declaration) is shared with the enclosing
-//! function's and cut to a bounded name, so no source can make the compiler ask for more memory
-//! than the process has. This binary counts every allocation, so it holds this one test.
+//! function's and cut to a bounded name, a name built along a path of fields included, so no
+//! source can make the compiler ask for more memory than the process has. This binary counts every allocation, so it holds this one test.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -57,7 +57,19 @@ fn compile_memory_follows_the_source_not_its_nesting() {
         "end ".repeat(150)
     );
 
-    for (what, src) in [("captures", captures), ("nesting", nested)] {
+    // Constructors nested 150 deep under long field names, a function at each level: each
+    // function's name is the whole path to it, as long as the source above it.
+    let fields = format!(
+        "T = {}{}",
+        format!("{{f = function() end, {long} = ").repeat(150),
+        "{}".to_string() + &"}".repeat(150)
+    );
+
+    for (what, src) in [
+        ("captures", captures),
+        ("nesting", nested),
+        ("fields", fields),
+    ] {
         let peak = peak_compiling(&src);
         assert!(
             peak < 16 * src.len() + (4 << 20),

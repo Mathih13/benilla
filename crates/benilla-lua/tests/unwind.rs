@@ -55,3 +55,18 @@ fn a_panic_through_xpcall_leaves_no_stale_handler() {
     let got: Vec<String> = r.into_iter().map(|v| vm.display(v)).collect();
     assert_eq!(got, ["false", "after", "true"]);
 }
+
+/// A type error the host's own call or index raises, with no Lua frame running, names no
+/// variable, a register given or not: there is no function whose register it could be.
+#[test]
+fn a_type_error_with_no_frame_running_names_no_variable() {
+    use benilla_lua::value::Value;
+    let mut vm = benilla_lua::new_state();
+    let e = vm.pcall_value(Value::Bool(true), &[], 0).unwrap_err();
+    assert_eq!(vm.display(e), "attempt to call a boolean value");
+    let key = Value::Str(vm.heap.intern(b"x"));
+    for reg in [None, Some(0)] {
+        let e = vm.index(Value::Bool(true), key, reg).unwrap_err().value;
+        assert_eq!(vm.display(e), "attempt to index a boolean value");
+    }
+}
