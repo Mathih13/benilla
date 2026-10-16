@@ -16,7 +16,7 @@
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
@@ -98,9 +98,15 @@ thread_local! {
     /// The family and VM of the callback running now, if any.
     static RUNNING: Cell<(u64, *mut Vm)> = const { Cell::new((0, std::ptr::null_mut())) };
     /// Each panic a callback raised as a Lua error, by its error value's tag: the payload until
-    /// it resumes in Rust, and its text for `tostring`.
-    static PANICS: RefCell<HashMap<u64, Panic>> = RefCell::new(HashMap::new());
+    /// it resumes in Rust, and its text for `tostring`. Tags rise, so the first entry is the
+    /// oldest; a Lua `pcall` that swallows a panic leaves its entry, and only the latest
+    /// [`PANICS_KEPT`] are kept.
+    static PANICS: RefCell<BTreeMap<u64, Panic>> = const { RefCell::new(BTreeMap::new()) };
 }
+
+// ponytail: a bound in place of a `__gc`, which the VM lacks; an older panic's error loses its
+// text and payload, and a callback panicking that often is already a bug report.
+const PANICS_KEPT: usize = 64;
 
 /// A panic raised as a Lua error: its payload until it resumes, and its text.
 type Panic = (Option<Box<dyn Any + Send>>, std::string::String);
@@ -149,7 +155,13 @@ fn raise_panic(vm: &mut Vm, payload: Box<dyn Any + Send>) -> LuaError {
         "<panic>".to_owned()
     };
     let tag = PANIC_TAG | NEXT_PANIC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    PANICS.with(|p| p.borrow_mut().insert(tag, (Some(payload), text)));
+    PANICS.with(|p| {
+        let mut p = p.borrow_mut();
+        p.insert(tag, (Some(payload), text));
+        while p.len() > PANICS_KEPT {
+            p.pop_first();
+        }
+    });
     let meta = panic_meta(vm);
     let u = vm.new_user(tag, Some(meta));
     vm.throw(u)
