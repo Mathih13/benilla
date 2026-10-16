@@ -177,6 +177,7 @@ pub struct Vm {
     pub reentry: Option<Reentry>,
     /// `math.random`'s generator.
     pub(crate) rand: crate::lib_math::GlibcRand,
+    identity: crate::heap::Identity,
 }
 
 /// The host's way in: run the closure with the `&mut Vm` as the VM in effect.
@@ -417,6 +418,7 @@ impl Vm {
             host: None,
             reentry: None,
             rand: crate::lib_math::GlibcRand::seeded(1),
+            identity: Default::default(),
         };
         vm.heap.threshold = 2 * vm.heap.bytes().max(32 * 1024);
         vm
@@ -1266,8 +1268,11 @@ impl Vm {
             self.in_handler,
             self.in_hook,
         );
+        let id = self.identity();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
             Ok(v) => v,
+            // Another VM in this one's place has its own state to keep.
+            Err(payload) if self.identity() != id => std::panic::resume_unwind(payload),
             Err(payload) => {
                 let (frames, c_depth, top, handlers, in_handler, in_hook) = at;
                 self.close_upvals(top);
@@ -1496,10 +1501,13 @@ impl Vm {
             tailcalls: 0,
             boundary: false,
         });
-        let n = match host {
-            Some(h) => h(self, nargs)?,
-            None => f(self, nargs)?,
+        let id = self.identity();
+        let r = match host {
+            Some(h) => h(self, nargs),
+            None => f(self, nargs),
         };
+        self.check_identity(id);
+        let n = r?;
         // A string the native made could not be: it raises here, in its caller.
         if self.heap.oom {
             return Err(self.memory_error());
@@ -1753,9 +1761,31 @@ impl Vm {
         h.counted -= h.step;
         let f = h.f.clone();
         self.in_hook = true;
+        let id = self.identity();
         let r = f(self);
+        self.check_identity(id);
         self.in_hook = false;
         r
+    }
+
+    /// This VM's and its heap's identity ([`crate::heap::Identity`]).
+    #[inline(always)]
+    fn identity(&self) -> (u64, u64) {
+        (self.identity.0, self.heap.identity.0)
+    }
+
+    /// Stop if a native replaced the VM or its heap: the running frames' code and stack are
+    /// gone, and a Lua error would resume them.
+    #[inline(always)]
+    fn check_identity(&self, id: (u64, u64)) {
+        #[cold]
+        #[inline(never)]
+        fn replaced() -> ! {
+            panic!("a native replaced the running Lua VM or its heap");
+        }
+        if self.identity() != id {
+            replaced();
+        }
     }
 
     // ── stack inspection ─────────────────────────────────────────────────────────────────────

@@ -444,6 +444,7 @@ pub struct Census {
 
 #[derive(Clone)]
 pub struct Heap {
+    pub(crate) identity: Identity,
     strs: Arena<StrObj>,
     /// The intern table: open addressing, linear probing, at most half full.
     strt: Vec<u32>,
@@ -501,9 +502,30 @@ struct SourceBook {
     scan_in: usize,
 }
 
+/// Which VM or heap this is: a fresh number for each one made and each clone. Natives hold
+/// `&mut Vm`, so one could put another VM or heap in place of the running one
+/// (`*vm = new_state()`), freeing the code and stack the running frames point into; the
+/// interpreter compares identities after every native and stops instead ([`Vm::identity`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Identity(pub(crate) u64);
+
+impl Default for Identity {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Identity(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Clone for Identity {
+    fn clone(&self) -> Self {
+        Identity::default()
+    }
+}
+
 impl Default for Heap {
     fn default() -> Self {
         let mut h = Heap {
+            identity: Identity::default(),
             strs: Arena::new(),
             strt: vec![STRT_EMPTY; 128],
             tables: Arena::new(),
