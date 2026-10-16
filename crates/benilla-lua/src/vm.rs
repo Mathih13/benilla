@@ -2068,14 +2068,14 @@ impl Vm {
                     (fr!().maxstack as usize)
                 };
             }
-            // SAFETY: the upvalue list lives as the code does (`Frame::upvals`), and the
-            // compiler indexes only the upvalues the function has.
+            // SAFETY: the upvalue list lives as the code does (`Frame::upvals`), and
+            // `Proto::verify` checked every index against the function's upvalues.
             macro_rules! upval {
                 ($i:expr) => {
                     unsafe { *fr!().upvals.add($i as usize) }
                 };
             }
-            // SAFETY: the compiler only encodes constants this function has.
+            // SAFETY: `Proto::verify` checked every constant index against the table.
             macro_rules! kv {
                 ($i:expr) => {{
                     let i = $i as usize;
@@ -2089,8 +2089,8 @@ impl Vm {
                     regs = unsafe { self.stack.as_mut_ptr().add(base!()) }
                 };
             }
-            // SAFETY for `r!`: `regs` is current (see above), and the compiler addresses no
-            // register at or past `maxstack` (`Fc::reserve`, `Fc::need`).
+            // SAFETY for `r!`: `regs` is current (see above), and `Proto::verify` checked that no
+            // instruction addresses a register at or past `maxstack`.
             macro_rules! r {
                 ($x:expr) => {
                     *{
@@ -2193,7 +2193,7 @@ impl Vm {
             macro_rules! jump {
                 ($off:expr) => {{
                     let off = $off as isize;
-                    // SAFETY: the compiler's jumps land inside the function.
+                    // SAFETY: `Proto::verify` checked that every jump lands inside the code.
                     ip = unsafe { ip.offset(off) };
                     // A loop's back edge: the place the budget hook is counted.
                     if off < 0 && self.hooked {
@@ -2304,7 +2304,8 @@ impl Vm {
             }
             loop {
                 debug_assert!(unsafe { (*fr!().proto).code.as_ptr_range().contains(&ip) });
-                // SAFETY: every function ends in `Return`, and every jump lands inside it.
+                // SAFETY: `Proto::verify` checked that every function ends in a return and every jump
+                // lands inside it.
                 let op = unsafe { *ip };
                 ip = unsafe { ip.add(1) };
                 match op {
