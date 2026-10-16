@@ -114,7 +114,6 @@ pub struct Names {
     pub tostring: StrRef,
     pub n: StrRef,
     pub next: StrRef,
-    pub gpow: StrRef,
 }
 
 #[derive(Clone)]
@@ -388,7 +387,6 @@ impl Vm {
             tostring: s(b"__tostring"),
             n: s(b"n"),
             next: s(b"next"),
-            gpow: s(b"__pow"),
         };
         // `lua_newstate`: both made by `luaH_new(L, 0, 2)`.
         let globals = heap.new_table(0, 2);
@@ -1064,8 +1062,8 @@ impl Vm {
         Err(self.rt_error("loop in settable"))
     }
 
-    /// 5.0's `Arith`. Numbers (and numeric strings) compute, `^` through the global `__pow`;
-    /// anything else tries the operands' metamethods.
+    /// 5.1's `Arith`. Numbers (and numeric strings) compute, `^` with C's `pow`; anything else
+    /// tries the operands' metamethods, `__pow` for `^`.
     #[cold]
     #[inline(never)]
     fn arith(
@@ -2036,7 +2034,6 @@ impl Vm {
             n.tostring,
             n.n,
             n.next,
-            n.gpow,
         ] {
             roots.push(Value::Str(s));
         }
@@ -2602,7 +2599,7 @@ impl Vm {
                     Op::JmpCmpK(cj, b, kx, off) => cmpk!(cj.cmp(), cj.cond(), r!(b), kv!(kx), off),
                     Op::JmpCmpKR(cj, kx, c, off) => cmpk!(cj.cmp(), cj.cond(), kv!(kx), r!(c), off),
                     Op::Pow(a, b, c) => {
-                        // 5.0's `^` always goes through the global `__pow`.
+                        // 5.1's `OP_POW`: always `Arith`, numbers through `pow`.
                         let (x, y) = (rk!(b), rk!(c));
                         let v = slow!(self.arith(Arith::Pow, x, y, (rkreg!(b), rkreg!(c))))?;
                         r!(a) = v;
@@ -2881,10 +2878,11 @@ impl Vm {
                             r!(a + 3) = v;
                         }
                     }
-                    // 5.0's `TFORPREP`: a table becomes `next` over it once, at loop entry. The
-                    // C build's patch swaps at every `TFORLOOP` instead, so a callable-table
-                    // global `next` raises `invalid key to 'next'` after one pass there; benilla
-                    // keeps 5.0's single swap, which the 1.12 client runs.
+                    // The client's `TFORPREP` (`0x6f94a2`): a table generator becomes the raw
+                    // global `next` over it once, at loop entry. The C build's patch swaps at
+                    // every `TFORLOOP` instead, so where the global `next` is a callable table
+                    // it raises `invalid key to 'next'` after one pass; the single swap here
+                    // moves benilla-lua toward the reference.
                     Op::TForPrep(a, off) => {
                         if let V::Table(_) = (r!(a)).unpack() {
                             r!(a + 1) = r!(a);

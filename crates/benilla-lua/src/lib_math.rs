@@ -76,7 +76,8 @@ pub fn open(vm: &mut Vm) {
         .set(k, Value::Num(std::f64::consts::PI))
         .unwrap();
     vm.set_global("math", Value::Table(t));
-    // `luaopen_math` registers `math_pow` as the global `__pow`, which the VM calls for `^`.
+    // 5.0's `luaopen_math` registers `math_pow` as the global `__pow`, as the client's does; the
+    // VM's `^` is 5.1's and reads no global.
     let pow = vm.new_native("__pow", |vm, n| bin(vm, n, f64::powf));
     vm.set_global("__pow", pow);
     open_bit(vm);
