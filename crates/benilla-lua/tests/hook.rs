@@ -187,6 +187,37 @@ fn a_hook_set_while_lua_runs_counts_from_there() {
     }
 }
 
+/// A loop whose back edge moves it to the VM's slow loop, a hook having been set, runs each
+/// iteration once with its own index, whatever its step: the index is written before the jump.
+#[test]
+fn a_loop_moved_by_a_hook_keeps_its_index() {
+    for (src, sum) in [
+        (
+            "arm() local s = 0 for i = 10, 1, -1 do s = s + i end return s",
+            "55",
+        ),
+        (
+            "arm() local s = 0 for i = 1, 20, 2 do s = s + i end return s",
+            "100",
+        ),
+        (
+            "arm() local s = 0 for i = 1, 10 do s = s + i end return s",
+            "55",
+        ),
+    ] {
+        let mut vm = benilla_lua::new_state();
+        let arm = vm.new_host(
+            "arm",
+            Rc::new(|vm: &mut Vm, _| {
+                vm.set_hook(1 << 40, Rc::new(|_: &mut Vm| Ok(())));
+                Ok(0)
+            }),
+        );
+        vm.set_global("arm", arm);
+        assert_eq!(run(&mut vm, src), sum, "{src}");
+    }
+}
+
 fn counts_from_the_arming(src: &str) {
     let ours = {
         let mut vm = benilla_lua::new_state();
