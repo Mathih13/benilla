@@ -772,7 +772,8 @@ impl Vm {
         None
     }
 
-    pub(crate) fn frames_empty(&self) -> bool {
+    /// No Lua or native runs on this VM: no call is in progress.
+    pub fn frames_empty(&self) -> bool {
         self.frames.is_empty()
     }
 

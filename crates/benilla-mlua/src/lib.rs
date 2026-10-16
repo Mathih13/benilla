@@ -270,7 +270,16 @@ impl Lua {
     /// An independent copy of this state: the whole VM, every value and closure, with no host
     /// data; the caller copies the host data it needs (`set_app_data`). A snapshot to restore
     /// from, or a template to start many runs from.
+    ///
+    /// # Panics
+    ///
+    /// Inside a callback of this state: the copy would hold the running calls' frames, which
+    /// nothing would ever return from.
     pub fn fork(&self) -> Lua {
+        assert!(
+            self.vm().frames_empty(),
+            "a state is forked from outside its callbacks"
+        );
         let vm: Vm = self.vm().clone();
         Lua::over(Box::new(vm), self.0.family)
     }
