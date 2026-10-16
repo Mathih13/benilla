@@ -224,6 +224,8 @@ pub(crate) struct FuncState {
     pub nactvar: u8,
     pub freereg: u8,
     pub maxstack: u8,
+    /// [`Proto::c_maxstack`]: `maxstack` as `luaK_checkstack` alone raises it.
+    c_maxstack: u8,
     /// The last pc marked as a jump target (`luaK_getlabel`), in 5.1's count, or -1.
     lasttarget: i64,
     /// `LoadNil`s at the head of the function that 5.1 leaves out (see [`Parser::nil`]).
@@ -263,6 +265,7 @@ impl FuncState {
             nactvar: 0,
             freereg: 0,
             maxstack: 2,
+            c_maxstack: 2,
             lasttarget: -1,
             silent_nils: 0,
             jpc: NO_JUMP,
@@ -335,6 +338,7 @@ impl FuncState {
             vararg: self.vararg,
             clears: self.clears,
             maxstack: self.maxstack as u16 + 1,
+            c_maxstack: self.c_maxstack,
             source_id: heap.source_id(&self.source),
             source: self.source,
             line_defined: self.linedefined,
@@ -660,6 +664,8 @@ impl<'a> Parser<'a> {
             }
             self.fs().maxstack = newstack as u8;
         }
+        let fs = self.fs();
+        fs.c_maxstack = fs.c_maxstack.max(newstack as u8);
         Ok(())
     }
 

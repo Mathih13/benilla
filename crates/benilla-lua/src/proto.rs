@@ -314,11 +314,16 @@ pub struct Proto {
     /// `...`: the extras become the `arg` table in register `nparams`.
     pub vararg: bool,
     /// The function has a generic `for` over more than three values, whose body can read the
-    /// register above its variables before anything writes it: its frame starts with every
-    /// register nil, as `luaD_precall` starts every frame. Elsewhere the code writes each
-    /// register before it reads it, so the VM skips the clearing.
+    /// registers above its variables before anything writes them: what the calls under it left.
+    /// While it runs, the VM clears each frame entered in its range as `luaD_precall` clears
+    /// every frame (`Vm`'s `clear_below`). Elsewhere the code writes each register before it
+    /// reads it, so the VM skips the clearing.
     pub clears: bool,
     pub maxstack: u16,
+    /// 5.1's `maxstacksize`, the registers the C build's code for this function uses: the frame
+    /// a call clears ([`crate::vm::Vm`]'s `clear_below`). `maxstack` is more by the slot the
+    /// generic `for` steps `next` into and the scratch registers benilla's operands need.
+    pub c_maxstack: u8,
     pub source: Bytes,
     pub line_defined: u32,
     pub locvars: Vec<LocVar>,

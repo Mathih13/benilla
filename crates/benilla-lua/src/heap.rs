@@ -91,6 +91,8 @@ pub(crate) struct Shape {
     /// A call enters through `Vm::precall`: the function takes `...` or clears its registers.
     pub(crate) precall: bool,
     pub(crate) maxstack: u16,
+    /// [`Proto::c_maxstack`].
+    pub(crate) c_maxstack: u8,
     /// The first instruction, so a call starts its frame without reaching the prototype.
     /// Valid as long as the prototype, which the closure holds.
     pub(crate) code: *const crate::proto::Op,
@@ -105,6 +107,7 @@ impl Shape {
             nparams: p.nparams,
             precall: p.vararg || p.clears,
             maxstack: p.maxstack,
+            c_maxstack: p.c_maxstack,
             code: p.code.as_ptr(),
             consts: p.consts.as_ptr(),
         }

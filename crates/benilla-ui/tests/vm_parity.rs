@@ -567,6 +567,20 @@ b]])"#),
           R(t .. "for k in pairs(t) do end for k in next, t, nil, 42 do local y = k table.insert(o, type(y)) end return table.concat(o, ' ')"),
           R(t .. "local function f() local a, b, c, d, e, g, h, i, j, l = 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x' end "
             .. "local function h() for k, v, w, x in next, t, nil, 42 do local y = k table.insert(o, tostring(y)) end end f() h() return table.concat(o, ' ')"))"#),
+    // `luaD_precall` starts every Lua frame with its registers nil, and `OP_TAILCALL` makes the
+    // callee's frame where its function sits before moving it down: a generic `for` over more
+    // than three values lets its body read what the calls under it left.
+    ("fix-vm frame_clears", r#"local function R(src) return E(loadstring(src, "=t")) end
+        local P = 'local o, n = {}, 0 local function T(v) return type(v) == "function" and "f" or tostring(v) end '
+        local B = ' for k in it, "s", "c", 1, 2, 3, 4, 5, 6 do local x1, x2, x3, x4, x5, x6, x7, x8, x9 '
+          .. 'table.insert(o, T(x1)..T(x2)..T(x3)..T(x4)..T(x5)..T(x6)..T(x7)..T(x8)..T(x9)) end return table.concat(o, " ")'
+        local I = 'local function it(s, c) n = n + 1 if n > 3 then return nil end if n == 1 then '
+        return S(R(P .. I .. 'local a, b, c2, d = "A", "B", "C", "D" end return n end' .. B),
+          R(P .. 'local function deep(m) if m > 0 then return deep(m - 1) end local a, b, c, d, e = "P", "Q", "R", "S", "T" end '
+            .. I .. 'local function g() local a, b, c2, d, e, f = "A", "B", "C", "D", "E", "F" end g() deep(2) end return n end' .. B),
+          R(P .. 'local function two(a, b) local x, y = "X", "Y" end ' .. I .. 'two(1, 2, 3, 4, 5, 6, 7) end return n end' .. B),
+          R(P .. 'local function w() local a, b, c, d, e, f, g, h = "a", "b", "c", "d", "e", "f", "g", "h" end '
+            .. 'local function t2(a) end local function t1() return t2(1) end ' .. I .. 'w() t1() end return n end' .. B))"#),
     // `__index` and `__newindex` chains: 5.1.5's `luaV_gettable` and `luaV_settable` take 100 steps.
     ("fix-vm tag_loop", r#"local function chain(n, field)
           local last = {x = "found"}

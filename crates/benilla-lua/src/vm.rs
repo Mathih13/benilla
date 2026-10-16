@@ -144,6 +144,12 @@ pub struct Vm {
     /// `ci_size - 1`: a call is made while `frames.len()` is below it, one compare on the call
     /// path.
     ci_limit: usize,
+    /// The stack below it may hold the frame of a running function whose code can read a
+    /// register it has not written (`Proto::clears`). A Lua frame entered below it starts with
+    /// every register past its arguments nil, as `luaD_precall` starts every frame, so such code
+    /// reads what C's would; above it no code can tell, and the clearing is skipped. Raised as
+    /// such a function is entered, reset at the host's outermost call.
+    clear_below: usize,
     /// Error handlers running (`throw`): only they may use the margin past `MAX_RUST_STACK`.
     in_handler: u32,
     /// The Rust stack address where the outermost host-level call entered (`MAX_RUST_STACK`).
@@ -406,6 +412,7 @@ impl Vm {
             c_depth: 0,
             ci_size: BASIC_CI_SIZE,
             ci_limit: BASIC_CI_SIZE - 1,
+            clear_below: 0,
             stack_base: 0,
             in_handler: 0,
             handlers: Vec::new(),
@@ -1309,6 +1316,7 @@ impl Vm {
         if !self.frames.is_empty() {
             return self.call_at_inner(func_idx, nargs, nres);
         }
+        self.clear_below = 0;
         let r = self.unwind_guard(|vm| vm.call_at_inner(func_idx, nargs, nres));
         if let Some(p) = self.profile.as_mut() {
             p.close();
@@ -1444,6 +1452,19 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn precall(&mut self, func_idx: usize, nargs: usize, nres: i32) -> Result<Called, LuaError> {
+        self.precall_clearing(func_idx, nargs, nres, false)
+    }
+
+    /// [`Vm::precall`]; `clear` clears a Lua frame's registers wherever it starts.
+    #[cold]
+    #[inline(never)]
+    fn precall_clearing(
+        &mut self,
+        func_idx: usize,
+        nargs: usize,
+        nres: i32,
+        clear: bool,
+    ) -> Result<Called, LuaError> {
         let mut nargs = nargs;
         let fref = match self.stack[func_idx].unpack() {
             V::Func(f) => f,
@@ -1492,22 +1513,18 @@ impl Vm {
                 } else if nargs > np {
                     fill_from = base + np;
                 }
-                // Missing parameters are nil. The registers above are cleared, as C Lua clears
-                // them, only where the code can read one it has not written (`Proto::clears`);
-                // the collector skips a stale handle (`Heap::collect`).
-                let params_end = base + np;
-                if fill_from < params_end {
-                    for v in &mut self.stack[fill_from..params_end] {
-                        *v = Value::Nil;
-                    }
-                }
+                // Missing parameters are nil; below `clear_below`, every register past the
+                // parameters too, extra arguments included, as `luaD_precall` clears them.
                 if proto.clears {
-                    let from = if proto.vararg {
-                        base + np + 1
-                    } else {
-                        base + np
-                    };
-                    for v in &mut self.stack[from..frame_top] {
+                    self.clear_below = self.clear_below.max(frame_top);
+                }
+                let end = if clear || base < self.clear_below {
+                    base + proto.c_maxstack as usize
+                } else {
+                    base + np
+                };
+                if fill_from < end {
+                    for v in &mut self.stack[fill_from..end] {
                         *v = Value::Nil;
                     }
                 }
@@ -2700,6 +2717,7 @@ impl Vm {
                                 // frame list.
                                 if !shape.precall && self.frames.len() < self.ci_limit {
                                     let np = shape.nparams as usize;
+                                    let cmax = shape.c_maxstack as usize;
                                     let consts = shape.consts;
                                     let nbase = func_idx + 1;
                                     let ftop = nbase + shape.maxstack as usize;
@@ -2719,7 +2737,14 @@ impl Vm {
                                         boundary: false,
                                     };
                                     self.ensure(ftop + 1);
-                                    if nargs < np {
+                                    if nbase < self.clear_below {
+                                        // As `precall`: every register past the arguments.
+                                        for v in
+                                            &mut self.stack[nbase + nargs.min(np)..nbase + cmax]
+                                        {
+                                            *v = Value::Nil;
+                                        }
+                                    } else if nargs < np {
                                         for v in &mut self.stack[nbase + nargs..nbase + np] {
                                             *v = Value::Nil;
                                         }
@@ -2802,8 +2827,31 @@ impl Vm {
                         }
                         let b0 = base!();
                         self.close_upvals(b0);
+                        let dest = fr!().func_idx();
+                        if dest < self.clear_below {
+                            // `OP_TAILCALL`'s order, where code may read what it leaves: the
+                            // callee's frame is made where its function sits, registers cleared,
+                            // then moved down whole over this one, and the place it was made
+                            // keeps its copy.
+                            let nres = fr!().nresults;
+                            self.precall_clearing(func_idx, nargs, nres, true)?;
+                            let mut new = self.frames.pop().unwrap();
+                            let me = self.frames.pop().unwrap();
+                            // C's frame, to `ci->top`; benilla's spare slots above stay as they
+                            // were.
+                            // SAFETY: the closure just called holds its code (`Frame::proto`).
+                            let cmax = unsafe { &*new.proto }.c_maxstack as usize;
+                            self.stack.copy_within(func_idx..func_idx + 1 + cmax, dest);
+                            self.top -= func_idx - dest;
+                            new.base = dest as u32 + 1;
+                            // 5.1's `ci->tailcalls++` is a C int; saturated here so 2^32 tail
+                            // calls cannot overflow, a count no traceback reaches.
+                            new.tailcalls = me.tailcalls.saturating_add(1);
+                            new.boundary = me.boundary;
+                            self.frames.push(new);
+                            continue 'frame;
+                        }
                         let me = self.frames.pop().unwrap();
-                        let dest = me.func_idx();
                         self.stack.copy_within(func_idx..func_idx + nargs + 1, dest);
                         self.top = dest + nargs + 1;
                         match self.precall(dest, nargs, me.nresults) {
