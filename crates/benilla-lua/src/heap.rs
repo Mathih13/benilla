@@ -279,6 +279,9 @@ struct Arena<T> {
     mask: usize,
 }
 
+/// An arena's first size, and the least a sweep shrinks it to.
+const ARENA_FIRST: usize = 64;
+
 /// A slot with no live object.
 const FREE: u8 = 0;
 /// A live object a collection has not reached yet.
@@ -332,13 +335,12 @@ impl Dead for UserObj {
 
 impl<T: Dead> Arena<T> {
     fn new() -> Self {
-        const FIRST: usize = 64;
         Arena {
-            items: (0..FIRST).map(|_| T::dead()).collect(),
-            state: vec![FREE; FIRST],
+            items: (0..ARENA_FIRST).map(|_| T::dead()).collect(),
+            state: vec![FREE; ARENA_FIRST],
             free: Vec::new(),
             used: 0,
-            mask: FIRST - 1,
+            mask: ARENA_FIRST - 1,
         }
     }
 
@@ -1003,9 +1005,9 @@ impl Heap {
         );
         live += sweep(&mut self.upvals, |_| 24, |_| false, drop);
         live += sweep(&mut self.users, |_| 32, |_| false, drop);
-        let freed = self.strs.free.len();
+        let strs_before = self.strs.live();
         live += sweep(&mut self.strs, |s| 32 + s.bytes().len(), |_| false, drop);
-        let dead_str = self.strs.free.len() != freed;
+        let dead_str = self.strs.live() != strs_before;
         let live_strs = self.strs.live() as u32;
         self.str_gc_at = live_strs + (self.str_id_limit.saturating_sub(live_strs)) / 2;
         if dead_str {
@@ -1080,6 +1082,10 @@ fn mark_proto(p: &Rc<Proto>, gray: &mut Vec<Value>, epoch: u32) {
 
 /// Free every live object the mark left unmarked, and unmark the rest; answers the bytes that
 /// stay.
+///
+/// The slots past the last live one are given back, and the free list is rebuilt so `alloc`
+/// takes the lowest free slot first: new objects fill the bottom, and the next sweep's range
+/// follows the live set instead of the most the arena ever held.
 fn sweep<T: Dead>(
     a: &mut Arena<T>,
     size: impl Fn(&T) -> usize,
@@ -1089,12 +1095,14 @@ fn sweep<T: Dead>(
     let mut live = 0;
     let n = a.used as usize;
     let (items, state) = (&mut a.items[..n], &mut a.state[..n]);
+    let mut top = 0;
     for i in 0..n {
         match state[i] {
             FREE => {}
             MARKED => {
                 state[i] = LIVE;
                 live += size(&items[i]);
+                top = i + 1;
             }
             _ => {
                 if keep(&items[i]) {
@@ -1103,9 +1111,55 @@ fn sweep<T: Dead>(
                     items[i] = T::dead();
                 }
                 state[i] = FREE;
-                a.free.push(i as u32);
             }
         }
     }
+    a.used = top as u32;
+    a.free.clear();
+    a.free.extend(
+        (0..top as u32)
+            .rev()
+            .filter(|&i| a.state[i as usize] == FREE),
+    );
+    // Halve while a quarter or less is in use, so a spike's arena does not stay that size.
+    let mut len = a.items.len();
+    while len > ARENA_FIRST && top <= len / 4 {
+        len /= 2;
+    }
+    if len < a.items.len() {
+        a.items.truncate(len);
+        a.items.shrink_to_fit();
+        a.state.truncate(len);
+        a.state.shrink_to_fit();
+        a.mask = len - 1;
+    }
     live
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spike of garbage leaves no high-water mark: the arena shrinks back, and what is made
+    /// after fills the bottom, so a sweep's range follows the live set.
+    #[test]
+    fn a_sweep_gives_back_a_spikes_slots() {
+        let mut h = Heap::default();
+        let keep = h.new_table(0, 0);
+        for _ in 0..100_000 {
+            h.new_table(0, 0);
+        }
+        let mode = h.intern(b"__mode");
+        h.collect(&[Value::Table(keep)], &[], &[], mode);
+        assert!(h.tables.items.len() <= 4 * ARENA_FIRST, "the arena shrank");
+        let t = h.new_table(0, 0);
+        assert!(
+            (t.0 as usize) < ARENA_FIRST,
+            "a new table takes a low slot, got {}",
+            t.0
+        );
+        h.collect(&[Value::Table(keep), Value::Table(t)], &[], &[], mode);
+        assert_eq!(h.table(keep).array.len(), 0, "the kept table is intact");
+        assert!(h.tables.used as usize <= ARENA_FIRST);
+    }
 }
