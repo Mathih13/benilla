@@ -884,8 +884,10 @@ fn without_mlua_wrapper(s: &str) -> String {
 /// - `math.random` is the host `rand`.
 ///
 /// benilla-lua pins the reference platform's answers for the compiler and `rand` cases, and runs
-/// the host libm, so it answers as the C build only on the reference platform; elsewhere it skips
-/// these cases.
+/// the host libm, so it answers a whole case as the C build only on the reference platform.
+/// Elsewhere, and on a platform no answer was blessed on, a case's answer is split into items at
+/// its separator, and each item every recorded platform answers alike is checked: only the items
+/// the platforms differ on go unchecked.
 const PLATFORM_CASES: &[&str] = &[
     "fix-libs deg_rad",
     "fix-libs random_ranges",
@@ -909,6 +911,60 @@ const PLATFORM_CASES: &[&str] = &[
     "sweep math.atan",
     "sweep math.atan2",
 ];
+
+/// Where a platform case's answer splits into items: a sweep's calls, the random numbers, else
+/// the answer's `|`-separated parts.
+fn item_separator(name: &str) -> &'static str {
+    if name.starts_with("sweep ") {
+        " | "
+    } else if name == "fix-libs random_ranges" {
+        " "
+    } else {
+        "|"
+    }
+}
+
+/// A platform case checked item by item against `recorded`, each blessed platform's answer: the
+/// failures, how many items went unchecked because the platforms answer them differently, and
+/// how many there are. `None` when nothing was recorded, or the platforms' answers do not split
+/// alike.
+fn check_items(name: &str, got: &str, recorded: &[String]) -> Option<(Vec<String>, usize, usize)> {
+    let sep = item_separator(name);
+    let sets: Vec<Vec<&str>> = recorded.iter().map(|a| a.split(sep).collect()).collect();
+    let n = sets.first()?.len();
+    if sets.iter().any(|s| s.len() != n) {
+        return None;
+    }
+    let got: Vec<&str> = got.split(sep).collect();
+    if got.len() != n {
+        return Some((
+            vec![format!("{name}: {} items, the C build {n}", got.len())],
+            0,
+            n,
+        ));
+    }
+    let mut failures = Vec::new();
+    let mut unchecked = 0;
+    // A NaN prints the same `nan` under Apple's libc whatever its sign, so a NaN item agreeing
+    // says nothing of the sign another platform's libm gives it.
+    let nan = |a: &str| {
+        a.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == "nan")
+    };
+    for (i, g) in got.iter().enumerate() {
+        let w = sets[0][i];
+        if sets.iter().any(|s| s[i] != w || nan(s[i])) {
+            unchecked += 1;
+        } else if *g != w {
+            failures.push(format!(
+                "{name} item {i}\n    got:  {}\n    want: {}",
+                g.escape_default(),
+                w.escape_default()
+            ));
+        }
+    }
+    Some((failures, unchecked, n))
+}
 
 /// The platform benilla-lua's pinned answers are the C build's on: Linux, x86-64, glibc.
 const REFERENCE_PLATFORM: &str = "linux-x86_64";
@@ -1035,15 +1091,33 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
     }
     let mut failures = Vec::new();
     let mut skipped = Vec::new();
+    let (mut unchecked_items, mut items) = (0, 0);
     for (name, got) in &answers {
-        let got = got.escape_default().to_string();
         let platform_case = PLATFORM_CASES.contains(name);
-        // benilla-lua answers a platform case as the C build only where its pins were taken.
-        if platform_case && cfg!(feature = "benilla-vm") && platform != REFERENCE_PLATFORM {
-            skipped.push(*name);
+        // benilla-lua answers a whole platform case as the C build only where its pins were
+        // taken; elsewhere, and where no answer was blessed, the items every platform agrees on.
+        let own = want.get(&golden_key(name, &platform));
+        if platform_case
+            && (own.is_none() || (cfg!(feature = "benilla-vm") && platform != REFERENCE_PLATFORM))
+        {
+            let prefix = format!("{name}@");
+            let recorded: Vec<String> = want
+                .iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(_, a)| without_mlua_wrapper(&unescape(a)))
+                .collect();
+            match check_items(name, &without_mlua_wrapper(got), &recorded) {
+                Some((f, unchecked, n)) => {
+                    failures.extend(f);
+                    unchecked_items += unchecked;
+                    items += n;
+                }
+                None => skipped.push(*name),
+            }
             continue;
         }
-        match want.get(&golden_key(name, &platform)) {
+        let got = got.escape_default().to_string();
+        match own {
             Some(w) if *w == got => {}
             Some(w)
                 if without_mlua_wrapper(&unescape(w))
@@ -1056,8 +1130,6 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
                     .to_string();
                 failures.push(format!("{name}\n    got:  {got}\n    want: {w}"))
             }
-            // A platform case no one has blessed on this platform yet.
-            None if platform_case => skipped.push(*name),
             None => failures.push(format!(
                 "{name}: no golden answer; bless on the C Lua build"
             )),
@@ -1066,6 +1138,13 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
     let surface_golden =
         std::fs::read_to_string(dir.join(SURFACE_GOLDEN)).expect("the surface golden file");
     compare(&surface_golden, &surface, &mut failures);
+    if items > 0 {
+        eprintln!(
+            "platform cases on {platform}: {} of {items} items checked, {unchecked_items} the \
+             platforms answer differently not",
+            items - unchecked_items
+        );
+    }
     if !skipped.is_empty() {
         eprintln!(
             "{} platform cases not checked on {platform}: {}",
@@ -1075,7 +1154,7 @@ fn every_case_answers_as_the_c_lua_build_recorded() {
     }
     assert!(
         failures.is_empty(),
-        "{} of {} cases differ:\n{}",
+        "{} answers of {} cases differ:\n{}",
         failures.len(),
         cases.len(),
         failures.join("\n")
