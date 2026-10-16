@@ -2230,6 +2230,16 @@ impl Vm {
                     fr_mut!().ip = ip
                 };
             }
+            /// `check_gc` at a safe point: a collection drops the host closures it freed, whose
+            /// destructors may run Lua and move the stack, so the registers are refreshed after.
+            macro_rules! gc {
+                () => {
+                    if self.heap.bytes() >= self.heap.threshold || self.gc_stress {
+                        self.full_gc();
+                        refresh!();
+                    }
+                };
+            }
             /// A call that may run Lua: the pc saved first, the registers refreshed after.
             macro_rules! slow {
                 ($e:expr) => {{
@@ -2551,7 +2561,7 @@ impl Vm {
                         r!(a) = Value::Table(t);
                         save!();
                         self.top = base!() + maxstack!();
-                        self.check_gc();
+                        gc!();
                     }
                     Op::SelfOp(a, b, c) => {
                         let obj = r!(b);
@@ -2619,7 +2629,7 @@ impl Vm {
                         let b0 = base!();
                         slow!(self.concat(b0 + b as usize, b0 + c as usize))?;
                         r!(a) = r!(b);
-                        self.check_gc();
+                        gc!();
                     }
                     Op::Jmp(off) => jump!(off),
                     Op::JmpCmp(cj, b, c, off) => {
@@ -2727,7 +2737,7 @@ impl Vm {
                                 if c != 0 {
                                     self.top = base!() + maxstack!();
                                 }
-                                self.check_gc();
+                                gc!();
                                 continue;
                             }
                         }
@@ -2738,7 +2748,7 @@ impl Vm {
                                 if c != 0 {
                                     self.top = base!() + maxstack!();
                                 }
-                                self.check_gc();
+                                gc!();
                             }
                         }
                     }
@@ -3005,7 +3015,7 @@ impl Vm {
                         r!(a) = Value::Func(f);
                         save!();
                         self.top = base!() + maxstack!();
-                        self.check_gc();
+                        gc!();
                     }
                 }
             }

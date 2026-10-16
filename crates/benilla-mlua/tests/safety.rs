@@ -200,6 +200,44 @@ fn a_destructor_run_by_the_collector_can_use_the_state() {
     );
 }
 
+/// A destructor the interpreter's own collection runs may grow the value stack, moving it: the
+/// frame that was running reads and writes its registers where they now are.
+#[test]
+fn a_destructor_that_moves_the_stack_leaves_the_running_frame_sound() {
+    struct Grow(Lua);
+    impl Drop for Grow {
+        fn drop(&mut self) {
+            let deep = "local function r(n) if n > 0 then return 1 + r(n - 1) end return 0 end \
+                        return r(10000)";
+            assert_eq!(self.0.load(deep).eval::<i64>().unwrap(), 10000);
+        }
+    }
+    let lua = Lua::new();
+    let g = Grow(lua.clone());
+    let f = lua
+        .create_function(move |_, ()| {
+            let _ = &g;
+            Ok(())
+        })
+        .unwrap();
+    drop(f);
+    // A table a pass, so a collection runs at a `NewTable` with the loop's registers live.
+    // Registers written through a stale pointer corrupt the heap, which can hang the loop: a
+    // watchdog fails the test instead.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watched = done.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        if !watched.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("the loop after the stack moved never ended");
+            std::process::abort();
+        }
+    });
+    let src = "local s = 0 for i = 1, 100000 do local t = {} local x = i s = s + x end return s";
+    assert_eq!(lua.load(src).eval::<i64>().unwrap(), 5_000_050_000);
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A value whose conversion collects garbage, as a conversion that runs Lua may.
 struct Collects(f64);
 
