@@ -149,3 +149,50 @@ fn table_growth_counts_toward_the_heap() {
         "a 100000-slot array is over a megabyte, gcinfo says {kb} KB"
     );
 }
+
+/// The handler convention: the globals hold the given values for the call alone, and their
+/// earlier values come back after it, after an error too, even when the call collected.
+#[test]
+fn a_call_with_globals_puts_them_back() {
+    let mut vm = benilla_lua::new_state();
+    vm.gc_stress = true;
+    run(&mut vm, "this = {name = 'outer'} event = nil");
+    let f = vm
+        .load(
+            b"Seen = this.name .. ':' .. event .. ':' .. arg1 collectgarbage() error('boom')",
+            b"=handler",
+        )
+        .unwrap();
+    let hf = vm.root(f);
+    let t = vm.exec(b"return {name = 'frame'}", b"=t").unwrap()[0];
+    let held = [hf, vm.root(t)];
+    let name = |vm: &mut benilla_lua::Vm, s: &[u8]| {
+        let v = vm.str(s);
+        vm.root(v);
+        v
+    };
+    let (this, event, arg1, ev) = (
+        name(&mut vm, b"this"),
+        name(&mut vm, b"event"),
+        name(&mut vm, b"arg1"),
+        name(&mut vm, b"PLAYER_LOGIN"),
+    );
+    let sets = [
+        (this.as_str().unwrap(), t),
+        (event.as_str().unwrap(), ev),
+        (arg1.as_str().unwrap(), Value::Num(7.0)),
+    ];
+    let r = vm.call_with_globals(f, &sets);
+    assert!(r.is_err(), "the handler's error is the answer");
+    assert_eq!(run(&mut vm, "return Seen"), "frame:PLAYER_LOGIN:7");
+    assert_eq!(
+        run(
+            &mut vm,
+            "return this.name .. tostring(event) .. tostring(arg1)"
+        ),
+        "outernilnil"
+    );
+    for h in held {
+        vm.unroot(h);
+    }
+}

@@ -616,6 +616,60 @@ impl Vm {
         }
     }
 
+    /// Call `f`, protected and with no arguments, while each global in `globals` holds the value
+    /// paired with it, read and written through the globals table's metamethods as
+    /// `lua_getglobal` and `lua_setglobal` do; each one's earlier value is put back after the
+    /// call, after an error too. The earlier values wait on the stack, where a collection inside
+    /// the call keeps them. It is the 1.12 script handler's convention (`this`, `event`,
+    /// `arg1..`) in one step. Answers the call's error value, or the first one a read or write
+    /// of the globals raised. `f` and the values must be rooted by the caller, as a host's handles
+    /// root them; the names wait on the stack with the earlier values.
+    pub fn call_with_globals(
+        &mut self,
+        f: Value,
+        globals: &[(StrRef, Value)],
+    ) -> Result<(), Value> {
+        let base = self.top;
+        let n = globals.len();
+        let g = Value::Table(self.globals);
+        for &(k, _) in globals {
+            self.push(Value::Str(k));
+        }
+        let read = self.protected(|vm| {
+            for &(k, _) in globals {
+                let old = vm.index(g, Value::Str(k), None)?;
+                vm.push(old);
+            }
+            Ok(())
+        });
+        if let Err(e) = read {
+            self.top = base;
+            return Err(e);
+        }
+        let set = self.protected(|vm| {
+            for &(k, v) in globals {
+                vm.setindex(g, Value::Str(k), v, None)?;
+            }
+            Ok(())
+        });
+        let called = set.and_then(|()| {
+            let func_idx = self.top;
+            self.push(f);
+            match self.pcall_at(func_idx, 0, 0, None) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.value),
+            }
+        });
+        let mut restored = Ok(());
+        for (i, &(k, _)) in globals.iter().enumerate() {
+            let old = self.stack[base + n + i];
+            let r = self.protected(|vm| vm.setindex(g, Value::Str(k), old, None));
+            restored = restored.and(r);
+        }
+        self.top = base;
+        called.and(restored)
+    }
+
     /// A value as a Rust string, for hosts and tests: strings and numbers as `tostring` writes
     /// them, other values by type.
     pub fn display(&mut self, v: Value) -> String {
