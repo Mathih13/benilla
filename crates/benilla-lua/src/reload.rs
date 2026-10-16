@@ -48,6 +48,10 @@ impl Vm {
     #[allow(clippy::mutable_key_type)] // as `walk`
     pub fn hot_reload(&mut self, chunkname: &[u8], src: &[u8]) -> Result<Report, SyntaxError> {
         let root = crate::compile::compile(src, chunkname, &mut self.heap, 0)?;
+        // A constant the compiler could not make: `not enough memory`, as `Vm::load` answers.
+        if self.heap.take_oom() {
+            return Err(SyntaxError(b"not enough memory".to_vec()));
+        }
         self.heap.charge(root.tree_bytes());
         let mut fresh = HashMap::new();
         walk(&root, &mut fresh);

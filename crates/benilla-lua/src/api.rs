@@ -58,11 +58,13 @@ pub const MAX_C_STACK: usize = 8000;
 
 impl Vm {
     /// 5.1's memory error: `not enough memory`, with no position (`luaD_throw(L, LUA_ERRMEM)`).
+    /// It is thrown as it is: only `luaG_errormsg`, a runtime error, runs an `xpcall` handler.
     #[cold]
     pub fn memory_error(&mut self) -> LuaError {
         self.heap.oom = false;
-        let v = Value::Str(self.heap.oom_str);
-        self.throw(v)
+        LuaError {
+            value: Value::Str(self.heap.oom_str),
+        }
     }
 
     /// Room in `buf` for `extra` more bytes of a string being built, within [`MAX_STRING`] and

@@ -13,8 +13,6 @@ use crate::value::{FuncRef, StrRef, TableRef, Value, V};
 #[derive(Clone, Copy, Debug)]
 pub struct LuaError {
     pub value: Value,
-    /// The innermost protected call's handler already ran on it.
-    handled: bool,
 }
 
 /// 5.1.5's `LUAI_MAXCCALLS`: nested host-level calls (a host call, a metamethod, a library
@@ -697,10 +695,7 @@ impl Vm {
     /// 5.0's `luaD_throw` runs `errfunc` at the raise.
     pub fn throw(&mut self, v: Value) -> LuaError {
         let Some(Some(h)) = self.handlers.last().copied() else {
-            return LuaError {
-                value: v,
-                handled: false,
-            };
+            return LuaError { value: v };
         };
         // 5.1's `luaG_errormsg`: a handler that is not a function is LUA_ERRERR, uncalled.
         if !matches!(h.unpack(), V::Func(_)) {
@@ -715,7 +710,6 @@ impl Vm {
         match r {
             Ok(vals) => LuaError {
                 value: vals.first().copied().unwrap_or(Value::Nil),
-                handled: true,
             },
             Err(e) => e,
         }
@@ -1431,13 +1425,12 @@ impl Vm {
         self.handlers.push(handler);
         let r = self.call_at(func_idx, nargs, nres);
         self.handlers.pop();
-        if let Err(mut e) = r {
+        if let Err(e) = r {
             self.close_upvals(func_idx);
             self.frames.truncate(frames);
             self.c_depth = c_depth;
             self.top = func_idx;
             self.restore_stack_limit();
-            e.handled = false;
             return Err(e);
         }
         Ok(())
@@ -1662,7 +1655,6 @@ impl Vm {
     fn errerr(&mut self) -> LuaError {
         LuaError {
             value: self.str(b"error in error handling"),
-            handled: true,
         }
     }
 
