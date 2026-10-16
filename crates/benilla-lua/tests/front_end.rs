@@ -3,6 +3,11 @@
 //! the same message, and a compiled chunk has, function by function, the C build's constants in
 //! its order, its register count, parameters, locals, upvalues and line numbers: the code
 //! generator allocated as 5.1's does. Every disagreement is printed.
+//!
+//! `front_end.digest` keeps the C build's shapes for when there is no C build to ask: a line per
+//! compiled chunk, a hash of its source and a hash of the C build's shape. `BENILLA_BLESS=1`
+//! rewrites it from the C build; a chunk whose source is not in it (another corpus version) is
+//! not checked against it.
 
 use std::path::{Path, PathBuf};
 
@@ -278,6 +283,31 @@ fn shape_diff(a: &Shape, b: &Shape, path: &str) -> Option<String> {
         .then(|| format!("function {path}\n    ours: {x:?}\n    fork: {y:?}"))
 }
 
+/// FNV-1a, 64 bits: stable across platforms and Rust versions, which `DefaultHasher` is not.
+fn fnv64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+const DIGEST: &str = "tests/front_end.digest";
+
+/// The digest file: each source hash's shape hash.
+fn read_digest() -> std::collections::HashMap<u64, u64> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DIGEST);
+    std::fs::read_to_string(path)
+        .expect("the digest file")
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(a, b)| {
+            (
+                u64::from_str_radix(a, 16).unwrap(),
+                u64::from_str_radix(b, 16).unwrap(),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn every_chunk_compiles_as_the_fork_compiles_it() {
     let mut chunks = Vec::new();
@@ -292,6 +322,9 @@ fn every_chunk_compiles_as_the_fork_compiles_it() {
     let mut msg_diff = Vec::new();
     let mut shape_diff_list = Vec::new();
     let mut heap = benilla_lua::heap::Heap::default();
+    let mut digest = std::collections::BTreeMap::new();
+    let recorded = read_digest();
+    let mut digest_diff = Vec::new();
     for c in &chunks {
         let chunkname = format!("@{}", c.name);
         let ours = benilla_lua::check(&c.bytes, chunkname.as_bytes());
@@ -301,8 +334,17 @@ fn every_chunk_compiles_as_the_fork_compiles_it() {
                 both_ok += 1;
                 let p = benilla_lua::compile(&c.bytes, chunkname.as_bytes(), &mut heap, 0).unwrap();
                 let fork_shape = c_shape(&f.dump(false));
-                if let Some(d) = shape_diff(&our_shape(&p, &heap), &fork_shape, "") {
+                let ours = our_shape(&p, &heap);
+                if let Some(d) = shape_diff(&ours, &fork_shape, "") {
                     shape_diff_list.push(format!("{}: {d}", c.name));
+                }
+                let src = fnv64(&c.bytes);
+                digest.insert(src, fnv64(format!("{fork_shape:?}").as_bytes()));
+                if recorded
+                    .get(&src)
+                    .is_some_and(|&h| h != fnv64(format!("{ours:?}").as_bytes()))
+                {
+                    digest_diff.push(c.name.clone());
                 }
             }
             (Err(a), Err(b)) => {
@@ -338,11 +380,27 @@ fn every_chunk_compiles_as_the_fork_compiles_it() {
     for l in shape_diff_list.iter().take(20) {
         println!("SHAPE  {l}");
     }
+    if std::env::var_os("BENILLA_BLESS").is_some() {
+        let lines: String = digest
+            .iter()
+            .map(|(s, h)| format!("{s:016x} {h:016x}\n"))
+            .collect();
+        std::fs::write(Path::new(env!("CARGO_MANIFEST_DIR")).join(DIGEST), lines)
+            .expect("write the digest file");
+    }
+    println!(
+        "{} compiled chunks differ from the digest",
+        digest_diff.len()
+    );
+    for l in digest_diff.iter().take(20) {
+        println!("DIGEST  {l}");
+    }
     assert!(
         ours_only.is_empty()
             && fork_only.is_empty()
             && msg_diff.is_empty()
-            && shape_diff_list.is_empty(),
+            && shape_diff_list.is_empty()
+            && digest_diff.is_empty(),
         "the two front ends disagree"
     );
 }
