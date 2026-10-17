@@ -121,7 +121,7 @@ pub(super) fn sample(
         }
         (ns, census.then(|| vm.heap.census()))
     });
-    let owners = std::mem::take(&mut prof.owners);
+    let owners = &prof.owners;
 
     let frames = prof.frames.max(1) as f32;
     let mut per: HashMap<&str, f32> = HashMap::new();
@@ -157,7 +157,6 @@ pub(super) fn sample(
             }
         }
     }
-    prof.owners = owners;
 }
 
 fn push(h: &mut VecDeque<f32>, v: f32) {

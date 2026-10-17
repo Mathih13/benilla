@@ -53,14 +53,15 @@ pub(super) fn poll(time: Res<Time>, script: Option<NonSend<UiScript>>, mut hr: R
     };
     let hr = &mut *hr;
     if hr.session != script.session() {
-        let log = std::mem::take(&mut hr.log);
-        *hr = HotReload {
-            session: script.session(),
-            epoch: u64::MAX,
-            resolved: std::mem::take(&mut hr.resolved),
-            log,
-            ..default()
-        };
+        hr.session = script.session();
+        hr.files.clear();
+        hr.epoch = u64::MAX;
+        hr.watch.clear();
+        hr.mtimes.clear();
+        hr.ran.clear();
+        hr.xml.clear();
+        hr.walked.clear();
+        hr.next_poll = 0.0;
     }
     let now = time.elapsed_secs();
     if now >= hr.next_poll {
