@@ -624,7 +624,7 @@ fn debug_panel_ui(
             ui.separator();
             ui.label(
                 egui::RichText::new(format!(
-                    "{DEV_CHORD}:  D panel · P perf · I inspect · M mute · F free-fly"
+                    "{DEV_CHORD}:  D panel · P perf · I inspect · L addons · E Lua · M mute · F free-fly"
                 ))
                 .small()
                 .color(OVERLAY_TEXT_DIM),
