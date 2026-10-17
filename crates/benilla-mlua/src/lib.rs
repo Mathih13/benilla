@@ -481,11 +481,13 @@ impl Lua {
     /// reaching the VM a second way; Lua that `f` runs through the reference reaches its
     /// callbacks as usual, and they use the API as any callback does.
     ///
-    /// Panics inside a callback of this state, whose VM the interpreter is using.
+    /// Panics while a callback of this state runs, whose VM the interpreter is using, another
+    /// state's callback under it included: the API stays open to a running callback, so a lend
+    /// then would leave two ways in.
     pub fn with_vm<R>(&self, f: impl FnOnce(&mut Vm) -> R) -> R {
         assert!(
-            RUNNING.get().0 != self.0.family,
-            "`Lua::with_vm` inside a callback of the same state"
+            RUNNING.get().0 != self.0.family && self.0.depth.get() == 0,
+            "`Lua::with_vm` while a callback of the same state runs"
         );
         let vm = self.vm();
         assert!(!self.0.lent.replace(true), "{LENT}");

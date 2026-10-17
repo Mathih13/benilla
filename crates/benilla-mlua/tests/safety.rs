@@ -348,6 +348,30 @@ fn a_lent_vm_is_the_only_way_in_until_it_is_back() {
     );
 }
 
+/// No lend while a callback of the state runs, another state's callback under it included: the
+/// API stays open to the running callback, so a lend then would be a second way in.
+#[test]
+fn no_lend_while_a_callback_of_the_state_runs() {
+    let a = Lua::new();
+    let outer = a
+        .create_function(|a, ()| {
+            let a = a.clone();
+            let b = Lua::new();
+            let inner = b.create_function(move |_, ()| {
+                a.with_vm(|_| ());
+                Ok(())
+            })?;
+            inner.call::<()>(())
+        })
+        .unwrap();
+    let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| outer.call::<()>(())));
+    assert!(
+        hit.is_err(),
+        "the lend under another state's callback panics"
+    );
+    a.with_vm(|_| ());
+}
+
 /// An error that carries a Lua value prints, `{:?}` and `Display`, after its state is gone: the
 /// value waits out of the error, which is `Send` and `Sync` as mlua's is.
 #[test]
