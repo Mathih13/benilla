@@ -1,18 +1,19 @@
 //! Hot reload: an edited `.lua` file of a loaded addon, or of benilla's own layer, takes effect in
 //! the running UI, its functions swapped into the live closures (`benilla_lua::reload`), state and
 //! registrations kept; an edited handler body in one of their `.xml` files is swapped into the
-//! frames running it. The files are checked twice a second; each reload is reported in the chat
-//! frame.
+//! frames running it. Each file is checked about twice a second, a slice of them each frame; each
+//! reload is reported in the chat frame.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use benilla_ui::mlua::benilla_lua::reload::{top_level_changed, Report};
 use benilla_ui::mlua::{ObjectLike, Table};
 use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
-/// How often the files are checked.
+/// How often each file is checked, and the VM's list of loaded files read again.
 const POLL_SECS: f32 = 0.5;
 /// Reloads the profiler panel lists.
 pub(super) const LOG_LINES: usize = 6;
@@ -27,32 +28,90 @@ pub(crate) struct HotReload {
     epoch: u64,
     /// Each chunk name's file, resolved once.
     resolved: HashMap<Box<[u8]>, Option<PathBuf>>,
+    /// Every watched file, in the order the slices check them: a `.lua` file by the source id the
+    /// VM loaded it as, or an `.xml` file.
+    watch: Vec<(Option<usize>, PathBuf)>,
+    /// Where the next frame's slice of `watch` starts.
+    cursor: usize,
     mtimes: HashMap<PathBuf, SystemTime>,
+    /// Each watched `.lua` file's text when first seen, the one its top level ran: an edit of the
+    /// top level is told apart from it.
+    ran: HashMap<PathBuf, Vec<u8>>,
     /// Each watched `.xml` file's addon and its text as last read: an edited handler's old body
     /// is what finds the frames running it.
     xml: HashMap<PathBuf, (String, String)>,
+    /// The folders whose `.xml` files are watched, each walked once a VM session.
+    walked: HashSet<PathBuf>,
     next_poll: f32,
     /// The latest reloads, newest last: the time, the line and whether it applied.
     pub(super) log: VecDeque<(f32, String, bool)>,
 }
 
 pub(super) fn poll(time: Res<Time>, script: Option<NonSend<UiScript>>, mut hr: ResMut<HotReload>) {
-    let now = time.elapsed_secs();
-    if now < hr.next_poll {
-        return;
-    }
-    hr.next_poll = now + POLL_SECS;
     let (Some(root), Some(script)) = (crate::ui_script::addons::root(), script) else {
         return;
     };
     let hr = &mut *hr;
     if hr.session != script.session() {
-        hr.session = script.session();
-        hr.files.clear();
-        hr.epoch = u64::MAX;
-        hr.mtimes.clear();
-        hr.xml.clear();
+        let log = std::mem::take(&mut hr.log);
+        *hr = HotReload {
+            session: script.session(),
+            epoch: u64::MAX,
+            resolved: std::mem::take(&mut hr.resolved),
+            log,
+            ..default()
+        };
     }
+    let now = time.elapsed_secs();
+    if now >= hr.next_poll {
+        hr.next_poll = now + POLL_SECS;
+        refresh(hr, &script, &root);
+    }
+    let n = hr.watch.len();
+    if n == 0 {
+        return;
+    }
+    let mut changed = Vec::new();
+    for _ in 0..slice_len(n, time.delta_secs()) {
+        hr.cursor = (hr.cursor + 1) % n;
+        let (id, path) = &hr.watch[hr.cursor];
+        let Ok(t) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        match hr.mtimes.insert(path.clone(), t) {
+            // A file first seen is recorded, not reloaded.
+            None if id.is_some() => {
+                if let Ok(bytes) = std::fs::read(path) {
+                    let text = benilla_ui::source::chunk(&bytes).to_vec();
+                    hr.ran.insert(path.clone(), text);
+                }
+            }
+            Some(old) if old != t => changed.push((*id, path.clone())),
+            _ => {}
+        }
+    }
+    for (id, path) in changed {
+        let (line, ok) = match id {
+            Some(id) => reload(&script, &root, id, &path, hr.ran.get(&path)),
+            None => reload_xml(&script, &root, &path, &mut hr.xml),
+        };
+        info!("devtools: {line}");
+        chat(&script, &line, ok);
+        hr.log.push_back((now, line, ok));
+        while hr.log.len() > LOG_LINES {
+            hr.log.pop_front();
+        }
+    }
+}
+
+/// How many of `n` watched files a frame `dt` long checks, so that each is checked about every
+/// [`POLL_SECS`] and no frame stats them all: a few thousand addon files take milliseconds.
+fn slice_len(n: usize, dt: f32) -> usize {
+    ((n as f32 * dt / POLL_SECS).ceil() as usize).clamp(1, n)
+}
+
+/// Read the VM's list of loaded chunks again when it moved, and with it the watch list.
+fn refresh(hr: &mut HotReload, script: &UiScript, root: &Path) {
     let layer = crate::run_mode::dev_source_dir().map(|d| d.join("assets/ui"));
     let moved = script.lua().with_vm(|vm| {
         let heap = &vm.heap;
@@ -69,48 +128,24 @@ pub(super) fn poll(time: Res<Time>, script: Option<NonSend<UiScript>>, mut hr: R
                 if let Some(p) = resolved.get(&name[..]) {
                     return p.clone();
                 }
-                let p = file_of(&root, layer.as_deref(), &String::from_utf8_lossy(name));
+                let p = file_of(root, layer.as_deref(), &String::from_utf8_lossy(name));
                 resolved.insert(Box::from(&name[..]), p.clone());
                 p
             })
             .collect();
         true
     });
-    if moved {
-        watch_xml(hr, &root, layer.as_deref());
+    if !moved {
+        return;
     }
-    let mut changed = Vec::new();
-    let lua_files = hr
+    watch_xml(hr, root, layer.as_deref());
+    let lua = hr
         .files
         .iter()
         .enumerate()
-        .filter_map(|(id, p)| Some((Some(id), p.as_ref()?)));
-    let xml_files = hr.xml.keys().map(|p| (None, p));
-    for (id, path) in lua_files.chain(xml_files) {
-        let Ok(t) = std::fs::metadata(path).and_then(|m| m.modified()) else {
-            continue;
-        };
-        // A file first seen is recorded, not reloaded.
-        if hr
-            .mtimes
-            .insert(path.clone(), t)
-            .is_some_and(|old| old != t)
-        {
-            changed.push((id, path.clone()));
-        }
-    }
-    for (id, path) in changed {
-        let (line, ok) = match id {
-            Some(id) => reload(&script, &root, id, &path),
-            None => reload_xml(&script, &root, &path, &mut hr.xml),
-        };
-        info!("devtools: {line}");
-        chat(&script, &line, ok);
-        hr.log.push_back((now, line, ok));
-        while hr.log.len() > LOG_LINES {
-            hr.log.pop_front();
-        }
-    }
+        .filter_map(|(id, p)| Some((Some(id), p.clone()?)));
+    let xml = hr.xml.keys().map(|p| (None, p.clone()));
+    hr.watch = lua.chain(xml).collect();
 }
 
 /// The file a chunk was read from: the loader names it `@Interface\AddOns\<Folder>\<file>`, in
@@ -128,7 +163,7 @@ fn file_of(root: &Path, layer: Option<&Path>, chunk: &str) -> Option<PathBuf> {
 }
 
 /// Watch every `.xml` file under the folder of each addon a watched `.lua` file is in, and under
-/// the layer's: its text is read now, the old text of a later edit.
+/// the layer's, each folder walked once: its text is read now, the old text of a later edit.
 fn watch_xml(hr: &mut HotReload, root: &Path, layer: Option<&Path>) {
     let mut dirs: Vec<(String, PathBuf)> = Vec::new();
     for path in hr.files.iter().flatten() {
@@ -148,6 +183,9 @@ fn watch_xml(hr: &mut HotReload, root: &Path, layer: Option<&Path>) {
         }
     }
     for (addon, dir) in dirs {
+        if !hr.walked.insert(dir.clone()) {
+            continue;
+        }
         let mut found = Vec::new();
         walk_xml(&dir, &mut found);
         for path in found {
@@ -308,9 +346,15 @@ fn reload_xml(
     (line, idle.is_empty() && shared.is_empty())
 }
 
-/// Reload one file into the chunk the loader compiled it as, source `id`; the report line and
-/// whether it applied.
-fn reload(script: &UiScript, root: &Path, id: usize, path: &Path) -> (String, bool) {
+/// Reload one file into the chunk the loader compiled it as, source `id`, whose top level ran as
+/// `ran`; the report line and whether it applied.
+fn reload(
+    script: &UiScript,
+    root: &Path,
+    id: usize,
+    path: &Path,
+    ran: Option<&Vec<u8>>,
+) -> (String, bool) {
     let shown = path
         .strip_prefix(root)
         .unwrap_or(path)
@@ -328,13 +372,17 @@ fn reload(script: &UiScript, root: &Path, id: usize, path: &Path) -> (String, bo
         return (format!("{shown}: no longer loaded"), false);
     };
     match r {
-        Ok(r) => report_line(&shown, &r),
+        Ok(r) => {
+            let top = ran.is_some_and(|old| top_level_changed(old, src));
+            report_line(&shown, &r, top)
+        }
         Err(e) => (format!("{shown}: {e}"), false),
     }
 }
 
-/// What a reload did, in a line, and whether all of it took effect.
-fn report_line(shown: &str, r: &benilla_ui::mlua::benilla_lua::reload::Report) -> (String, bool) {
+/// What a reload did, in a line, and whether all of it took effect: `top` says the file's top
+/// level differs from the one that ran.
+fn report_line(shown: &str, r: &Report, top: bool) -> (String, bool) {
     // A new function nested in one that was swapped exists from that one's next call; any other
     // is made by code that already ran.
     let (live, later): (Vec<&String>, Vec<&String>) = r.added.iter().partition(|k| {
@@ -366,10 +414,10 @@ fn report_line(shown: &str, r: &benilla_ui::mlua::benilla_lua::reload::Report) -
             r.removed.join(", ")
         );
     }
-    if r.top_level_changed {
+    if top {
         line += "; top-level code changed, which runs again only on /reload";
     }
-    let complete = r.reshaped.is_empty() && later.is_empty() && !r.top_level_changed;
+    let complete = r.reshaped.is_empty() && later.is_empty() && !top;
     (line, complete)
 }
 
@@ -386,7 +434,18 @@ fn chat(script: &UiScript, line: &str, ok: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use benilla_ui::mlua::benilla_lua::reload::Report;
+
+    #[test]
+    fn each_file_is_checked_every_poll_and_no_frame_checks_them_all() {
+        for dt in [1.0 / 30.0, 1.0 / 60.0, 1.0 / 240.0] {
+            let n = 2200;
+            let frames = (POLL_SECS / dt).round() as usize;
+            assert!(slice_len(n, dt) * frames >= n, "{dt}: all within a poll");
+            assert!(slice_len(n, dt) < n / 10, "{dt}: a slice");
+        }
+        assert_eq!(slice_len(3, 0.0), 1, "the first frame still checks one");
+        assert_eq!(slice_len(3, 5.0), 3, "a long frame checks each once");
+    }
 
     #[test]
     fn handlers_are_listed_with_their_frames_chunk_names() {
@@ -419,10 +478,9 @@ mod tests {
             swapped: s(&["Outer", "F:SetScript"]),
             added: s(&["Outer/inner", "NewGlobal"]),
             removed: s(&["Old"]),
-            top_level_changed: true,
             ..Default::default()
         };
-        let (line, complete) = report_line("A.lua", &r);
+        let (line, complete) = report_line("A.lua", &r, true);
         assert_eq!(
             line,
             "A.lua: 2 function(s) swapped into 2 closure(s); 1 new, live on their parent's next \
@@ -437,7 +495,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            report_line("A.lua", &r).1,
+            report_line("A.lua", &r, false).1,
             "a nested addition is live at once"
         );
     }

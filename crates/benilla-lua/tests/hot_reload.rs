@@ -360,27 +360,28 @@ F:SetScript("OnEvent", function() return "event" end)
     assert_eq!(r.added, ["SetScript:OnEvent"]);
 }
 
-/// An edit of the top level, which ran once, is reported: the new value of `SPACING` is not the
-/// one the swapped function reads. An edit inside a function body alone is not.
+/// An edit of the top level, which ran once, is told apart from an edit inside a function body:
+/// the new value of `SPACING` is not the one the swapped function reads.
 #[test]
-fn a_changed_top_level_is_reported() {
+fn a_changed_top_level_is_told_apart() {
+    use benilla_lua::reload::top_level_changed;
+    let old = b"local SPACING = 4 Note('kept') function Gap() return SPACING end";
+    let body = b"local SPACING = 4 Note('kept') function Gap() return SPACING + 0 end";
+    let top = b"local SPACING = 6 Note('kept') function Gap() return SPACING + 0 end";
+    assert!(
+        !top_level_changed(old, body),
+        "a body edit leaves the top level"
+    );
+    assert!(top_level_changed(old, top));
+    assert!(
+        !top_level_changed(old, b"nil +"),
+        "a source that does not compile"
+    );
+
     let mut vm = benilla_lua::new_state();
-    vm.exec(b"local SPACING = 4 function Gap() return SPACING end", NAME)
-        .unwrap();
-    let r = vm
-        .hot_reload(
-            NAME,
-            b"local SPACING = 4 function Gap() return SPACING + 0 end",
-        )
-        .unwrap();
-    assert!(!r.top_level_changed, "a body edit leaves the top level");
-    let r = vm
-        .hot_reload(
-            NAME,
-            b"local SPACING = 6 function Gap() return SPACING + 0 end",
-        )
-        .unwrap();
-    assert!(r.top_level_changed);
+    vm.exec(b"function Note() end", b"=setup").unwrap();
+    vm.exec(old, NAME).unwrap();
+    vm.hot_reload(NAME, top).unwrap();
     assert_eq!(
         run(&mut vm, "return Gap()"),
         "4",

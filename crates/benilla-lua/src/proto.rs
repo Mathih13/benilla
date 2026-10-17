@@ -376,7 +376,8 @@ impl Proto {
 impl Proto {
     /// A hash of what this function runs, its code and constants, without its lines or the
     /// functions nested in it: two compiles of a chunk whose top level is the same agree on the
-    /// main function's, however its functions' bodies changed.
+    /// main function's, however its functions' bodies changed, when one heap holds both (a string
+    /// constant is its id there).
     pub(crate) fn code_digest(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
