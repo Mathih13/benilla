@@ -84,6 +84,27 @@ pub(crate) fn node_deferred(
     }
 }
 
+/// What the Lua error handler is called with for one caught error: the value an error carries,
+/// its bytes as Lua wrote them, or a host's own text.
+#[derive(Clone, Debug)]
+pub(crate) enum HandlerArg {
+    Text(String),
+    Error(mlua::Error),
+}
+
+impl HandlerArg {
+    /// The one argument, in `lua`.
+    pub(crate) fn value(self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+        Ok(match self {
+            HandlerArg::Text(t) => mlua::Value::String(lua.create_string(t)?),
+            HandlerArg::Error(e) => match e.lua_value(lua) {
+                Some(v) => v,
+                None => mlua::Value::String(lua.create_string(e.lua_bytes(lua))?),
+            },
+        })
+    }
+}
+
 /// The Rust-side model behind the Lua VM, in `lua.app_data`. It holds no Lua handles, each of
 /// which is a collector root.
 #[derive(Clone)]
@@ -332,7 +353,7 @@ pub(crate) struct Model {
     pub(crate) errors: Vec<String>,
     /// Errors owed to `geterrorhandler()`, which the reference calls on each caught error; one the
     /// handler itself raises skips this queue, which stops the recursion.
-    pub(crate) pending_error_dispatch: Vec<String>,
+    pub(crate) pending_error_dispatch: Vec<HandlerArg>,
     /// The session's retained diagnostic log, deduplicated and bounded; `errors` drains each frame.
     pub(crate) diagnostics: super::diagnostics::DiagnosticLog,
     /// Non-fatal warnings for the host, such as a dropped `inherits=` template.
@@ -646,6 +667,9 @@ pub(crate) struct Model {
     pub(crate) battlefield_positions: Vec<super::battlefield_positions::BattlefieldPositionView>,
     pub(crate) battlefield_flag: Option<super::battlefield_positions::BattlefieldFlagView>,
     pub(crate) battlefield_icon_scale: f32,
+    /// The 0-based rows `GetBattlefieldPosition` read with no name: each call's name lookup passes
+    /// the callback `0x4ac190` (`0x4ac118`), which the app makes.
+    pub(crate) battlefield_position_lookups: Vec<usize>,
     pub(crate) battlefield_position_requests: u32,
     /// `CancelMeetingStoneRequest()` calls; the app gates on leadership.
     pub(crate) meeting_stone_cancels: u32,
@@ -983,11 +1007,22 @@ pub(crate) struct Model {
     pub(crate) quest_confirms: u32,
     /// Item id to its tooltip view.
     pub(crate) item_templates: HashMap<u32, ItemTemplateView>,
-    /// Item ids asked for and missing, for the app to answer.
+    /// Item ids asked for and missing, for the app to answer: a lookup with a callback, which
+    /// asks the server.
     pub(crate) item_stat_asks: HashSet<u32>,
+    /// Item ids `GetItemInfo` read and missing: its lookup passes no callback (`0x48e185`), so
+    /// the app answers from its cache only.
+    pub(crate) item_stat_reads: HashSet<u32>,
     /// Set id to its tooltip set block (`0x854b1c`), and the misses asked for.
     pub(crate) item_sets: HashMap<u32, super::ItemSetView>,
     pub(crate) item_set_asks: HashSet<u32>,
+    /// Guids an item build looked up in the name cache and missed, for the app to ask: the
+    /// creator's and the giver's lookups pass a callback (`0x52e204`, `0x52e29d`) at every build,
+    /// and a hovered bag or paper-doll slot's `OnUpdate` builds again each frame.
+    pub(crate) item_name_asks: HashSet<u64>,
+    /// Charter item guids whose build missed the petition record or its owner's name, for the
+    /// app to ask: both lookups pass a callback (`0x52b93b`, `0x52b9d2`) at every build.
+    pub(crate) petition_asks: HashSet<u64>,
     /// `ItemRandomProperties` id to its view, pushed whole at startup: a clicked tooltip cannot
     /// repaint on a late answer. The reference reads its loaded store `0xc0dbd4` (`0x52c991`).
     pub(crate) random_properties: HashMap<u32, super::RandomPropertyView>,
@@ -1197,6 +1232,9 @@ pub(crate) struct Model {
     pub(crate) summon_confirm: super::summon::SummonConfirmUiState,
     /// `ConfirmSummon()` calls, one `CMSG_SUMMON_RESPONSE` each; the app holds the summoner.
     pub(crate) summon_confirms: u32,
+    /// `GetSummonConfirmSummoner()` calls that answered no name: each call's lookup passes the
+    /// callback `0x48b710` (`0x48b6e1`), which the app makes.
+    pub(crate) summon_summoner_lookups: u32,
     /// `GetFramerate()`, pushed each tick.
     pub(crate) framerate: f64,
     /// `(shift, ctrl, alt)` for `Is*KeyDown`, pushed before the frame's mouse events.
@@ -1241,6 +1279,11 @@ impl Model {
     /// handler is called with. An error raised by the handler itself goes to `errors` directly,
     /// which stops the recursion.
     pub(crate) fn record_script_error(&mut self, log: String, handler: String) {
+        self.record_error(log, HandlerArg::Text(handler));
+    }
+
+    /// A script error whose log row is `log` and whose handler hears `handler`.
+    pub(crate) fn record_error(&mut self, log: String, handler: HandlerArg) {
         self.diagnostics
             .record(super::diagnostics::DiagnosticKind::Error, &log);
         self.pending_error_dispatch.push(handler);
@@ -1248,9 +1291,10 @@ impl Model {
     }
 
     /// [`Self::record_script_error`] for an error mlua caught: the log keeps mlua's `Display` (its
-    /// word and traceback), the handler gets the bare Lua message `lua_pcall` leaves (`0x703b40`).
+    /// word and traceback), the handler gets the error value itself, as `lua_pcall` hands its
+    /// error function the value raised (`0x703b40`).
     pub(crate) fn record_lua_error(&mut self, e: &mlua::Error) {
-        self.record_script_error(e.to_string(), super::stdlib::lua_message(e));
+        self.record_error(e.to_string(), HandlerArg::Error(e.clone()));
     }
 
     /// Records a non-fatal warning for the host's terminal and the retained diagnostic log.
@@ -1521,6 +1565,7 @@ impl Model {
             battlefield_join_requests: Vec::new(),
             battlefield_list_requests: Vec::new(),
             battlefield_positions: Vec::new(),
+            battlefield_position_lookups: Vec::new(),
             battlefield_flag: None,
             battlefield_icon_scale: 1.0,
             battlefield_position_requests: 0,
@@ -1691,8 +1736,11 @@ impl Model {
             item_templates: HashMap::new(),
             item_sets: HashMap::new(),
             item_set_asks: HashSet::new(),
+            item_name_asks: HashSet::new(),
+            petition_asks: HashSet::new(),
             random_properties: HashMap::new(),
             item_stat_asks: HashSet::new(),
+            item_stat_reads: HashSet::new(),
             player_req: PlayerReqState::default(),
             lock_rows: HashMap::new(),
             lock_openers: None,
@@ -1735,6 +1783,7 @@ impl Model {
             binder_pending: false,
             summon_confirm: super::summon::SummonConfirmUiState::default(),
             summon_confirms: 0,
+            summon_summoner_lookups: 0,
             framerate: 0.0,
             modifiers: (false, false, false),
             money: 0,
