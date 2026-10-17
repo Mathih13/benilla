@@ -51,7 +51,7 @@ impl Vm {
     #[allow(clippy::mutable_key_type)] // as `walk`
     pub fn hot_reload(&mut self, chunkname: &[u8], src: &[u8]) -> Result<Report, SyntaxError> {
         let old_main = self.heap.main_digest(chunkname);
-        let root = crate::compile::compile(src, chunkname, &mut self.heap, 0)?;
+        let root = crate::compile::compile(src, chunkname, &mut self.heap)?;
         // A constant the compiler could not make: `not enough memory`, as `Vm::load` answers.
         if self.heap.take_oom() {
             return Err(SyntaxError(b"not enough memory".to_vec()));
@@ -160,8 +160,8 @@ impl Vm {
         select: impl Fn(&Proto) -> bool,
     ) -> Result<usize, SyntaxError> {
         const PROBE: &[u8] = b"=[hot reload]";
-        let want = crate::compile::compile(old, PROBE, &mut self.heap, 0)?;
-        crate::compile::compile(new, PROBE, &mut self.heap, 0)?;
+        let want = crate::compile::compile(old, PROBE, &mut self.heap)?;
+        crate::compile::compile(new, PROBE, &mut self.heap)?;
         let digest = want.code_digest();
         let mut names: Vec<Bytes> = Vec::new();
         for f in self.heap.funcs_mut() {
@@ -178,7 +178,7 @@ impl Vm {
         }
         let mut fresh: HashMap<Bytes, Rc<Proto>> = HashMap::new();
         for name in names {
-            let p = crate::compile::compile(new, &name, &mut self.heap, 0)?;
+            let p = crate::compile::compile(new, &name, &mut self.heap)?;
             fresh.insert(name, p);
         }
         if self.frames_empty() {
