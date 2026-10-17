@@ -42,6 +42,9 @@ pub(crate) struct AddonProfiler {
     /// Each source id's charged time at the last sample.
     last_ns: Vec<u64>,
     rows: HashMap<String, Row>,
+    /// Each source id's owning addon, as of source epoch `owners_epoch`.
+    owners: Vec<String>,
+    owners_epoch: Option<u64>,
     total_us: f32,
     total_history: VecDeque<f32>,
 }
@@ -105,14 +108,20 @@ pub(super) fn sample(
     }
     prof.next = now + SAMPLE_SECS;
     let census = now >= prof.next_census;
-    let (owners, ns, census) = script.lua().with_vm(|vm| {
+    let prof = &mut *prof;
+    let (ns, census) = script.lua().with_vm(|vm| {
         let ns = vm
             .profile
             .as_ref()
             .map(|p| p.ns.clone())
             .unwrap_or_default();
-        (owners_of(&vm.heap), ns, census.then(|| vm.heap.census()))
+        if prof.owners_epoch != Some(vm.heap.sources_epoch()) {
+            prof.owners = owners_of(&vm.heap);
+            prof.owners_epoch = Some(vm.heap.sources_epoch());
+        }
+        (ns, census.then(|| vm.heap.census()))
     });
+    let owners = std::mem::take(&mut prof.owners);
 
     let frames = prof.frames.max(1) as f32;
     let mut per: HashMap<&str, f32> = HashMap::new();
@@ -122,7 +131,6 @@ pub(super) fn sample(
             *per.entry(owner).or_default() += d as f32 / 1000.0 / frames;
         }
     }
-    let prof = &mut *prof;
     prof.last_ns = ns;
     prof.frames = 0;
     prof.total_us = per.values().sum();
@@ -149,6 +157,7 @@ pub(super) fn sample(
             }
         }
     }
+    prof.owners = owners;
 }
 
 fn push(h: &mut VecDeque<f32>, v: f32) {
