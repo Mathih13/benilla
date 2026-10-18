@@ -258,7 +258,8 @@ events:SetScript("OnEvent", function()
     elseif event == "PARTY_MEMBERS_CHANGED" then
         client.nextRoster = now
     elseif event == "CHAT_MSG_ADDON" then
-        client:Receive(arg1, arg2, arg3, arg4, UnitName("player"), now)
+        if client:Receive(arg1, arg2, arg3, arg4, UnitName("player"), now)
+            and client.synced and InCinematic() then StopCinematic() end
     end
     render(now)
 end)
