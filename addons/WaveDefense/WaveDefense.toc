@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: Wave Defense
+## Notes: Queue, objectives and draft choices for Wave Defense.
+## Version: 1
+## SavedVariablesPerCharacter: WaveDefenseRequest
+Protocol.lua
+Client.lua
+WaveDefense.lua
