@@ -618,9 +618,11 @@ fn drive_session_start(
 /// The session start after the addons' own `ADDON_LOADED`: `VARIABLES_LOADED`, `PLAYER_LOGIN` and
 /// `PLAYER_ENTERING_WORLD`, a target, then ten ticks of 0.1 s ([`drive_session_start`] says why).
 ///
-/// The target comes after `PLAYER_ENTERING_WORLD` with its `PLAYER_TARGET_CHANGED`: 1.12 loads the
-/// interface before world entry, so no load sees one. Seated earlier, `TargetFrame_OnLoad`'s
-/// `TargetFrame_Update()` raises before the frame's `RegisterEvent` calls.
+/// The target comes after `PLAYER_ENTERING_WORLD`, with the argless `PLAYER_TARGET_CHANGED` that
+/// selecting one signals (`0x493540`): the interface is built (`0x48fbf0`) before the enter cascade
+/// (`0x4908c0`), and a selection needs its object in the world, so no load sees a target. Seated
+/// earlier, `TargetFrame_OnLoad`'s `TargetFrame_Update()` (`TargetFrame.lua:20`) indexes
+/// `TargetofTargetFrame`, which `TargetFrame.xml` declares later, before its `RegisterEvent` calls.
 fn enter_world(script: &mut UiScript) {
     for event in ["VARIABLES_LOADED", "PLAYER_LOGIN", "PLAYER_ENTERING_WORLD"] {
         script.fire_event(event, Vec::new());
