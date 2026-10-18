@@ -1,11 +1,7 @@
-//! Game accounts, owned by the service: a player never sees their game password. Creation and
-//! every change go through the console (`account create` computes the SRP verifier server-side;
-//! there is no offline path worth maintaining), the password is kept encrypted in
-//! `game_accounts` so `/api/play` can hand it to the browser client.
-
 use anyhow::{anyhow, Context, Result};
 use sqlx::SqlitePool;
 
+use crate::config::Backend;
 use crate::db::now;
 use crate::secrets::{random_string, Keyring, ALNUM_UPPER};
 use crate::soap::{self, Client, SoapError};
@@ -40,20 +36,30 @@ pub async fn provision(
     soap: &Client,
     keys: &Keyring,
     user_id: i64,
+    backend: &Backend,
 ) -> Result<GameAccount> {
+    let _operation = match backend {
+        Backend::LyraCore(provisioner) => Some(provisioner.lock().await),
+        Backend::Mangos => None,
+    };
     if let Some(existing) = get(db, user_id).await? {
         return Ok(existing);
     }
-    let name = game_username(user_id);
+    let name = match backend {
+        Backend::Mangos => game_username(user_id),
+        Backend::LyraCore(_) => random_string(ALNUM_UPPER, MAX_ACCOUNT_STR),
+    };
     let pass = random_string(ALNUM_UPPER, MAX_ACCOUNT_STR);
-    match soap.exec(&format!("account create {name} {pass}")).await {
-        Ok(_) => {}
-        // A row we lost track of (restored sqlite, say): take it over by resetting its password.
-        Err(SoapError::Fault(m)) if m.contains("already exist") => {
-            soap.exec(&format!("account set password {name} {pass} {pass}"))
-                .await?;
-        }
-        Err(e) => return Err(e.into()),
+    match backend {
+        Backend::LyraCore(provisioner) => provisioner.provision(&name, &pass, true).await?,
+        Backend::Mangos => match soap.exec(&format!("account create {name} {pass}")).await {
+            Ok(_) => {}
+            Err(SoapError::Fault(m)) if m.contains("already exist") => {
+                soap.exec(&format!("account set password {name} {pass} {pass}"))
+                    .await?;
+            }
+            Err(e) => return Err(e.into()),
+        },
     }
     let (enc, nonce) = keys.encrypt(pass.as_bytes())?;
     sqlx::query("INSERT INTO game_accounts (user_id, game_username, password_enc, nonce, created_at) VALUES (?, ?, ?, ?, ?)")
@@ -77,16 +83,30 @@ pub async fn rotate_password(
     soap: &Client,
     keys: &Keyring,
     user_id: i64,
+    backend: &Backend,
 ) -> Result<()> {
+    let _operation = match backend {
+        Backend::LyraCore(provisioner) => Some(provisioner.lock().await),
+        Backend::Mangos => None,
+    };
     let acct = get(db, user_id)
         .await?
         .ok_or_else(|| anyhow!("no game account"))?;
     let pass = random_string(ALNUM_UPPER, MAX_ACCOUNT_STR);
-    soap.exec(&format!(
-        "account set password {} {pass} {pass}",
-        acct.game_username
-    ))
-    .await?;
+    match backend {
+        Backend::LyraCore(provisioner) => {
+            provisioner
+                .provision(&acct.game_username, &pass, false)
+                .await?
+        }
+        Backend::Mangos => {
+            soap.exec(&format!(
+                "account set password {} {pass} {pass}",
+                acct.game_username
+            ))
+            .await?;
+        }
+    }
     let (enc, nonce) = keys.encrypt(pass.as_bytes())?;
     sqlx::query(
         "UPDATE game_accounts SET password_enc = ?, nonce = ?, rotated_at = ? WHERE user_id = ?",

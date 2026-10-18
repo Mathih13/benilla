@@ -25,7 +25,14 @@ async fn play(session: Session, State(state): State<Arc<AppState>>) -> Result<Re
     let acct = match accounts::get(&state.db, session.user.id).await? {
         Some(a) => a,
         None => {
-            accounts::provision(&state.db, &state.soap, &state.secrets, session.user.id).await?
+            accounts::provision(
+                &state.db,
+                &state.soap,
+                &state.secrets,
+                session.user.id,
+                &state.cfg.backend,
+            )
+            .await?
         }
     };
     let pass = accounts::password(&state.secrets, &acct)?;

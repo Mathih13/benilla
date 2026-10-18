@@ -1,6 +1,3 @@
-//! The admin panel: dashboard (status, who is online, announce/restart), users (create, ban,
-//! kick, passwords, delete), config (rates, MOTD, limits, bots), audit.
-
 use std::sync::Arc;
 
 use axum::extract::{Form, Path, Query, State};
@@ -48,11 +45,16 @@ async fn dashboard(
     State(state): State<Arc<AppState>>,
     Query(flash): Query<Flash>,
 ) -> Result<Response, AppError> {
+    if state.cfg.backend.is_lyracore() {
+        return Ok(Redirect::to("/admin/users").into_response());
+    }
+    let realmdb = state
+        .realmdb
+        .as_ref()
+        .ok_or(AppError::Unsupported("MaNGOS database is not configured"))?;
     let status = control::status(&state.soap).await;
-    let online = realmdb::online(&state.realmdb).await.unwrap_or_default();
-    let (players_online, bots_online) = realmdb::online_count(&state.realmdb)
-        .await
-        .unwrap_or((0, 0));
+    let online = realmdb::online(realmdb).await.unwrap_or_default();
+    let (players_online, bots_online) = realmdb::online_count(realmdb).await.unwrap_or((0, 0));
     let s = mangos_conf::load(&state.conf).unwrap_or_else(|_| mangos_conf::Settings {
         xp_rate: 1.0,
         loot_rate: 1.0,
@@ -66,6 +68,7 @@ async fn dashboard(
         ahbot: false,
     });
     Ok(render(templates::AdminDashboard {
+        lyracore: state.cfg.backend.is_lyracore(),
         realm_name: state.realm_name().await,
         nav: "dashboard",
         s,
@@ -123,6 +126,11 @@ async fn server_action(
 ) -> Result<Response, AppError> {
     csrf::verify(&session, &f._csrf)?;
     let ip = client_ip(&headers);
+    if state.cfg.backend.is_lyracore() {
+        return Err(AppError::Unsupported(
+            "LyraCore realm controls are not available in this panel",
+        ));
+    }
     let result: Result<String, String> = match action.as_str() {
         "announce" => control::announce(&state.soap, &f.text)
             .await
@@ -180,13 +188,18 @@ async fn user_rows(state: &AppState) -> Result<Vec<UserRow>, AppError> {
         .filter_map(|row| row.5.as_deref())
         .filter(|name| !name.is_empty())
         .collect();
-    let mut characters_by_account = realmdb::characters_for_accounts(&state.realmdb, &usernames)
-        .await
-        .unwrap_or_default();
-    let bans: std::collections::HashSet<String> = realmdb::active_bans(&state.realmdb)
-        .await
-        .map(|b| b.into_iter().map(|b| b.username).collect())
-        .unwrap_or_default();
+    let (mut characters_by_account, bans) = if let Some(pool) = &state.realmdb {
+        let characters = realmdb::characters_for_accounts(pool, &usernames)
+            .await
+            .unwrap_or_default();
+        let bans: std::collections::HashSet<String> = realmdb::active_bans(pool)
+            .await
+            .map(|bans| bans.into_iter().map(|ban| ban.username).collect())
+            .unwrap_or_default();
+        (characters, bans)
+    } else {
+        Default::default()
+    };
     let mut out = Vec::with_capacity(rows.len());
     for (id, username, display_name, role, disabled, game_username) in rows {
         let game_username = game_username.unwrap_or_default();
@@ -213,6 +226,7 @@ async fn users(
     Query(flash): Query<Flash>,
 ) -> Result<Response, AppError> {
     Ok(render(templates::AdminUsers {
+        lyracore: state.cfg.backend.is_lyracore(),
         realm_name: state.realm_name().await,
         nav: "users",
         csrf: session.csrf_token.clone(),
@@ -247,6 +261,7 @@ async fn create_user(
     let realm_name = state.realm_name().await;
     let page = |created: Option<(String, String)>, error: Option<String>, users: Vec<UserRow>| {
         render(templates::AdminUsers {
+            lyracore: state.cfg.backend.is_lyracore(),
             realm_name: realm_name.clone(),
             nav: "users",
             csrf: session.csrf_token.clone(),
@@ -300,10 +315,20 @@ async fn create_user(
     .await?
     .last_insert_rowid();
     set_bootstrap_password(&state.db, id, &password, state.cfg.bootstrap_ttl_hours).await?;
-    if let Err(e) = accounts::provision(&state.db, &state.soap, &state.secrets, id).await {
-        // Keep the web user; the game account is provisioned again on their first play.
+    let provision_error = if let Err(e) = accounts::provision(
+        &state.db,
+        &state.soap,
+        &state.secrets,
+        id,
+        &state.cfg.backend,
+    )
+    .await
+    {
         tracing::warn!(error = %e, user = %username, "game account provisioning deferred");
-    }
+        Some("The web account was created, but its game account is not ready. Check the realm account command and retry Play.".into())
+    } else {
+        None
+    };
     audit::log(
         &state.db,
         Some(session.user.id),
@@ -315,7 +340,7 @@ async fn create_user(
     .await;
     Ok(page(
         Some((username, password)),
-        None,
+        provision_error,
         user_rows(&state).await?,
     ))
 }
@@ -350,6 +375,16 @@ async fn user_action(
     let Some((username, role)) = target else {
         return Err(AppError::NotFound);
     };
+    if state.cfg.backend.is_lyracore()
+        && matches!(
+            action.as_str(),
+            "ban" | "unban" | "kick" | "delete" | "disable" | "enable"
+        )
+    {
+        return Err(AppError::Unsupported(
+            "This game account operation is not available for LyraCore",
+        ));
+    }
     let self_target = id == session.user.id;
     let mut detail = None;
     let result: Result<String, String> = match action.as_str() {
@@ -387,12 +422,16 @@ async fn user_action(
                 "new web password for {username}: {pw} (they must change it at first login)"
             ))
         }
-        "rotate-game-password" => {
-            accounts::rotate_password(&state.db, &state.soap, &state.secrets, id)
-                .await
-                .map(|_| "game password rotated; they need to reload the play page".into())
-                .map_err(|e| e.to_string())
-        }
+        "rotate-game-password" => accounts::rotate_password(
+            &state.db,
+            &state.soap,
+            &state.secrets,
+            id,
+            &state.cfg.backend,
+        )
+        .await
+        .map(|_| "game password rotated; they need to reload the play page".into())
+        .map_err(|e| e.to_string()),
         "disable" if !self_target => {
             sqlx::query("UPDATE users SET disabled = 1 WHERE id = ?")
                 .bind(id)
@@ -459,8 +498,14 @@ async fn config_page(
     State(state): State<Arc<AppState>>,
     Query(flash): Query<Flash>,
 ) -> Result<Response, AppError> {
+    if state.cfg.backend.is_lyracore() {
+        return Err(AppError::Unsupported(
+            "LyraCore settings are managed through the realm operator",
+        ));
+    }
     let s = mangos_conf::load(&state.conf)?;
     Ok(render(templates::AdminConfig {
+        lyracore: state.cfg.backend.is_lyracore(),
         realm_name: state.realm_name().await,
         nav: "settings",
         csrf: session.csrf_token.clone(),
@@ -495,6 +540,11 @@ async fn config_save(
     Form(f): Form<ConfigForm>,
 ) -> Result<Response, AppError> {
     csrf::verify(&session, &f._csrf)?;
+    if state.cfg.backend.is_lyracore() {
+        return Err(AppError::Unsupported(
+            "LyraCore settings are managed through the realm operator",
+        ));
+    }
     let old = mangos_conf::load(&state.conf)?;
     let mut new = old.clone();
     new.xp_rate = f.xp_rate;
@@ -565,6 +615,7 @@ async fn audit_page(
         None
     };
     Ok(render(templates::AdminAudit {
+        lyracore: state.cfg.backend.is_lyracore(),
         realm_name: state.realm_name().await,
         nav: "audit",
         me: session.user,

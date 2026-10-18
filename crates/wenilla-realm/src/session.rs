@@ -243,7 +243,11 @@ pub fn client_ip(parts: &axum::http::HeaderMap) -> Option<String> {
 /// Is this a request for a page (redirect to `/login` on failure) or for an asset/API (401)?
 fn wants_html(req: &Request) -> bool {
     let p = req.uri().path();
-    if p.starts_with("/data/") || p.starts_with("/ws/") || p.starts_with("/api/") {
+    if p.starts_with("/data/")
+        || p.starts_with("/ws/")
+        || p.starts_with("/api/")
+        || p.starts_with("/addons/")
+    {
         return false;
     }
     req.headers()

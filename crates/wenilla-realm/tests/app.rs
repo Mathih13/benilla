@@ -1,7 +1,3 @@
-//! End-to-end through the router with a mock console: wizard → admin creates a player → the
-//! player logs in → `/api/play` hands out hidden game credentials; the game routes are locked
-//! without a session; CSRF and cross-site posts are refused.
-
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -42,6 +38,10 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_mode(false).await
+}
+
+async fn harness_mode(lyracore: bool) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("state");
     let conf_dir = dir.path().join("config");
@@ -70,13 +70,71 @@ async fn harness() -> Harness {
     cfg.config_dir = conf_dir.clone();
     cfg.soap_url = soap_url;
     cfg.mariadb_url = "mysql://nobody:nothing@127.0.0.1:1/classicrealmd".into();
+    cfg.addons = dir.path().join("addons");
+    std::fs::create_dir_all(cfg.addons.join("WaveDefense")).unwrap();
+    std::fs::write(
+        cfg.addons.join("WaveDefense/WaveDefense.toc"),
+        "## Title: Wave Defense\nWaveDefense.lua\n",
+    )
+    .unwrap();
+    if lyracore {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = dir.path().join("gateway");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+[ "$LYRACORE_DATABASE" = "test-realm" ] || exit 2
+[ "$LYRACORE_SPACETIMEDB_URL" = "http://127.0.0.1:3000" ] || exit 2
+[ "$LYRACORE_COORDINATOR_TOKEN" = "test-owner-token" ] || exit 2
+[ -z "$REALM_PUBLIC_URL" ] || exit 2
+[ "$1" = provision ] || exit 2
+[ "$3" = --password-stdin ] || exit 2
+[ "$#" -eq 3 ] || { [ "$#" -eq 4 ] && [ "$4" = --create-only ]; } || exit 2
+IFS= read -r password
+[ "${#password}" -eq 16 ] || exit 2
+printf '%s\n' "$@" > "$LYRACORE_TEST_ARGS"
+printf '%s' "$password" > "$LYRACORE_TEST_PASSWORD"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        cfg.backend =
+            wenilla_realm::config::Backend::LyraCore(wenilla_realm::lyracore::Provisioner::new(
+                executable,
+                [
+                    ("LYRACORE_DATABASE".into(), "test-realm".into()),
+                    (
+                        "LYRACORE_SPACETIMEDB_URL".into(),
+                        "http://127.0.0.1:3000".into(),
+                    ),
+                    (
+                        "LYRACORE_COORDINATOR_TOKEN".into(),
+                        "test-owner-token".into(),
+                    ),
+                    (
+                        "LYRACORE_TEST_ARGS".into(),
+                        dir.path().join("args").to_str().unwrap().into(),
+                    ),
+                    (
+                        "LYRACORE_TEST_PASSWORD".into(),
+                        dir.path().join("password").to_str().unwrap().into(),
+                    ),
+                ]
+                .into(),
+            ));
+        std::fs::remove_dir_all(&conf_dir).unwrap();
+    }
     let sqlite = db::open_sqlite(&cfg.sqlite_path()).await.unwrap();
     db::meta_set(&sqlite, "setup_token", "TESTTOKEN")
         .await
         .unwrap();
     let state = Arc::new(AppState {
         setup_cache: Default::default(),
-        realmdb: realmdb::connect(&cfg.mariadb_url).await.unwrap(),
+        realmdb: if lyracore {
+            None
+        } else {
+            Some(realmdb::connect(&cfg.mariadb_url).await.unwrap())
+        },
         soap: soap::Client::new(&cfg.soap_url, "ADMINISTRATOR", "ADMINISTRATOR"),
         conf: mangos_conf::ConfFiles::in_dir(&conf_dir),
         secrets: secrets::Keyring::load_or_create(&state_dir).unwrap(),
@@ -86,6 +144,7 @@ async fn harness() -> Harness {
         db: sqlite,
         cfg: cfg.clone(),
     });
+    state.check_account_backend().await.unwrap();
     let app = wenilla_realm::app(Arc::clone(&state), None, &www);
     Harness {
         app,
@@ -355,7 +414,14 @@ async fn admin_creates_player_who_can_fetch_hidden_game_credentials() {
     let r = send(&h.app, get("/", Some(&alice))).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     assert_eq!(r.location(), "/account/password");
-    for path in ["/api/play", "/data/__index", "/ws/8085", "/manila.js"] {
+    for path in [
+        "/api/play",
+        "/data/__index",
+        "/ws/8085",
+        "/manila.js",
+        "/addons/__index",
+        "/addons/WaveDefense/WaveDefense.toc",
+    ] {
         let r = send(
             &h.app,
             Request::get(path)
@@ -451,7 +517,14 @@ async fn admin_creates_player_who_can_fetch_hidden_game_credentials() {
 async fn game_routes_are_locked_without_a_session() {
     let h = harness().await;
     let admin = run_setup(&h).await;
-    for path in ["/manila.js", "/ws/8085", "/data/__index", "/api/play"] {
+    for path in [
+        "/manila.js",
+        "/ws/8085",
+        "/data/__index",
+        "/api/play",
+        "/addons/__index",
+        "/addons/WaveDefense/WaveDefense.toc",
+    ] {
         let r = send(&h.app, Request::get(path).body(Body::empty()).unwrap()).await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{path} must be locked");
         assert_eq!(
@@ -649,4 +722,234 @@ async fn setup_cache_refreshes_after_completion_and_external_reset() {
         true,
     ));
     assert!(!h.state.setup_complete().await.unwrap());
+}
+
+async fn run_lyracore_setup(h: &Harness) -> String {
+    let page = send(&h.app, get("/setup", None)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(!page.body.contains("name=\"bots\""));
+    let response = send(
+        &h.app,
+        form(
+            "/setup",
+            None,
+            &[
+                ("token", "TESTTOKEN"),
+                ("admin_username", "boss"),
+                ("admin_password", "correct horse battery"),
+                ("admin_password2", "correct horse battery"),
+                ("realm_name", "Wave Defense"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::SEE_OTHER, "{}", response.body);
+    assert!(h.soap_log.lock().unwrap().is_empty());
+    assert!(h.state.realmdb.is_none());
+    response.cookie().unwrap()
+}
+
+#[tokio::test]
+async fn lyracore_accounts_use_password_stdin_and_rotate_owned_credentials() {
+    let h = harness_mode(true).await;
+    let cookie = run_lyracore_setup(&h).await;
+    let response = send(&h.app, get("/api/play", Some(&cookie))).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    assert_eq!(response.headers[header::CACHE_CONTROL], "no-store");
+    let credentials: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    let arguments = std::fs::read_to_string(h._dir.path().join("args")).unwrap();
+    let name = credentials["user"].as_str().unwrap();
+    let password = credentials["pass"].as_str().unwrap();
+    assert_eq!(name.len(), 16);
+    assert_eq!(
+        arguments,
+        format!("provision\n{name}\n--password-stdin\n--create-only\n")
+    );
+    assert!(!arguments.contains(password));
+    assert_eq!(
+        std::fs::read_to_string(h._dir.path().join("password")).unwrap(),
+        password
+    );
+    let page = send(&h.app, get("/admin/users", Some(&cookie))).await;
+    let csrf = csrf_of(&page.body);
+    let response = send(
+        &h.app,
+        form(
+            "/admin/users/1/rotate-game-password",
+            Some(&cookie),
+            &[("_csrf", &csrf)],
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::SEE_OTHER);
+    let response = send(&h.app, get("/api/play", Some(&cookie))).await;
+    let rotated: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(rotated["user"], name);
+    assert_ne!(rotated["pass"], password);
+    assert_eq!(
+        std::fs::read_to_string(h._dir.path().join("password")).unwrap(),
+        rotated["pass"].as_str().unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(h._dir.path().join("args")).unwrap(),
+        format!("provision\n{name}\n--password-stdin\n")
+    );
+}
+
+#[tokio::test]
+async fn addons_require_a_session_and_allow_authenticated_reads() {
+    let h = harness_mode(true).await;
+    for path in ["/addons/__index", "/addons/WaveDefense/WaveDefense.toc"] {
+        assert_eq!(send(&h.app, get(path, None)).await.location(), "/setup");
+    }
+    let cookie = run_lyracore_setup(&h).await;
+    for path in ["/addons/__index", "/addons/WaveDefense/WaveDefense.toc"] {
+        let response = send(&h.app, get(path, None)).await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+        let response = send(&h.app, get(path, Some(&cookie))).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        assert!(response.body.contains("WaveDefense"));
+        let mut request = form(path, Some(&cookie), &[]);
+        request
+            .headers_mut()
+            .insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert_eq!(send(&h.app, request).await.status, StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn lyracore_provision_failure_never_saves_or_takes_over_an_account() {
+    let h = harness_mode(true).await;
+    let cookie = run_lyracore_setup(&h).await;
+    sqlx::query("DELETE FROM game_accounts")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let executable = h._dir.path().join("gateway");
+    std::fs::write(
+        executable,
+        r#"#!/bin/sh
+[ "$4" = --create-only ] || { printf 'takeover attempted' > "$LYRACORE_TEST_PASSWORD"; exit 2; }
+printf 'child-secret-that-must-not-leak' >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    let previous = std::fs::read_to_string(h._dir.path().join("password")).unwrap();
+    let response = send(&h.app, get("/api/play", Some(&cookie))).await;
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.body, "something went wrong");
+    assert!(!response.body.contains("child-secret-that-must-not-leak"));
+    assert_eq!(
+        std::fs::read_to_string(h._dir.path().join("password")).unwrap(),
+        previous
+    );
+    assert!(wenilla_realm::accounts::get(&h.state.db, 1)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn lyracore_rotation_failure_preserves_saved_credentials() {
+    let h = harness_mode(true).await;
+    let cookie = run_lyracore_setup(&h).await;
+    let before = send(&h.app, get("/api/play", Some(&cookie))).await.body;
+    std::fs::write(h._dir.path().join("gateway"), "#!/bin/sh\nexit 1\n").unwrap();
+    let page = send(&h.app, get("/admin/users", Some(&cookie))).await;
+    let csrf = csrf_of(&page.body);
+    let response = send(
+        &h.app,
+        form(
+            "/admin/users/1/rotate-game-password",
+            Some(&cookie),
+            &[("_csrf", &csrf)],
+        ),
+    )
+    .await;
+    assert!(response.location().contains("error="));
+    assert_eq!(
+        send(&h.app, get("/api/play", Some(&cookie))).await.body,
+        before
+    );
+}
+
+#[tokio::test]
+async fn lyracore_unsupported_administration_fails_before_state_changes() {
+    let h = harness_mode(true).await;
+    let cookie = run_lyracore_setup(&h).await;
+    let page = send(&h.app, get("/admin/users", Some(&cookie))).await;
+    let csrf = csrf_of(&page.body);
+    assert!(!page.body.contains("/admin/users/1/ban"));
+    assert!(!page.body.contains("href=\"/admin/config\""));
+    assert_eq!(
+        send(&h.app, get("/admin", Some(&cookie))).await.location(),
+        "/admin/users"
+    );
+    for path in ["/admin/config"] {
+        assert_eq!(
+            send(&h.app, get(path, Some(&cookie))).await.status,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+    for path in [
+        "/admin/server/restart",
+        "/admin/users/1/ban",
+        "/admin/users/1/delete",
+        "/admin/users/1/disable",
+    ] {
+        assert_eq!(
+            send(&h.app, form(path, Some(&cookie), &[("_csrf", "wrong")]))
+                .await
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        let response = send(&h.app, form(path, Some(&cookie), &[("_csrf", &csrf)])).await;
+        assert_eq!(
+            response.status,
+            StatusCode::NOT_IMPLEMENTED,
+            "{}",
+            response.body
+        );
+    }
+    let disabled: (i64,) = sqlx::query_as("SELECT disabled FROM users WHERE id = 1")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(disabled.0, 0);
+    assert!(h.soap_log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn account_backend_cannot_change_for_existing_web_credentials() {
+    let h = harness_mode(true).await;
+    db::meta_set(&h.state.db, "game_backend", "mangos")
+        .await
+        .unwrap();
+    assert!(h.state.check_account_backend().await.is_err());
+}
+
+#[tokio::test]
+async fn concurrent_lyracore_play_requests_receive_the_same_owned_account() {
+    let h = harness_mode(true).await;
+    let cookie = run_lyracore_setup(&h).await;
+    sqlx::query("DELETE FROM game_accounts")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let (first, second) = tokio::join!(
+        send(&h.app, get("/api/play", Some(&cookie))),
+        send(&h.app, get("/api/play", Some(&cookie))),
+    );
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+    assert_eq!(first.body, second.body);
+}
+
+#[tokio::test]
+async fn lyracore_refuses_unmarked_existing_game_accounts() {
+    let h = harness_mode(true).await;
+    run_lyracore_setup(&h).await;
+    db::meta_del(&h.state.db, "game_backend").await.unwrap();
+    assert!(h.state.check_account_backend().await.is_err());
 }

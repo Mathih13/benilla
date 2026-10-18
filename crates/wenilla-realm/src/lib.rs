@@ -1,8 +1,3 @@
-//! `wenilla-realm` — the realm service. One process: login-gated hosting of the browser client
-//! (wenilla-host's `/data`, `/ws`, static routers behind a session cookie), the play page that
-//! hands the client its hidden game credentials, and an admin panel that runs the game server
-//! over SOAP, the config files and read-only DB access. See `docs/DESIGN.md` in wenilla-realm.
-
 pub mod accounts;
 pub mod api;
 pub mod audit;
@@ -11,6 +6,7 @@ pub mod config;
 pub mod control;
 pub mod csrf;
 pub mod db;
+pub mod lyracore;
 pub mod mangos_conf;
 pub mod ratelimit;
 pub mod realmdb;
@@ -39,20 +35,37 @@ pub struct AppState {
     pub setup_cache: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
     pub cfg: Config,
     pub db: sqlx::SqlitePool,
-    pub realmdb: sqlx::MySqlPool,
+    pub realmdb: Option<sqlx::MySqlPool>,
     pub soap: soap::Client,
     pub conf: mangos_conf::ConfFiles,
     pub secrets: secrets::Keyring,
     pub providers: Vec<Arc<dyn auth::provider::IdentityProvider>>,
     pub limiter: ratelimit::Limiter,
-    /// Why the client data could not be opened at start — `None` when it could. The service
-    /// still runs (setup and the panel work) so an operator sees the problem instead of a
-    /// crash loop; `/data` answers 503 and `/healthz` reports it until a restart with a valid
-    /// `CLIENT_DATA`.
+    /// Client-data startup failure, exposed by health checks.
     pub client_data_error: Option<String>,
 }
 
 impl AppState {
+    pub async fn check_account_backend(&self) -> Result<()> {
+        let expected = self.cfg.backend.name();
+        match db::meta_get(&self.db, "game_backend").await? {
+            Some(current) if current != expected => {
+                anyhow::bail!("REALM_BACKEND differs from this state directory's account provider");
+            }
+            Some(_) => {}
+            None => {
+                let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM game_accounts")
+                    .fetch_one(&self.db)
+                    .await?;
+                if count > 0 && self.cfg.backend.is_lyracore() {
+                    anyhow::bail!("LyraCore requires a new state directory; existing game account ownership is unknown");
+                }
+                db::meta_set(&self.db, "game_backend", expected).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Cache this global gate across asset requests. A short TTL also observes
     /// reset-admin run by another process without requiring a service restart.
     pub async fn setup_complete(&self) -> Result<bool> {
@@ -85,6 +98,9 @@ impl AppState {
 
     /// Restore the console credentials the bootstrap stored (or fall back to the seeded ones).
     pub async fn load_soap_credentials(&self) -> Result<()> {
+        if self.cfg.backend.is_lyracore() {
+            return Ok(());
+        }
         if let (Some(user), Some(enc), Some(nonce)) = (
             db::meta_get(&self.db, "soap_user").await?,
             db::meta_get(&self.db, "soap_pass_enc").await?,
@@ -114,6 +130,7 @@ pub enum AppError {
     Forbidden(&'static str),
     NotFound,
     TooMany,
+    Unsupported(&'static str),
     Internal(anyhow::Error),
 }
 
@@ -129,14 +146,13 @@ impl IntoResponse for AppError {
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
             AppError::Forbidden(m) => (StatusCode::FORBIDDEN, m).into_response(),
             AppError::NotFound => StatusCode::NOT_FOUND.into_response(),
+            AppError::Unsupported(message) => {
+                (StatusCode::NOT_IMPLEMENTED, message).into_response()
+            }
             AppError::TooMany => (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response(),
             AppError::Internal(e) => {
                 tracing::error!(error = format!("{e:#}"), "request failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("something went wrong: {e:#}"),
-                )
-                    .into_response()
+                (StatusCode::INTERNAL_SERVER_ERROR, "something went wrong").into_response()
             }
         }
     }
@@ -168,18 +184,11 @@ async fn setup_gate(State(state): State<Arc<AppState>>, req: Request, next: Next
     }
 }
 
-/// The whole application.
-///
-/// `chain` is `None` only in tests (the data router needs real archives); everything else,
-/// including the lock on `/data`, is mounted the same way.
 pub fn app(state: Arc<AppState>, chain: Option<Arc<Chain>>, www: &Path) -> Router {
     let session_layer =
         middleware::from_fn_with_state(Arc::clone(&state), session::require_session);
     let admin_layer = middleware::from_fn(session::require_admin);
 
-    // Anything the game client needs — the wasm bundle, the data reads, the two relayed ports —
-    // sits behind the session. The relay's upstream is a service per port in the container
-    // deployment (realmd and mangosd are separate services).
     let locked = api::router()
         .merge(web::play::router())
         .merge(auth::local::account_router())
@@ -201,6 +210,7 @@ pub fn app(state: Arc<AppState>, chain: Option<Arc<Chain>>, www: &Path) -> Route
             (3724u16, Arc::<str>::from(state.cfg.realmd_host.as_str())),
             (8085u16, Arc::<str>::from(state.cfg.mangosd_host.as_str())),
         ]))
+        .merge(wenilla_host::addons::router(state.cfg.addons.clone()))
         .merge(wenilla_host::static_site::router(www))
         .layer(session_layer.clone());
     let admin = web::admin::router()
@@ -219,4 +229,20 @@ pub fn app(state: Arc<AppState>, chain: Option<Arc<Chain>>, www: &Path) -> Route
         .layer(middleware::from_fn(csrf::reject_cross_site))
         .layer(middleware::from_fn_with_state(state, setup_gate))
         .layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppError, IntoResponse, StatusCode};
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn internal_error_response_does_not_expose_diagnostics() {
+        let error = anyhow::anyhow!("password=secret-fixture owner-token=private-fixture")
+            .context("connecting with mysql://user:private-fixture@example.invalid/realm");
+        let response = AppError::Internal(error).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"something went wrong");
+    }
 }

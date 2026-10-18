@@ -1,7 +1,3 @@
-//! `/setup` — first run: the admin account, the realm's name, rates, bots, MOTD; then the
-//! console bootstrap and `setup_complete`. After `reset-admin` the same page runs in a reduced
-//! mode that only sets a new admin password.
-
 use std::sync::Arc;
 
 use axum::extract::{Form, Query, State};
@@ -42,6 +38,7 @@ async fn page(
         token: q.token.unwrap_or_default(),
         public_url: state.cfg.public_url.clone(),
         bot_account_count,
+        lyracore: state.cfg.backend.is_lyracore(),
     }))
 }
 
@@ -90,6 +87,7 @@ async fn submit(
             token: f.token.clone(),
             public_url: state.cfg.public_url.clone(),
             bot_account_count,
+            lyracore: state.cfg.backend.is_lyracore(),
         })
     };
 
@@ -155,56 +153,77 @@ async fn submit(
             return Ok(fail("bot count: 0–2000".into()));
         }
 
-        // 1. The console: our own account, the seeded defaults re-passworded.
-        let (su, sp) = match accounts::bootstrap_console(&state.soap).await {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(fail(format!(
-                    "could not reach the world server console: {e:#}. Is mangosd up yet?"
-                )))
-            }
-        };
-        state.store_soap_credentials(&su, &sp).await?;
-
-        // 2. Realm name + settings.
-        if let Err(e) = realmdb::set_realm_name(&state.realmdb, &realm_name).await {
-            tracing::warn!(error = %e, "could not write the realm name to realmlist (the game shows the old one)");
-        }
-        meta_set(&state.db, "realm_name", &realm_name).await?;
-        let old = mangos_conf::load(&state.conf)?;
-        let mut new = old.clone();
-        new.xp_rate = f.xp_rate;
-        new.loot_rate = f.loot_rate;
-        new.money_rate = f.money_rate;
-        new.bots = f.bots;
-        new.ahbot = f.ahbot.is_some();
-        let motd = f.motd.trim();
-        new.motd = if motd.is_empty() {
-            format!("Welcome to {realm_name}")
+        if state.cfg.backend.is_lyracore() {
+            meta_set(&state.db, "realm_name", &realm_name).await?;
         } else {
-            motd.chars()
-                .filter(|c| !c.is_control() && *c != '"')
-                .take(250)
-                .collect()
-        };
-        let steps = match mangos_conf::save(&state.conf, &old, &new) {
-            Ok(s) => s,
-            Err(e) => return Ok(fail(e.to_string())),
-        };
-        let restart = control::apply(&state.soap, &steps).await.unwrap_or(true);
-        let _ = control::set_motd_live(&state.soap, &new.motd).await;
-        meta_set(
-            &state.db,
-            "restart_pending",
-            if restart { "1" } else { "0" },
-        )
-        .await?;
+            let (su, sp) = match accounts::bootstrap_console(&state.soap).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(fail(format!(
+                        "could not reach the world server console: {e:#}. Is mangosd up yet?"
+                    )))
+                }
+            };
+            state.store_soap_credentials(&su, &sp).await?;
+
+            if let Err(e) = realmdb::set_realm_name(
+                state
+                    .realmdb
+                    .as_ref()
+                    .ok_or(AppError::Unsupported("MaNGOS database is not configured"))?,
+                &realm_name,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "could not write the realm name to realmlist (the game shows the old one)");
+            }
+            meta_set(&state.db, "realm_name", &realm_name).await?;
+            let old = mangos_conf::load(&state.conf)?;
+            let mut new = old.clone();
+            new.xp_rate = f.xp_rate;
+            new.loot_rate = f.loot_rate;
+            new.money_rate = f.money_rate;
+            new.bots = f.bots;
+            new.ahbot = f.ahbot.is_some();
+            let motd = f.motd.trim();
+            new.motd = if motd.is_empty() {
+                format!("Welcome to {realm_name}")
+            } else {
+                motd.chars()
+                    .filter(|c| !c.is_control() && *c != '"')
+                    .take(250)
+                    .collect()
+            };
+            let steps = match mangos_conf::save(&state.conf, &old, &new) {
+                Ok(s) => s,
+                Err(e) => return Ok(fail(e.to_string())),
+            };
+            let restart = control::apply(&state.soap, &steps).await.unwrap_or(true);
+            let _ = control::set_motd_live(&state.soap, &new.motd).await;
+            meta_set(
+                &state.db,
+                "restart_pending",
+                if restart { "1" } else { "0" },
+            )
+            .await?;
+        }
 
         insert_admin(&state, &admin_username).await?
     };
 
     set_password(&state.db, admin_id, &f.admin_password).await?;
-    let _ = accounts::provision(&state.db, &state.soap, &state.secrets, admin_id).await;
+    let provision_error = accounts::provision(
+        &state.db,
+        &state.soap,
+        &state.secrets,
+        admin_id,
+        &state.cfg.backend,
+    )
+    .await
+    .err();
+    if let Some(error) = &provision_error {
+        tracing::warn!(error = %error, "admin game account provisioning deferred");
+    }
     state.mark_setup_complete().await?;
     meta_del(&state.db, "setup_token").await?;
     meta_del(&state.db, "setup_mode").await?;
@@ -225,7 +244,12 @@ async fn submit(
 
     let token = session::create(&state.db, admin_id, ip.as_deref(), None).await?;
     let jar = jar.add(session::cookie(token, !state.cfg.cookie_insecure));
-    Ok((jar, Redirect::to("/admin/users")).into_response())
+    let destination = if provision_error.is_some() {
+        "/admin/users?error=Web+setup+is+complete%2C+but+the+game+account+is+not+ready.+Check+the+realm+account+command+and+retry+Play."
+    } else {
+        "/admin/users"
+    };
+    Ok((jar, Redirect::to(destination)).into_response())
 }
 
 async fn insert_admin(state: &AppState, username: &str) -> Result<i64, AppError> {

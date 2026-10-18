@@ -18,9 +18,16 @@ pub fn router() -> Router<Arc<AppState>> {
 
 async fn healthz(State(state): State<Arc<AppState>>) -> Response {
     let sqlite = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
-    let mariadb = crate::realmdb::ping(&state.realmdb).await;
-    let soap = state.soap.exec("server info").await.is_ok();
-    let body = serde_json::json!({ "sqlite": sqlite, "mariadb": mariadb, "soap": soap, "client_data": state.client_data_error.is_none(), "client_data_error": state.client_data_error, "memory": crate::sysinfo::read() });
+    let mariadb = match &state.realmdb {
+        Some(pool) => Some(crate::realmdb::ping(pool).await),
+        None => None,
+    };
+    let soap = if state.cfg.backend.is_lyracore() {
+        None
+    } else {
+        Some(state.soap.exec("server info").await.is_ok())
+    };
+    let body = serde_json::json!({ "backend": state.cfg.backend.name(), "sqlite": sqlite, "mariadb": mariadb, "soap": soap, "client_data": state.client_data_error.is_none(), "client_data_error": state.client_data_error, "memory": crate::sysinfo::read() });
     let code = if sqlite {
         axum::http::StatusCode::OK
     } else {

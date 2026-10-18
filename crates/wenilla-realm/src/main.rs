@@ -78,7 +78,11 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         setup_cache: Default::default(),
         client_data_error,
-        realmdb: realmdb::connect(&cfg.mariadb_url).await?,
+        realmdb: if cfg.backend.is_lyracore() {
+            None
+        } else {
+            Some(realmdb::connect(&cfg.mariadb_url).await?)
+        },
         soap: soap::Client::new(
             &cfg.soap_url,
             &cfg.soap_bootstrap_user,
@@ -91,6 +95,7 @@ async fn main() -> Result<()> {
         db: sqlite,
         cfg: cfg.clone(),
     });
+    state.check_account_backend().await?;
     state.load_soap_credentials().await?;
 
     if !db::setup_complete(&state.db).await? {

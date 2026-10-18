@@ -1,16 +1,13 @@
-//! Process configuration — environment only, so the same binary runs in the compose image and
-//! on a developer's box. Every knob has a default that matches the container layout
-//! (`/state`, `/config`, `/client/Data`, service names `realmd`/`mangosd`/`mariadb`).
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub backend: Backend,
+    pub addons: PathBuf,
     pub bind: String,
-    /// The URL players use, e.g. `https://realm.example`. Also the only `Origin` the WebSocket
-    /// relay accepts.
+    /// The public page origin used for the game connection.
     pub public_url: String,
     pub state_dir: PathBuf,
     pub www: PathBuf,
@@ -18,22 +15,36 @@ pub struct Config {
     pub config_dir: PathBuf,
     pub mariadb_url: String,
     pub soap_url: String,
-    /// The console login used until the wizard has created the service's own (`WRSOAP`). The
-    /// classic-db seed is `ADMINISTRATOR/ADMINISTRATOR`.
+    /// MaNGOS console credentials used before setup creates the service account.
     pub soap_bootstrap_user: String,
     pub soap_bootstrap_pass: String,
     pub realmd_host: String,
     pub mangosd_host: String,
-    /// How long an admin-issued first-login password stays usable, in hours; `0` disables the
-    /// expiry. It is handed over out of band (a chat message, a spoken word), so its lifetime is
-    /// the real control on who can claim the account — not the password itself, which the
-    /// recipient must replace on first login anyway. Also the operator's escape hatch: raise it
-    /// if an invite must survive a weekend.
+    /// First-login password lifetime in hours; zero disables expiry.
     pub bootstrap_ttl_hours: i64,
     /// Let the page's `?user=&pass=` query log a player in — development only.
     pub dev_query_creds: bool,
     /// Drop the cookie's `Secure` flag — plain-http development only.
     pub cookie_insecure: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum Backend {
+    Mangos,
+    LyraCore(crate::lyracore::Provisioner),
+}
+
+impl Backend {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Mangos => "mangos",
+            Self::LyraCore(_) => "lyracore",
+        }
+    }
+
+    pub fn is_lyracore(&self) -> bool {
+        matches!(self, Self::LyraCore(_))
+    }
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -48,7 +59,14 @@ impl Config {
         let public_url = env_or("REALM_PUBLIC_URL", "https://localhost");
         url::Url::parse(&public_url)
             .with_context(|| format!("REALM_PUBLIC_URL {public_url:?} is not a URL"))?;
+        let backend = match env_or("REALM_BACKEND", "mangos").as_str() {
+            "mangos" => Backend::Mangos,
+            "lyracore" => Backend::LyraCore(crate::lyracore::Provisioner::from_env()?),
+            _ => anyhow::bail!("REALM_BACKEND must be mangos or lyracore"),
+        };
         Ok(Self {
+            backend,
+            addons: env_or("REALM_ADDONS", "/client/Interface/AddOns").into(),
             bind: env_or("REALM_BIND", "0.0.0.0:8090"),
             public_url: public_url.trim_end_matches('/').to_string(),
             state_dir: env_or("REALM_STATE_DIR", "/state").into(),
@@ -79,8 +97,7 @@ impl Config {
         self.state_dir.join("realm.sqlite")
     }
 
-    /// Host part of `public_url` — what goes into `realmlist.address` (a label on the web: the
-    /// client dials the page's own origin, `benilla-protocol::transport::web`).
+    /// The hostname the browser uses for its game connection.
     pub fn public_host(&self) -> String {
         url::Url::parse(&self.public_url)
             .ok()

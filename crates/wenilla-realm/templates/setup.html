@@ -20,6 +20,7 @@
         <div class="field"><div class="field-row"><span class="label">Realm name</span><span class="hint">shown in the game's realm list</span></div><div class="input-shell plain"><input class="input" name="realm_name" type="text" maxlength="32" value="Our Realm"></div></div>
         <div class="field"><div class="field-row"><span class="label">Public address</span><span class="hint">from <code>REALM_PUBLIC_URL</code></span></div><div class="input-shell plain"><input class="input" type="text" value="{{ public_url }}" disabled></div></div>
       </div>
+      {% if !lyracore %}
       <div class="grid-3">
         <div class="field"><span class="label">Experience</span><div class="seg"><label><input type="radio" name="xp_rate" value="1" checked><span>1×</span></label><label><input type="radio" name="xp_rate" value="2"><span>2×</span></label><label><input type="radio" name="xp_rate" value="3"><span>3×</span></label><label><input type="radio" name="xp_rate" value="5"><span>5×</span></label></div></div>
         <div class="field"><span class="label">Loot drops</span><div class="seg"><label><input type="radio" name="loot_rate" value="1" checked><span>1×</span></label><label><input type="radio" name="loot_rate" value="2"><span>2×</span></label><label><input type="radio" name="loot_rate" value="3"><span>3×</span></label></div></div>
@@ -30,6 +31,7 @@
         <div class="field"><span class="label">Auction house</span><label class="check" style="margin-top: 10px;"><input name="ahbot" type="checkbox" value="1"> a bot keeps the auction house stocked</label></div>
       </div>
       <div class="field"><span class="label">Message of the day</span><div class="input-shell plain"><input class="input" name="motd" type="text" maxlength="250" placeholder="Welcome!"></div></div>
+      {% endif %}
       <button class="btn-gold" type="submit" style="justify-content: center; height: 50px; font-size: 13.5px;">Create the realm</button>
     </form>
   </div>

@@ -41,6 +41,7 @@ pub struct Privacy {
 #[derive(Template)]
 #[template(path = "setup.html")]
 pub struct Setup {
+    pub lyracore: bool,
     pub error: Option<String>,
     pub token: String,
     pub public_url: String,
@@ -61,6 +62,7 @@ pub struct UserRow {
 #[derive(Template)]
 #[template(path = "admin_users.html")]
 pub struct AdminUsers {
+    pub lyracore: bool,
     pub realm_name: String,
     pub nav: &'static str,
     pub csrf: String,
@@ -74,6 +76,7 @@ pub struct AdminUsers {
 #[derive(Template)]
 #[template(path = "admin_dashboard.html")]
 pub struct AdminDashboard {
+    pub lyracore: bool,
     pub realm_name: String,
     pub nav: &'static str,
     pub csrf: String,
@@ -93,6 +96,7 @@ pub struct AdminDashboard {
 #[derive(Template)]
 #[template(path = "admin_config.html")]
 pub struct AdminConfig {
+    pub lyracore: bool,
     pub realm_name: String,
     pub nav: &'static str,
     pub csrf: String,
@@ -106,6 +110,7 @@ pub struct AdminConfig {
 #[derive(Template)]
 #[template(path = "admin_audit.html")]
 pub struct AdminAudit {
+    pub lyracore: bool,
     pub realm_name: String,
     pub nav: &'static str,
     pub me: User,

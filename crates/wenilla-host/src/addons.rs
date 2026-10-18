@@ -18,9 +18,7 @@
 //! at both ends. A name containing a newline would break the format, so the walk drops it — no
 //! addon has ever had one, and silently omitting it beats corrupting the whole list.
 //!
-//! This host is a local development tool and this route inherits that: it hands the operator's
-//! addon folder to anyone who can reach the socket, exactly as `/data` hands over the game files.
-//! `wenilla-realm` does not mount it.
+//! The development host exposes this route directly; `wenilla-realm` requires a Session.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

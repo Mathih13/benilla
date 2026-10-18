@@ -113,11 +113,11 @@ done
 # line gets skipped by eye. (fdca1966's message says this was already fixed. It was not - that
 # commit only touched the wasm-opt block, and the timestamp test survived it.)
 for f in "${DIST}"/*.wasm "${DIST}"/*.js; do
-  want=$(stat -c%s "$f")
+  want=$(wc -c < "$f")
   if [ -e "$f.gz" ]; then
     # `gzip -l` reads the uncompressed length out of the trailer - no decompression pass.
     got=$(gzip -l "$f.gz" | awk 'NR==2 {print $2}')
-    if [ "$got" != "$want" ]; then
+    if [ "$got" -ne "$want" ]; then
       echo "web-build: $f.gz decompresses to $got bytes, $f is $want - stale twin" >&2
       exit 1
     fi
@@ -125,7 +125,7 @@ for f in "${DIST}"/*.wasm "${DIST}"/*.js; do
   if [ -e "$f.br" ]; then
     # brotli has no trailer to read, so this one costs a decompression pass.
     got=$(brotli -dc "$f.br" | wc -c)
-    if [ "$got" != "$want" ]; then
+    if [ "$got" -ne "$want" ]; then
       echo "web-build: $f.br decompresses to $got bytes, $f is $want - stale twin" >&2
       exit 1
     fi
