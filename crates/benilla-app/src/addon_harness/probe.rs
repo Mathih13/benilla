@@ -12,7 +12,7 @@ use std::path::Path;
 use benilla_ui::script::{ScriptValue, UiScript};
 use benilla_ui::toc::Toc;
 
-/// One addon, loaded and asked.
+/// One addon, or the default interface alone, loaded and asked.
 #[derive(Debug, Clone, Default)]
 pub struct ProbeOutcome {
     pub name: String,
@@ -20,8 +20,8 @@ pub struct ProbeOutcome {
     pub load_errors: Vec<String>,
     /// What its handlers raised while the session start was driven.
     pub session_errors: Vec<String>,
-    /// `(chunk, answer)` per step in order; an answer is `= <value>` or `ERROR: <message>`, and a
-    /// raise does not stop the steps after it.
+    /// `(step, answer)` per step in order; an answer is `= …`, `ERROR: <message>` or
+    /// `SYNTAX: <message>`, and a raise does not stop the steps after it.
     pub answers: Vec<(String, String)>,
 }
 
