@@ -163,18 +163,19 @@ out of scope is closed with the reason.
     from a folder of addons, with its dependencies from the same folder.
     `--probe-ui [<step>]…` loads the interface with no addon, for work on FrameXML or the layer.
   - Each run seats one session: a level 60 Human Warrior named `Harness` with a target, a buff,
-    an action on cooldown, a spellbook and a quest log. It fires `ADDON_LOADED`,
-    `VARIABLES_LOADED`, `PLAYER_LOGIN` and `PLAYER_ENTERING_WORLD`, then ticks one second. It
-    reads and writes no saved variables.
+    an action on cooldown, a spellbook and a quest log. It fires the addon's `ADDON_LOADED` (none
+    under `--probe-ui`), then `VARIABLES_LOADED`, `PLAYER_LOGIN` and `PLAYER_ENTERING_WORLD`,
+    then ticks one second. It reads and writes no saved variables.
   - The steps run in the order given. `--eval <lua>` answers its first return value through
     `tostring`, so return a string to read more than one value. `--event <NAME> [<arg>]…` fires
     an engine event; an argument that reads as a number is a number, and `nil` is nil.
     `--mouse <x>,<y>` hovers, `--click <x>,<y>[,<Button>]` presses and releases, and
     `--tick <secs>` runs one `OnUpdate` frame. Points are UI units on a 1024×768 screen, from
     the bottom left.
-  - Each answer is `= <value>`, `ERROR: <message>` for a raise, or `SYNTAX: <message>`. A step
-    that runs handlers answers what they raised. An event name 1.12 lacks is an `ERROR`, since no
-    frame can register for it. Load and session errors print first.
+  - An `--eval` answers `= <value>`, `ERROR: <message>` for a raise, or `SYNTAX: <message>`.
+    The other steps answer what their handlers raised, `= no errors` or `= RAISED: <message>`,
+    after the frame under the cursor for `--mouse` and `--click`. An event name 1.12 lacks
+    answers `ERROR`, since no frame can register for it. Load and session errors print first.
   - A window that waits on server state (a bank, a mailbox, a raid) has nothing to show here.
     Ask a live session with `WOW_PROBE_LUA` instead.
 - **The loop.** `cargo play` builds and runs the play profile. `cargo test -p <crate>` runs one

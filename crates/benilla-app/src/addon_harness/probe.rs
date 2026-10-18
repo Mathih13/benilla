@@ -40,7 +40,8 @@ pub enum Step {
     /// Lua to evaluate against the VM as it stands.
     Eval(String),
     /// Move the cursor to `(x, y)` in UI units (y-up from the bottom-left), firing the real
-    /// `OnLeave`/`OnEnter` pair as [`UiScript::mouse_move`] does for the app.
+    /// `OnLeave`/`OnEnter` pair as [`UiScript::mouse_move`] does for the app; the answer is the
+    /// frame under it and what the pair raised.
     Mouse(f32, f32),
     /// Advance one `OnUpdate` frame of `secs`; the answer is what the tick raised, or `no errors`.
     Tick(f32),
@@ -181,13 +182,18 @@ fn run_steps(script: &mut UiScript, steps: &[Step]) -> Vec<(String, String)> {
                 script.fire_event(event, args.iter().map(|a| event_arg(a)).collect());
                 (format!("--event {line}"), raised_since(script, before, ""))
             }
-            Step::Mouse(x, y) => (
-                format!("--mouse {x},{y}"),
-                format!("= over {}", hover(script, *x, *y)),
-            ),
-            Step::Click(x, y, button) => {
-                let over = hover(script, *x, *y);
+            Step::Mouse(x, y) => {
                 let before = script.errors().len();
+                let over = hover(script, *x, *y);
+                (
+                    format!("--mouse {x},{y}"),
+                    raised_since(script, before, &format!("over {over}, ")),
+                )
+            }
+            Step::Click(x, y, button) => {
+                // Before the hover: its `OnLeave`/`OnEnter` are part of the click.
+                let before = script.errors().len();
+                let over = hover(script, *x, *y);
                 script.mouse_button(*x, *y, button, true);
                 script.mouse_button(*x, *y, button, false);
                 (

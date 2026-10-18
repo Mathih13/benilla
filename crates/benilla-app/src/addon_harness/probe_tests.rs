@@ -151,6 +151,13 @@ fn the_probe_fires_events_and_clicks() {
         b:SetPoint("CENTER", UIParent, "CENTER")
         b:EnableMouse(true)
         b:SetScript("OnClick", function() ActorClicked = arg1 end)
+        local h = CreateFrame("Button", "ActorHot", UIParent)
+        h:SetFrameStrata("TOOLTIP")
+        h:SetWidth(40)
+        h:SetHeight(40)
+        h:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", 100, 300)
+        h:EnableMouse(true)
+        h:SetScript("OnEnter", function() error("hot to touch") end)
     "#,
     );
 
@@ -163,6 +170,9 @@ fn the_probe_fires_events_and_clicks() {
             Step::Eval("return ActorGot".into()),
             Step::Click(512.0, 384.0, "LeftButton".into()),
             Step::Eval("return ActorClicked".into()),
+            Step::Click(120.0, 320.0, "LeftButton".into()),
+            Step::Mouse(10.0, 700.0),
+            Step::Mouse(120.0, 320.0),
         ],
     )
     .expect("the fixture has a manifest");
@@ -181,6 +191,23 @@ fn the_probe_fires_events_and_clicks() {
     );
     assert_eq!(answers[3], "= clicked ActorButton, no errors");
     assert_eq!(answers[4], "= LeftButton", "OnClick ran with the button");
+    for (i, step) in [(5, "click"), (7, "mouse")] {
+        assert!(
+            answers[i].starts_with("= ")
+                && answers[i].contains("ActorHot, RAISED:")
+                && answers[i].contains("hot to touch"),
+            "a {step} answers what the hover's OnEnter raised: {}",
+            answers[i]
+        );
+    }
+}
+
+/// The default interface loads the stock frames.
+#[test]
+fn the_default_interface_probe_loads_the_stock_frames() {
+    benilla_formats::wow_data_or_skip!();
+    let out = probe_ui(&[Step::Eval("return MainMenuBar:IsVisible()".into())]);
+    assert_eq!(out.answers[0].1, "= 1", "{:#?}", out.load_errors);
 }
 
 /// The default interface is probed with no addon folder at all.
