@@ -31,11 +31,12 @@ pub trait TextMeasure {
         None
     }
 
-    /// The byte each row of `req`'s text starts at, wrapped at its width, as the line enumerator
-    /// records them (`0x5c2430`) for the tooltip sizer's split (`0x772b60`). `None`, the default,
-    /// has no rows to give.
-    fn row_starts(&mut self, req: &MeasureRequest) -> Option<Vec<usize>> {
-        let _ = req;
+    /// The tooltip sizer's split (`0x530837`-`0x5308c4`): `req`'s text cut at the row starts of its
+    /// wrap width (`0x772b60` → `0x5c2430`), at most `max_pieces` of them, each piece running to
+    /// the next start and the last to the text's end (`0x53088e`), measured unwrapped
+    /// (`0x772ae0`); the widest, in frame-local units. `None`, the default, has no split to give.
+    fn piece_width(&mut self, req: &MeasureRequest, max_pieces: usize) -> Option<f32> {
+        let _ = (req, max_pieces);
         None
     }
 }
@@ -57,8 +58,8 @@ impl TextMeasure for SharedMeasurer {
         self.0.borrow_mut().editbox_advances(req)
     }
 
-    fn row_starts(&mut self, req: &MeasureRequest) -> Option<Vec<usize>> {
-        self.0.borrow_mut().row_starts(req)
+    fn piece_width(&mut self, req: &MeasureRequest, max_pieces: usize) -> Option<f32> {
+        self.0.borrow_mut().piece_width(req, max_pieces)
     }
 }
 

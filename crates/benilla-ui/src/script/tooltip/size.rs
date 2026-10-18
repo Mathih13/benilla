@@ -11,7 +11,7 @@
 use super::{apply_anchor, tip_mut};
 use crate::layout::{Anchor, Point};
 use crate::script::layout::FONTSTRING_MIN_SPAN;
-use crate::script::{MeasureRequest, MeasuredText, Model};
+use crate::script::{MeasuredText, Model};
 use crate::widget::{
     FrameHandle, KindState, RegionHandle, TooltipAnchor, TOOLTIP_COLUMN_GAP, TOOLTIP_LINE_GAP,
     TOOLTIP_PLATE_PAD, TOOLTIP_WRAP_WIDTH,
@@ -71,9 +71,11 @@ pub(in crate::script) fn size_tooltip(model: &mut Model, h: FrameHandle) {
     }
 
     // The wrapped lines in order, shown or not (`0x530790`): the text's width capped at 230.4
-    // (`0x5307a9`-`0x5307ef`); wider than the widest so far, the text is split there into at most
-    // 20 pieces and the widest counts (`0x530837`-`0x5308be`). The line is then as wide as the
-    // widest so far (`0x5308ef`), so a later, wider line leaves an earlier one narrower.
+    // (`0x5307a9`-`0x5307ef`); wider than the widest so far, the text is split at its row starts
+    // into at most 20 pieces, each measured to the next start (`0x530884`-`0x5308a8`) with the
+    // whitespace its row's wrap skipped (`0x5c24fe`), and the widest counts. The line is then as
+    // wide as the widest so far (`0x5308ef`), so a later, wider line leaves an earlier one
+    // narrower.
     for &(left, _, wrapped) in &lines {
         if !wrapped {
             continue;
@@ -89,18 +91,18 @@ pub(in crate::script) fn size_tooltip(model: &mut Model, h: FrameHandle) {
         };
         let mut piece = cap;
         if cap > widest {
-            piece = match probe(model, left, Some(cap)) {
-                Some(m) => m.w.max(0.0),
-                // Headless, the cap stands in until the split's measure lands.
-                None => {
-                    pending = true;
-                    cap
-                }
+            piece = match split(model, left, cap) {
+                Some(w) => w,
+                // An engine with no split stands in its wrapped width; headless, the cap stands in
+                // until the measure lands.
+                None => match probe(model, left, Some(cap)) {
+                    Some(m) => m.w.max(0.0),
+                    None => {
+                        pending = true;
+                        cap
+                    }
+                },
             };
-            let last = last_piece(model, left, cap);
-            if last > piece {
-                piece = last;
-            }
         }
         // `fcomp; test ah,0x41; je` (`0x5308cc`): kept only when larger, so a NaN piece is taken.
         if widest.partial_cmp(&piece) != Some(std::cmp::Ordering::Greater) {
@@ -264,43 +266,30 @@ fn probe(model: &mut Model, rh: RegionHandle, wrap: Option<f32>) -> Option<Measu
     Some(m)
 }
 
-/// The 20th piece of `rh`'s text split at `wrap`: from that row's start to the text's end,
-/// unwrapped (`0x53083f`, `0x53088e`). 0 with fewer rows, or with no engine to split it.
-fn last_piece(model: &mut Model, rh: RegionHandle, wrap: f32) -> f32 {
+/// The widest piece of `rh`'s text split at `wrap` (`0x530837`-`0x5308c4`), from the memo or the
+/// font engine. A string with no text or no font has no pieces (`0x530822`, `0x772b6e`). `None`
+/// is an engine with no split to give, or none installed.
+fn split(model: &mut Model, rh: RegionHandle, wrap: f32) -> Option<f32> {
     let scale = scale_of(model, rh);
     let non_space_wrap = model.non_space_wrap_of(rh);
-    let Some(d) = model.region_data.get(&rh) else {
-        return 0.0;
-    };
-    let Some(text) = d.text.as_deref().filter(|t| !t.is_empty()) else {
-        return 0.0;
-    };
+    let d = model.region_data.get(&rh)?;
+    let text = d.text.as_deref().unwrap_or("");
+    if text.is_empty() {
+        return Some(0.0);
+    }
     let key = split_key(d.measure_key_at(text, Some(wrap), scale));
     if let Some(m) = model.tooltip_measures.get(&(key, non_space_wrap)) {
-        return m.natural_w;
+        return Some(m.w);
     }
-    if model.measurer.is_none() || !crate::script::font_block::has_font(model, rh) {
-        return 0.0;
+    if !crate::script::font_block::has_font(model, rh) {
+        return Some(0.0);
     }
-    let Some(req) = crate::script::layout::measure_request_at(model, rh, Some(wrap), key, scale)
-    else {
-        return 0.0;
-    };
+    model.measurer.as_ref()?;
+    let req = crate::script::layout::measure_request_at(model, rh, Some(wrap), key, scale)?;
     let mut engine = model.measurer.take().expect("checked above");
-    let tail = crate::script::TextMeasure::row_starts(&mut engine, &req)
-        .and_then(|rows| rows.get(SPLIT_PIECES - 1).copied())
-        .and_then(|at| req.text.get(at..))
-        .filter(|t| !t.is_empty())
-        .map(str::to_string);
-    let w = tail.map_or(0.0, |text| {
-        let req = MeasureRequest {
-            wrap_width: None,
-            text,
-            ..req
-        };
-        crate::script::TextMeasure::measure(&mut engine, &req).2
-    });
+    let w = crate::script::TextMeasure::piece_width(&mut engine, &req, SPLIT_PIECES);
     model.measurer = Some(engine);
+    let w = w?;
     let m = MeasuredText {
         w,
         h: 0.0,
@@ -308,7 +297,7 @@ fn last_piece(model: &mut Model, rh: RegionHandle, wrap: f32) -> f32 {
         key,
     };
     memo_insert(model, (key, non_space_wrap), m);
-    w
+    Some(w)
 }
 
 /// The memo key of the split of the text whose wrapped measure key is `key`.

@@ -48,14 +48,23 @@ impl TextMeasure for Mono {
         (widest, row * rows.len() as f32, natural)
     }
 
-    fn row_starts(&mut self, req: &MeasureRequest) -> Option<Vec<usize>> {
+    /// Each piece from its row's start to the next, the space the wrap skipped and all, the last
+    /// of `max_pieces` to the text's end.
+    fn piece_width(&mut self, req: &MeasureRequest, max_pieces: usize) -> Option<f32> {
         self.0.set(self.0.get() + 1);
         let wrap = req.wrap_width?;
+        let starts: Vec<usize> = mono_rows(&req.text, wrap)
+            .into_iter()
+            .map(|(at, _)| at)
+            .take(max_pieces)
+            .collect();
+        let ends = starts.iter().skip(1).copied().chain([req.text.len()]);
         Some(
-            mono_rows(&req.text, wrap)
-                .into_iter()
-                .map(|(at, _)| at)
-                .collect(),
+            starts
+                .iter()
+                .zip(ends)
+                .map(|(&at, end)| width(&req.text[at..end]))
+                .fold(0.0, f32::max),
         )
     }
 }
@@ -238,7 +247,8 @@ fn a_wrapped_line_takes_the_widest_so_far() {
         "short: {lw}"
     );
 
-    // Long and alone: twelve 4-byte words, 295 wide, split at 230.4 into rows of 220 and 70.
+    // Long and alone: twelve 4-byte words, 295 wide, split at 230.4 into rows of 220 and 70; the
+    // first piece runs to the second row's start, its space included (`0x530884`), 225.
     let long = ["aaaa"; 12].join(" ");
     s.run(&format!(
         r#"TS:ClearLines() TS:AddLine("{long}", 1, 1, 1, 1) TS:Show()"#
@@ -247,7 +257,7 @@ fn a_wrapped_line_takes_the_widest_so_far() {
     let lw: f64 = s.eval("return TSTextLeft1:GetWidth()").unwrap();
     let (w, h) = size(&s);
     assert!(
-        close(lw, 220.0) && close(w, plate(220.0)) && close(h, plate(28.0)),
+        close(lw, 225.0) && close(w, plate(225.0)) && close(h, plate(28.0)),
         "long: {lw}, {w}x{h}"
     );
 
@@ -265,12 +275,28 @@ fn a_wrapped_line_takes_the_widest_so_far() {
     );
 }
 
+/// A wrapped piece runs from its row's start to the next row's (`0x530884`-`0x5308a8`), and the
+/// next row starts past the whitespace the wrap skipped (`0x5c24fe`): a 225-wide word and a short
+/// one split at 230.4 into rows of 225 and 20, and the first piece is 230, its space a glyph.
+#[test]
+fn a_wrapped_piece_keeps_the_space_its_wrap_skipped() {
+    let (s, _) = tooltip();
+    let text = format!("{} bbbb", "a".repeat(45));
+    let w: f64 = s
+        .eval(&format!(
+            r#"TS:AddLine("{text}", 1, 1, 1, 1) TS:Show() return TS:GetWidth()"#
+        ))
+        .unwrap();
+    let lw: f64 = s.eval("return TSTextLeft1:GetWidth()").unwrap();
+    assert!(close(w, plate(230.0)) && close(lw, 230.0), "{w}, line {lw}");
+}
+
 /// The split stops at 20 pieces (`0x53083f`): the 20th runs from its row's start to the text's
 /// end and is measured unwrapped (`0x53088e`), so a line of more than 20 rows sizes to its tail.
 #[test]
 fn a_line_past_20_rows_sizes_to_its_20th_piece() {
     let (s, _) = tooltip();
-    // Nine 4-byte words make a 220-wide row at 230.4.
+    // Nine 4-byte words make a 220-wide row at 230.4, its piece 225 with the space after it.
     let plate_for = |rows: usize| -> f64 {
         let text = vec!["aaaa"; 9 * rows].join(" ");
         s.eval(&format!(
@@ -278,10 +304,10 @@ fn a_line_past_20_rows_sizes_to_its_20th_piece() {
         ))
         .unwrap()
     };
-    assert!(close(plate_for(19), plate(220.0)), "19 rows");
+    assert!(close(plate_for(19), plate(225.0)), "19 rows");
     assert!(
-        close(plate_for(20), plate(220.0)),
-        "20 rows: the last row alone"
+        close(plate_for(20), plate(225.0)),
+        "20 rows: the last row alone, narrower than the pieces before it"
     );
     // Rows 20 and 21: eighteen words, 89 bytes.
     let w = plate_for(21);

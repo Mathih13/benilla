@@ -60,12 +60,32 @@ fn request_spec(r: &MeasureRequest, rs: f32) -> super::FontSpec<'_> {
     }
 }
 
-/// `r`'s row starts at its wrap width, laid out at the size [`measure_request`] measures at; a
-/// string with no width is its hard lines.
-pub(crate) fn row_starts(e: &mut TextEngine, seam: f32, r: &MeasureRequest) -> Vec<usize> {
+/// The widest of the first `max_pieces` pieces of `r`'s text split at its wrap width, laid out at
+/// the size [`measure_request`] measures at. A piece runs from its row's start (`0x5c2430`) to the
+/// next one's, the last to the text's end (`0x530884`-`0x5308a8`), so it keeps the whitespace the
+/// wrap skipped (`0x5c24fe`); it is measured with `GetStringWidth`'s kernel and seed (`0x772ae0`).
+pub(crate) fn piece_width(
+    e: &mut TextEngine,
+    seam: f32,
+    r: &MeasureRequest,
+    max_pieces: usize,
+) -> f32 {
     let rs = seam * r.scale;
+    let spec = request_spec(r, rs);
     let wrap = r.wrap_width.map_or(0.0, |w| w * rs);
-    super::line_rows(e, &r.text, wrap, request_spec(r, rs)).0
+    let mut starts = super::line_rows(e, &r.text, wrap, spec).0;
+    starts.truncate(max_pieces);
+    // Kept only when wider, from 0 (`0x53086d`, `0x5308ad`).
+    let mut widest = 0.0f32;
+    for (i, &at) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(r.text.len());
+        let piece = r.text.get(at..end).unwrap_or("");
+        let w = super::string_width(e, piece, spec, r.shadow_x * seam);
+        if w > widest {
+            widest = w;
+        }
+    }
+    widest / rs
 }
 
 /// Answer one EditBox advance table as `(cumulative widths, row starts, row pitch)` in screen UI
@@ -138,12 +158,12 @@ impl TextMeasure for AtlasMeasurer {
         Some(editbox_advances(&mut e, self.seam, req))
     }
 
-    fn row_starts(&mut self, req: &MeasureRequest) -> Option<Vec<usize>> {
+    fn piece_width(&mut self, req: &MeasureRequest, max_pieces: usize) -> Option<f32> {
         let mut e = self
             .engine
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Some(row_starts(&mut e, self.seam, req))
+        Some(piece_width(&mut e, self.seam, req, max_pieces))
     }
 }
 
@@ -291,9 +311,53 @@ mod tests {
         );
     }
 
-    /// The stock GameTooltip's second line (`GameTooltipTemplate.xml:35`, `GameTooltipText`) wrapped
-    /// past 20 rows at 230.4: the split stops at 20 pieces (`0x53083f`), the 20th running to the
-    /// text's end unwrapped (`0x53088e`), so the plate is that tail's `GetStringWidth` and the pads.
+    /// A tooltip split's piece runs from its row's start to the next (`0x530884`-`0x5308a8`): it
+    /// keeps the space its wrap skipped, a space being a glyph to the extent kernel (`0x5c6940`),
+    /// and a piece crossing a LF is as wide as its widest line, the LF no glyph.
+    #[test]
+    fn a_split_piece_keeps_its_space_and_ends_its_line_at_a_lf() {
+        benilla_formats::wow_data_or_skip!();
+        let mut e = super::super::engine::test_engine(1.0).expect("the client faces open");
+        let req = |text: &str, wrap: Option<f32>| benilla_ui::script::MeasureRequest {
+            id: 0,
+            font: Some("Fonts\\FRIZQT__.TTF".into()),
+            height: Some(12.0),
+            text_height: None,
+            wrap_width: wrap,
+            outline: benilla_ui::script::Outline::None,
+            spacing: 0.0,
+            shadow_x: 0.0,
+            non_space_wrap: false,
+            max_lines: 0,
+            scale: 1.0,
+            text: text.into(),
+            key: 0,
+        };
+        let natural = |e: &mut super::TextEngine, text: &str| {
+            super::measure_request(e, 1.0, &req(text, None)).2
+        };
+        let (word, spaced) = (natural(&mut e, "abcd"), natural(&mut e, "abcd "));
+        assert!(spaced > word, "a space is a glyph: {spaced} against {word}");
+        // Wide enough for "abcd" and not for "abcd ef": rows "abcd", "ef" and, past the LF, "gh".
+        let wrap = Some(word + 1.0);
+        let text = "abcd ef\ngh";
+        let r = req(text, wrap);
+        let rows = super::super::line_rows(&mut e, text, word + 1.0, super::request_spec(&r, 1.0));
+        assert_eq!(rows.0, [0, 5, 8]);
+        let got = super::piece_width(&mut e, 1.0, &req(text, wrap), 20);
+        assert_eq!(got, spaced, "the first piece, its space and all");
+        // One piece: the whole text, as wide as its widest line.
+        let got = super::piece_width(&mut e, 1.0, &req(text, wrap), 1);
+        assert_eq!(got, natural(&mut e, "abcd ef"));
+        // The first piece crosses the LF: "abcd\n" is as wide as "abcd".
+        let got = super::piece_width(&mut e, 1.0, &req("abcd\nef", wrap), 20);
+        assert_eq!(got, word);
+    }
+
+    /// The stock GameTooltip's second line (`GameTooltipTemplate.xml:35`, `GameTooltipText`)
+    /// wrapped past 20 rows at 230.4: the split stops at 20 pieces (`0x53083f`), the 20th running
+    /// to the text's end unwrapped (`0x53088e`), so the plate is that tail's `GetStringWidth` and
+    /// the pads.
     #[test]
     fn a_stock_tooltip_line_past_20_rows_sizes_to_its_20th_piece() {
         benilla_formats::wow_data_or_skip!();
@@ -352,11 +416,13 @@ mod tests {
             ))
             .unwrap()
         };
-        use benilla_ui::widget::{TOOLTIP_PLATE_PAD, TOOLTIP_WRAP_WIDTH};
+        use benilla_ui::widget::TOOLTIP_PLATE_PAD;
         let pads = 2.0 * TOOLTIP_PLATE_PAD;
         let (nineteen, twenty) = (plate(19), plate(20));
         assert_eq!(twenty, nineteen, "20 rows: the 20th piece is the last row");
-        assert!(twenty <= pads + TOOLTIP_WRAP_WIDTH, "{twenty}");
+        // A piece before the last keeps the space its row's wrap skipped (`0x530884`).
+        let row = pads + natural(per_row);
+        assert!(twenty > row, "{twenty} against the row alone, {row}");
         let tail = pads + natural(2 * per_row);
         let got = plate(21);
         assert!(
