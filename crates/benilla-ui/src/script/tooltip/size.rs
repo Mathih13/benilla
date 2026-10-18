@@ -11,15 +11,18 @@
 use super::{apply_anchor, tip_mut};
 use crate::layout::{Anchor, Point};
 use crate::script::layout::FONTSTRING_MIN_SPAN;
-use crate::script::{MeasuredText, Model};
+use crate::script::{MeasureRequest, MeasuredText, Model};
 use crate::widget::{
     FrameHandle, KindState, RegionHandle, TooltipAnchor, TOOLTIP_COLUMN_GAP, TOOLTIP_LINE_GAP,
     TOOLTIP_PLATE_PAD, TOOLTIP_WRAP_WIDTH,
 };
 
 /// Entries the measure memo holds before it is emptied: thirty lines on each of a few plates,
-/// three widths a wrapped line.
+/// three widths and a split a wrapped line.
 const MEMO_CAP: usize = 1024;
+
+/// The pieces a wrapped line is split into at most (`0x53082f`).
+const SPLIT_PIECES: usize = 20;
 
 /// `GameTooltipSize` (`0x530640`) on tooltip `h`; nothing without an owner (`0x530649`).
 pub(in crate::script) fn size_tooltip(model: &mut Model, h: FrameHandle) {
@@ -68,9 +71,9 @@ pub(in crate::script) fn size_tooltip(model: &mut Model, h: FrameHandle) {
     }
 
     // The wrapped lines in order, shown or not (`0x530790`): the text's width capped at 230.4
-    // (`0x5307a9`-`0x5307ef`); wider than the widest so far, the text is split there and the widest
-    // piece counts (`0x530837`-`0x5308be`). The line is then as wide as the widest so far
-    // (`0x5308ef`), so a later, wider line leaves an earlier one narrower.
+    // (`0x5307a9`-`0x5307ef`); wider than the widest so far, the text is split there into at most
+    // 20 pieces and the widest counts (`0x530837`-`0x5308be`). The line is then as wide as the
+    // widest so far (`0x5308ef`), so a later, wider line leaves an earlier one narrower.
     for &(left, _, wrapped) in &lines {
         if !wrapped {
             continue;
@@ -94,6 +97,10 @@ pub(in crate::script) fn size_tooltip(model: &mut Model, h: FrameHandle) {
                     cap
                 }
             };
+            let last = last_piece(model, left, cap);
+            if last > piece {
+                piece = last;
+            }
         }
         // `fcomp; test ah,0x41; je` (`0x5308cc`): kept only when larger, so a NaN piece is taken.
         if widest.partial_cmp(&piece) != Some(std::cmp::Ordering::Greater) {
@@ -255,6 +262,61 @@ fn probe(model: &mut Model, rh: RegionHandle, wrap: Option<f32>) -> Option<Measu
     };
     memo_insert(model, memo_key, m);
     Some(m)
+}
+
+/// The 20th piece of `rh`'s text split at `wrap`: from that row's start to the text's end,
+/// unwrapped (`0x53083f`, `0x53088e`). 0 with fewer rows, or with no engine to split it.
+fn last_piece(model: &mut Model, rh: RegionHandle, wrap: f32) -> f32 {
+    let scale = scale_of(model, rh);
+    let non_space_wrap = model.non_space_wrap_of(rh);
+    let Some(d) = model.region_data.get(&rh) else {
+        return 0.0;
+    };
+    let Some(text) = d.text.as_deref().filter(|t| !t.is_empty()) else {
+        return 0.0;
+    };
+    let key = split_key(d.measure_key_at(text, Some(wrap), scale));
+    if let Some(m) = model.tooltip_measures.get(&(key, non_space_wrap)) {
+        return m.natural_w;
+    }
+    if model.measurer.is_none() || !crate::script::font_block::has_font(model, rh) {
+        return 0.0;
+    }
+    let Some(req) = crate::script::layout::measure_request_at(model, rh, Some(wrap), key, scale)
+    else {
+        return 0.0;
+    };
+    let mut engine = model.measurer.take().expect("checked above");
+    let tail = crate::script::TextMeasure::row_starts(&mut engine, &req)
+        .and_then(|rows| rows.get(SPLIT_PIECES - 1).copied())
+        .and_then(|at| req.text.get(at..))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let w = tail.map_or(0.0, |text| {
+        let req = MeasureRequest {
+            wrap_width: None,
+            text,
+            ..req
+        };
+        crate::script::TextMeasure::measure(&mut engine, &req).2
+    });
+    model.measurer = Some(engine);
+    let m = MeasuredText {
+        w,
+        h: 0.0,
+        natural_w: w,
+        key,
+    };
+    memo_insert(model, (key, non_space_wrap), m);
+    w
+}
+
+/// The memo key of the split of the text whose wrapped measure key is `key`.
+fn split_key(key: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (key, SPLIT_PIECES).hash(&mut hasher);
+    hasher.finish()
 }
 
 fn memo_insert(model: &mut Model, key: (u64, bool), m: MeasuredText) {

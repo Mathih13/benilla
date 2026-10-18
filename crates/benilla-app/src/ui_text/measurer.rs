@@ -20,7 +20,29 @@ pub(crate) fn measure_request(
     r: &MeasureRequest,
 ) -> (f32, f32, f32) {
     let rs = seam * r.scale;
-    let spec = || super::FontSpec {
+    let spec = request_spec(r, rs);
+    let wrap = r.wrap_width.map(|w| w * rs);
+    // `GetStringWidth` answers the unwrapped width (the extent measure `0x5c6940`), its line seeded
+    // with the shadow's x offset at the seam alone: `0x772890` leaves `[fs+0x108]` unscaled.
+    let natural = super::string_width(e, &r.text, spec, r.shadow_x * seam);
+    // Unwrapped, the laid-out width is that same measure (`[fs+0xfc]`).
+    let (w, h) = match wrap {
+        Some(w) => {
+            // `0x7729b0` measures the string `0x771ec0` returns: with `maxLines` the text is cut
+            // to that many lines first, and a FontString with no height takes its own from it.
+            let cut = (r.max_lines > 0)
+                .then(|| super::ellipsize_text(e, &r.text, w, 0.0, spec))
+                .flatten();
+            super::measure_text(e, cut.as_deref().unwrap_or(&r.text), wrap, spec)
+        }
+        None => (natural, super::unwrapped_height(e, &r.text, spec)),
+    };
+    (w / rs, h / rs, natural / rs)
+}
+
+/// `r`'s font at the drawn raster size `rs`, the seam times the owner's scale.
+fn request_spec(r: &MeasureRequest, rs: f32) -> super::FontSpec<'_> {
+    super::FontSpec {
         path: r.font.as_deref(),
         // The render pass's drawn px: `GetStringWidth` and `GetStringHeight` report the drawn
         // size (`0x772890`).
@@ -35,24 +57,15 @@ pub(crate) fn measure_request(
         alpha_gradient: None, // alpha never changes metrics
         non_space_wrap: r.non_space_wrap,
         max_lines: r.max_lines,
-    };
-    let wrap = r.wrap_width.map(|w| w * rs);
-    // `GetStringWidth` answers the unwrapped width (the extent measure `0x5c6940`), its line seeded
-    // with the shadow's x offset at the seam alone: `0x772890` leaves `[fs+0x108]` unscaled.
-    let natural = super::string_width(e, &r.text, spec(), r.shadow_x * seam);
-    // Unwrapped, the laid-out width is that same measure (`[fs+0xfc]`).
-    let (w, h) = match wrap {
-        Some(w) => {
-            // `0x7729b0` measures the string `0x771ec0` returns: with `maxLines` the text is cut
-            // to that many lines first, and a FontString with no height takes its own from it.
-            let cut = (r.max_lines > 0)
-                .then(|| super::ellipsize_text(e, &r.text, w, 0.0, spec()))
-                .flatten();
-            super::measure_text(e, cut.as_deref().unwrap_or(&r.text), wrap, spec())
-        }
-        None => (natural, super::unwrapped_height(e, &r.text, spec())),
-    };
-    (w / rs, h / rs, natural / rs)
+    }
+}
+
+/// `r`'s row starts at its wrap width, laid out at the size [`measure_request`] measures at; a
+/// string with no width is its hard lines.
+pub(crate) fn row_starts(e: &mut TextEngine, seam: f32, r: &MeasureRequest) -> Vec<usize> {
+    let rs = seam * r.scale;
+    let wrap = r.wrap_width.map_or(0.0, |w| w * rs);
+    super::line_rows(e, &r.text, wrap, request_spec(r, rs)).0
 }
 
 /// Answer one EditBox advance table as `(cumulative widths, row starts, row pitch)` in screen UI
@@ -123,6 +136,14 @@ impl TextMeasure for AtlasMeasurer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Some(editbox_advances(&mut e, self.seam, req))
+    }
+
+    fn row_starts(&mut self, req: &MeasureRequest) -> Option<Vec<usize>> {
+        let mut e = self
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(row_starts(&mut e, self.seam, req))
     }
 }
 
@@ -267,6 +288,80 @@ mod tests {
             height("Spare"),
             whole,
             "text within its lines is measured as it is"
+        );
+    }
+
+    /// The stock GameTooltip's second line (`GameTooltipTemplate.xml:35`, `GameTooltipText`) wrapped
+    /// past 20 rows at 230.4: the split stops at 20 pieces (`0x53083f`), the 20th running to the
+    /// text's end unwrapped (`0x53088e`), so the plate is that tail's `GetStringWidth` and the pads.
+    #[test]
+    fn a_stock_tooltip_line_past_20_rows_sizes_to_its_20th_piece() {
+        benilla_formats::wow_data_or_skip!();
+        let engine = super::super::engine::test_engine(1.0).expect("the client faces open");
+        let mut s = UiScript::new().unwrap();
+        for file in [
+            r"Interface\FrameXML\GlobalStrings.lua",
+            r"Interface\FrameXML\Fonts.xml",
+            r"Interface\FrameXML\BasicControls.xml",
+            r"Interface\FrameXML\LocaleProperties.lua",
+            r"Interface\FrameXML\UIParent.xml",
+            r"Interface\FrameXML\MoneyFrame.lua",
+            r"Interface\FrameXML\MoneyFrame.xml",
+            r"Interface\FrameXML\GameTooltip.xml",
+        ] {
+            crate::ui_script::load_ui_for_test(&s, file);
+        }
+        s.set_screen_size(1024.0, 768.0);
+        s.set_text_measurer(Box::new(AtlasMeasurer::new(
+            Arc::new(Mutex::new(engine)),
+            1.0,
+        )));
+        s.resolve();
+        // How many words of "word" a 230.4-wide row of the line's font holds.
+        let per_row: usize = s
+            .eval(
+                r#"
+                P = CreateFrame("Frame", nil, UIParent):CreateFontString(nil, "ARTWORK", "GameTooltipText")
+                P:SetWidth(230.4)
+                P:SetText("word")
+                local one = P:GetHeight()
+                local n = 1
+                while P:GetHeight() == one do
+                    n = n + 1
+                    P:SetText(string.rep("word ", n - 1) .. "word")
+                end
+                return n - 1
+            "#,
+            )
+            .unwrap();
+        assert!(per_row > 2, "{per_row} words a row");
+        let words = |n: usize| vec!["word"; n].join(" ");
+        let plate = |rows: usize| -> f32 {
+            s.eval(&format!(
+                r#"GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+                GameTooltip:AddLine("x") GameTooltip:AddLine("{}", 1, 1, 1, 1) GameTooltip:Show()
+                return GameTooltip:GetWidth()"#,
+                words(per_row * rows)
+            ))
+            .unwrap()
+        };
+        let natural = |n: usize| -> f32 {
+            s.eval(&format!(
+                r#"P:SetText("{}") return P:GetStringWidth()"#,
+                words(n)
+            ))
+            .unwrap()
+        };
+        use benilla_ui::widget::{TOOLTIP_PLATE_PAD, TOOLTIP_WRAP_WIDTH};
+        let pads = 2.0 * TOOLTIP_PLATE_PAD;
+        let (nineteen, twenty) = (plate(19), plate(20));
+        assert_eq!(twenty, nineteen, "20 rows: the 20th piece is the last row");
+        assert!(twenty <= pads + TOOLTIP_WRAP_WIDTH, "{twenty}");
+        let tail = pads + natural(2 * per_row);
+        let got = plate(21);
+        assert!(
+            (got - tail).abs() < 1e-3,
+            "21 rows: the plate is {got}, the last two rows unwrapped {tail}"
         );
     }
 

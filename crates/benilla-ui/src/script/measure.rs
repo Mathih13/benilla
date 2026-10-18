@@ -30,6 +30,14 @@ pub trait TextMeasure {
         let _ = req;
         None
     }
+
+    /// The byte each row of `req`'s text starts at, wrapped at its width, as the line enumerator
+    /// records them (`0x5c2430`) for the tooltip sizer's split (`0x772b60`). `None`, the default,
+    /// has no rows to give.
+    fn row_starts(&mut self, req: &MeasureRequest) -> Option<Vec<usize>> {
+        let _ = req;
+        None
+    }
 }
 
 /// The installed [`TextMeasure`], shared by a state and its forks ([`super::UiScript::fork`]): a
@@ -47,6 +55,10 @@ impl TextMeasure for SharedMeasurer {
         req: &super::EditBoxAdvanceRequest,
     ) -> Option<(Vec<f32>, Vec<usize>, f32)> {
         self.0.borrow_mut().editbox_advances(req)
+    }
+
+    fn row_starts(&mut self, req: &MeasureRequest) -> Option<Vec<usize>> {
+        self.0.borrow_mut().row_starts(req)
     }
 }
 
