@@ -155,6 +155,28 @@ out of scope is closed with the reason.
   - A capture runs through `scripts/visual.sh`, whose recipe is the header of
     `crates/benilla-app/src/capture/mod.rs`. Pixel questions go through `benilla-visual crop`,
     `series` and `hotspot`.
+- **Asking the UI without a server.** The addon harness's probe loads the interface into a VM
+  with no window, server or login, and answers in under a second. Build it once with
+  `cargo build --profile play -p benilla-app --example addon_harness`, then run
+  `target/play/examples/addon_harness`:
+  - `<folder> --probe <Name> [<step>]…` loads the stock FrameXML, benilla's layer and one addon
+    from a folder of addons, with its dependencies from the same folder.
+    `--probe-ui [<step>]…` loads the interface with no addon, for work on FrameXML or the layer.
+  - Each run seats one session: a level 60 Human Warrior named `Harness` with a target, a buff,
+    an action on cooldown, a spellbook and a quest log. It fires `ADDON_LOADED`,
+    `VARIABLES_LOADED`, `PLAYER_LOGIN` and `PLAYER_ENTERING_WORLD`, then ticks one second. It
+    reads and writes no saved variables.
+  - The steps run in the order given. `--eval <lua>` answers its first return value through
+    `tostring`, so return a string to read more than one value. `--event <NAME> [<arg>]…` fires
+    an engine event; an argument that reads as a number is a number, and `nil` is nil.
+    `--mouse <x>,<y>` hovers, `--click <x>,<y>[,<Button>]` presses and releases, and
+    `--tick <secs>` runs one `OnUpdate` frame. Points are UI units on a 1024×768 screen, from
+    the bottom left.
+  - Each answer is `= <value>`, `ERROR: <message>` for a raise, or `SYNTAX: <message>`. A step
+    that runs handlers answers what they raised. An event name 1.12 lacks is an `ERROR`, since no
+    frame can register for it. Load and session errors print first.
+  - A window that waits on server state (a bank, a mailbox, a raid) has nothing to show here.
+    Ask a live session with `WOW_PROBE_LUA` instead.
 - **The loop.** `cargo play` builds and runs the play profile. `cargo test -p <crate>` runs one
   crate's tests, the quickest loop. `scripts/check.sh` verifies a round of work: the crates your
   branch changed against main and their dependents, so on a clean clone it has nothing to check; `scripts/gates.sh` is the full chain, and it opens a window for the engine boot

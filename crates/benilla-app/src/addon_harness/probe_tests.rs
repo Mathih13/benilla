@@ -2,7 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::probe::{probe, Step};
+use benilla_ui::script::ScriptValue;
+
+use super::probe::{event_arg, probe, probe_ui, Step};
 
 /// One throwaway AddOns root, cleaned up on drop even if a test panics.
 struct Fixtures(PathBuf);
@@ -129,4 +131,75 @@ fn a_folder_without_a_manifest_is_refused() {
     std::fs::create_dir_all(fx.root().join("Backup")).unwrap();
     assert!(probe(fx.root(), "Backup", &[]).is_none());
     assert!(probe(fx.root(), "NotThereAtAll", &[]).is_none());
+}
+
+/// An event step reaches a registered handler with its arguments typed, and a click step reaches
+/// a button's `OnClick` through the hit-test.
+#[test]
+fn the_probe_fires_events_and_clicks() {
+    let fx = Fixtures::new("actuate");
+    fx.addon(
+        "Actor",
+        r#"
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("BAG_UPDATE")
+        f:SetScript("OnEvent", function() ActorGot = type(arg1) .. ":" .. tostring(arg1) .. "," .. tostring(arg2) end)
+        local b = CreateFrame("Button", "ActorButton", UIParent)
+        b:SetFrameStrata("TOOLTIP")
+        b:SetWidth(40)
+        b:SetHeight(40)
+        b:SetPoint("CENTER", UIParent, "CENTER")
+        b:EnableMouse(true)
+        b:SetScript("OnClick", function() ActorClicked = arg1 end)
+    "#,
+    );
+
+    let out = probe(
+        fx.root(),
+        "Actor",
+        &[
+            Step::Event("bag_update".into(), vec!["3".into(), "player".into()]),
+            Step::Event("ACTOR_PING".into(), Vec::new()),
+            Step::Eval("return ActorGot".into()),
+            Step::Click(512.0, 384.0, "LeftButton".into()),
+            Step::Eval("return ActorClicked".into()),
+        ],
+    )
+    .expect("the fixture has a manifest");
+
+    assert!(out.load_errors.is_empty(), "{:?}", out.load_errors);
+    let answers: Vec<&str> = out.answers.iter().map(|(_, a)| a.as_str()).collect();
+    assert_eq!(answers[0], "= no errors", "the name is matched case folded");
+    assert!(
+        answers[1].starts_with("ERROR: 1.12 has no event ACTOR_PING"),
+        "a name no frame can register is refused, not answered `no errors`: {}",
+        answers[1]
+    );
+    assert_eq!(
+        answers[2], "= number:3,player",
+        "the arguments arrive typed"
+    );
+    assert_eq!(answers[3], "= clicked ActorButton, no errors");
+    assert_eq!(answers[4], "= LeftButton", "OnClick ran with the button");
+}
+
+/// The default interface is probed with no addon folder at all.
+#[test]
+fn the_default_interface_is_probed_without_an_addon() {
+    let out = probe_ui(&[Step::Eval("return UnitName('player')".into())]);
+    assert_eq!(out.answers[0].1, "= Harness", "the session is seated");
+}
+
+/// Numbers are numbers, `nil` is nil, and a name that Rust would parse as a float stays a string.
+#[test]
+fn event_arguments_are_typed_from_their_text() {
+    assert!(matches!(event_arg("3"), ScriptValue::Number(n) if n == 3.0));
+    assert!(matches!(event_arg("-1.5"), ScriptValue::Number(n) if n == -1.5));
+    assert!(matches!(event_arg("nil"), ScriptValue::Nil));
+    for name in ["player", "inf", "NaN", ""] {
+        assert!(
+            matches!(event_arg(name), ScriptValue::Str(ref s) if s == name),
+            "{name:?} must stay a string"
+        );
+    }
 }
